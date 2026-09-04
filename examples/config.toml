@@ -1,0 +1,22 @@
+version = 1
+
+[profiles.interactive]
+slice = "app-amc.slice"
+memory_max = "6GiB"
+memory_swap_max = "512MiB"
+
+[profiles.batch]
+slice = "background-amc.slice"
+memory_max = "8GiB"
+memory_swap_max = "256MiB"
+
+[profiles.proof]
+slice = "app-amc.slice"
+memory_max = "256MiB"
+memory_swap_max = "32MiB"
+
+[applications."ai.opencode"]
+profile = "interactive"
+
+[applications."amc.proof"]
+profile = "proof"
