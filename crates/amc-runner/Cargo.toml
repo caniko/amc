@@ -1,0 +1,36 @@
+[package]
+name = "amc-runner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Memory admission and managed execution for AMC"
+repository = "https://codeberg.org/caniko/amc"
+readme = false
+
+[features]
+default = ["sync", "async", "sysinfo"]
+sync = []
+async = ["dep:tokio"]
+sysinfo = ["dep:sysinfo"]
+systemd = ["sync", "dep:anyhow"]
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+tracing = "0.1"
+tokio = { version = "1", features = [
+  "sync",
+  "time",
+  "macros",
+], optional = true }
+sysinfo = { version = "0.32", default-features = false, features = [
+  "system",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+  "sync",
+  "time",
+  "rt",
+  "rt-multi-thread",
+  "macros",
+] }
