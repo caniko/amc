@@ -52,6 +52,8 @@
 #![warn(missing_docs)]
 
 mod config;
+#[cfg(feature = "sync")]
+pub mod coordinator;
 pub mod provider;
 pub mod providers;
 pub mod weighted;

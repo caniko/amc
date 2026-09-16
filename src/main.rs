@@ -1,6 +1,8 @@
 mod config;
+mod control;
 mod helpers;
 mod systemd;
+mod telemetry;
 
 use std::{path::PathBuf, thread, time::Duration};
 
@@ -17,7 +19,7 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Apply hard memory contracts to transient user services"
+    about = "Disposable memory-policy fixtures on transient user services; real apps use native units/drop-ins"
 )]
 struct Cli {
     /// Use this configuration file instead of searching standard locations.
@@ -30,12 +32,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Verify that the local user manager can enforce the contract.
+    /// Actively probe fixture capabilities using a short-lived transient unit.
     Doctor {
         #[arg(long)]
         json: bool,
     },
-    /// Resolve and display an application's effective contract.
+    /// Display requested private fixture settings (effective policy is unverified).
     Explain {
         #[arg(long)]
         id: String,
@@ -51,6 +53,9 @@ enum Command {
     /// Inspect a retained or running AMC service.
     Inspect {
         unit: String,
+        /// Query a system unit rather than a unit in the current user manager.
+        #[arg(long)]
+        system: bool,
         #[arg(long)]
         json: bool,
     },
@@ -69,6 +74,12 @@ struct ManagedCommand {
     profile: Option<String>,
     #[arg(long)]
     retain_unit: bool,
+    /// Write the owned attempt's unit identity privately before submission.
+    #[arg(long, value_name = "PATH")]
+    unit_file: Option<PathBuf>,
+    /// Manager-enforced runtime bound for a disposable fixture, not a startup deadline.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    runtime_max_sec: Option<u64>,
     /// Copy one additional named variable from the caller without logging its value.
     #[arg(long, value_name = "NAME")]
     inherit_env: Vec<String>,
@@ -78,8 +89,10 @@ struct ManagedCommand {
 
 #[derive(Debug, Subcommand)]
 enum TestCommand {
-    /// Allocate and touch memory in bounded chunks.
+    /// Allocate and touch memory in bounded chunks (max-only fixture).
     Hog(HogArgs),
+    /// Finite useful-work task with completion + latency accounting.
+    Work(WorkArgs),
     /// Measure monotonic scheduling delay.
     Heartbeat {
         #[arg(long)]
@@ -101,6 +114,8 @@ struct ExpectedArgs {
     expect_memory_max: Option<String>,
     #[arg(long, value_name = "BYTES")]
     expect_memory_swap_max: Option<String>,
+    #[arg(long, value_name = "BYTES")]
+    expect_memory_high: Option<String>,
     #[arg(long, value_name = "0|1")]
     expect_memory_oom_group: Option<u8>,
 }
@@ -110,6 +125,7 @@ impl From<ExpectedArgs> for ExpectedLimits {
         Self {
             memory_max: value.expect_memory_max,
             memory_swap_max: value.expect_memory_swap_max,
+            memory_high: value.expect_memory_high,
             memory_oom_group: value.expect_memory_oom_group,
         }
     }
@@ -141,6 +157,18 @@ struct HogArgs {
     delay_ms: u64,
 }
 
+#[derive(Debug, Args)]
+struct WorkArgs {
+    #[arg(long)]
+    report: Option<PathBuf>,
+    #[command(flatten)]
+    expected: ExpectedArgs,
+    #[arg(long, default_value = "4MiB")]
+    size: String,
+    #[arg(long, default_value_t = 10)]
+    iterations: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Explanation<'a> {
@@ -150,12 +178,15 @@ struct Explanation<'a> {
     config_source: String,
     memory_max_bytes: u64,
     memory_swap_max_bytes: u64,
+    memory_high_bytes: Option<u64>,
     slice: &'a str,
     unit_name_pattern: &'static str,
     systemd_properties: Vec<String>,
     environment_inheritance: Vec<String>,
     oom_group_enforcement: &'static str,
     scope_statement: &'static str,
+    /// Requested TOML values are not yet effective: no unit exists.
+    effective: &'static str,
 }
 
 fn main() {
@@ -177,7 +208,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "AMC hard-contained backend: {}",
+                    "AMC fixture backend: {}",
                     if report.available {
                         "available"
                     } else {
@@ -208,25 +239,32 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Launch(arguments) => {
             managed(config::load(cli.config.as_deref())?, arguments, false)
         }
-        Command::Inspect { unit, json } => {
-            let inspection = systemd::inspect(&unit)?;
+        Command::Inspect { unit, system, json } => {
+            let inspection = systemd::inspect(&unit, system)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&inspection)?);
             } else {
                 println!("Unit: {}", inspection.unit);
+                println!("--- manager-reported (systemctl show) ---");
                 for (name, value) in &inspection.properties {
                     println!("{name}={value}");
                 }
-                if let Some(path) = &inspection.cgroup_path {
-                    println!("Cgroup: {path}");
+                println!("Requested: {}", inspection.requested);
+                println!(
+                    "Kernel observations (leaf through visible root):\n{}",
+                    serde_json::to_string_pretty(&inspection.kernel)?
+                );
+                println!(
+                    "Ancestor manager metadata:\n{}",
+                    serde_json::to_string_pretty(&inspection.ancestors)?
+                );
+                if !inspection.evidence_notes.is_empty() {
+                    println!("--- evidence notes ---");
+                    for note in &inspection.evidence_notes {
+                        println!("note: {note}");
+                    }
                 }
-                for (name, value) in &inspection.cgroup {
-                    println!("{name}={value}");
-                }
-                for (name, value) in &inspection.memory_events {
-                    println!("memory.events {name}={value}");
-                }
-                println!("Journal:\n{}", inspection.journal);
+                println!("Application journal messages are omitted from diagnostics.");
             }
             Ok(0)
         }
@@ -243,6 +281,7 @@ fn explain(config: &Config, id: &str, explicit_profile: Option<&str>, json: bool
         profile: &resolved.profile,
         unit: UNIT_PATTERN,
         retain: false,
+        runtime_max_sec: None,
         environment: &environment,
         argv: &dummy_argv,
     };
@@ -257,12 +296,14 @@ fn explain(config: &Config, id: &str, explicit_profile: Option<&str>, json: bool
         config_source: config.source.display().to_string(),
         memory_max_bytes: resolved.profile.memory_max_bytes,
         memory_swap_max_bytes: resolved.profile.memory_swap_max_bytes,
+        memory_high_bytes: resolved.profile.memory_high_bytes,
         slice: &resolved.profile.slice,
         unit_name_pattern: UNIT_PATTERN,
         systemd_properties,
         environment_inheritance: environment,
-        oom_group_enforcement: "OOMPolicy=kill sets memory.oom.group=1; doctor verifies cgroupfs directly",
+        oom_group_enforcement: "fixture only: OOMPolicy=kill sets memory.oom.group=1; doctor verifies kernel cgroupfs directly (no MemoryOOMGroup property exists)",
         scope_statement: SCOPE_STATEMENT,
+        effective: "unverified: no unit exists yet; requested TOML values are not effective settings. Real applications use native units/drop-ins, not this TOML.",
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&explanation)?);
@@ -275,6 +316,11 @@ fn explain(config: &Config, id: &str, explicit_profile: Option<&str>, json: bool
         println!("Config: {}", explanation.config_source);
         println!("MemoryMax: {} bytes", explanation.memory_max_bytes);
         println!("MemorySwapMax: {} bytes", explanation.memory_swap_max_bytes);
+        match explanation.memory_high_bytes {
+            Some(high) => println!("MemoryHigh: {high} bytes"),
+            None => println!("MemoryHigh: unset (not emitted; max-only fixture)"),
+        }
+        println!("Effective: {}", explanation.effective);
         println!("Slice: {}", explanation.slice);
         println!("Unit pattern: {}", explanation.unit_name_pattern);
         println!("Properties:");
@@ -294,13 +340,18 @@ fn explain(config: &Config, id: &str, explicit_profile: Option<&str>, json: bool
 fn managed(config: Config, arguments: ManagedCommand, synchronous: bool) -> Result<i32> {
     let resolved = config.resolve(&arguments.id, arguments.profile.as_deref())?;
     let environment = systemd::inherited_environment(&arguments.inherit_env)?;
-    let argv = systemd::resolve_command(&arguments.command)?;
+    let argv = systemd::resolve_command(&arguments.command)
+        .map_err(|_| anyhow::anyhow!("workload executable unavailable; arguments omitted"))?;
     let unit = systemd::unit_name(&arguments.id)?;
+    if let Some(path) = &arguments.unit_file {
+        helpers::atomic_write(path, format!("{unit}\n").as_bytes())?;
+    }
     let spec = StartSpec {
         id: &arguments.id,
         profile: &resolved.profile,
         unit: &unit,
         retain: arguments.retain_unit,
+        runtime_max_sec: arguments.runtime_max_sec,
         environment: &environment,
         argv: &argv,
     };
@@ -330,6 +381,14 @@ fn test_helper(command: TestCommand) -> Result<i32> {
             &arguments.progress_interval,
             arguments.delay_ms,
         )?,
+        TestCommand::Work(arguments) => {
+            helpers::work(
+                arguments.report.as_deref(),
+                &arguments.expected.into(),
+                &arguments.size,
+                arguments.iterations,
+            )?;
+        }
         TestCommand::Heartbeat {
             samples,
             summary,

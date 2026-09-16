@@ -1,3 +1,13 @@
+# Fixture/compatibility examples only (RFC 0.4).
+#
+# These numbers are NOT production policy. Do not copy them onto real
+# applications: historical backend peaks do not establish working-set needs
+# or justify the old 6 GiB example. Configure real applications with native
+# systemd units/drop-ins; see docs/rfc-v0.4/nixos-opencode.md.
+#
+# memory_high is optional. Absent => MemoryHigh is not emitted (isolated
+# max-only fixture). Present => emitted as native MemoryHigh for a separate
+# high/max comparison run.
 version = 1
 
 [profiles.interactive]
@@ -14,6 +24,14 @@ memory_swap_max = "256MiB"
 slice = "app-amc.slice"
 memory_max = "256MiB"
 memory_swap_max = "32MiB"
+
+# Separate high/max comparison fixture (not a default): throttling threshold
+# plus hard limit. Run and evaluate apart from the max-only proof profile.
+[profiles.proof-high]
+slice = "app-amc.slice"
+memory_max = "256MiB"
+memory_swap_max = "32MiB"
+memory_high = "192MiB"
 
 [applications."ai.opencode"]
 profile = "interactive"

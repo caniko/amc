@@ -1,3 +1,6 @@
 /result
+/.nix-results/
 /target
 /proof-artifacts
+/.direnv/
+__pycache__/

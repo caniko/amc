@@ -22,6 +22,9 @@ struct RawProfile {
     slice: String,
     memory_max: String,
     memory_swap_max: String,
+    /// Optional fixture MemoryHigh; absent means do not submit this property.
+    #[serde(default)]
+    memory_high: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +46,8 @@ pub struct Profile {
     pub slice: String,
     pub memory_max_bytes: u64,
     pub memory_swap_max_bytes: u64,
+    /// None = do not emit MemoryHigh. Native precedence is measured separately.
+    pub memory_high_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -91,12 +96,24 @@ fn parse(text: &str, source: PathBuf) -> Result<Config> {
         }
         let memory_swap_max_bytes = parse_bytes(&profile.memory_swap_max)
             .with_context(|| format!("profile {name:?} has invalid memory_swap_max"))?;
+        let memory_high_bytes = profile
+            .memory_high
+            .as_deref()
+            .map(parse_bytes)
+            .transpose()
+            .with_context(|| format!("profile {name:?} has invalid memory_high"))?;
+        if let Some(high) = memory_high_bytes
+            && high > memory_max_bytes
+        {
+            bail!("profile {name:?} memory_high must not exceed memory_max");
+        }
         profiles.insert(
             name,
             Profile {
                 slice: profile.slice,
                 memory_max_bytes,
                 memory_swap_max_bytes,
+                memory_high_bytes,
             },
         );
     }
@@ -302,10 +319,34 @@ profile = "small"
         let mapped = config.resolve("ai.opencode", None).unwrap();
         assert_eq!(mapped.name, "small");
         assert_eq!(mapped.resolution, ResolutionSource::ApplicationRule);
+        // Absent memory_high means "do not emit": never mask native config.
+        assert_eq!(mapped.profile.memory_high_bytes, None);
 
         let explicit = config.resolve("ai.opencode", Some("large")).unwrap();
         assert_eq!(explicit.name, "large");
         assert_eq!(explicit.resolution, ResolutionSource::ExplicitProfile);
         assert!(config.resolve("unknown", None).is_err());
+    }
+
+    #[test]
+    fn memory_high_is_optional_and_bounded_by_max() {
+        let with_high = VALID.replace(
+            "memory_swap_max = \"0B\"",
+            "memory_swap_max = \"0B\"\nmemory_high = \"128MiB\"",
+        );
+        let config = parse(&with_high, "config.toml".into()).unwrap();
+        let resolved = config.resolve("ai.opencode", None).unwrap();
+        assert_eq!(resolved.profile.memory_high_bytes, Some(128 << 20));
+
+        let too_high = VALID.replace(
+            "memory_swap_max = \"0B\"",
+            "memory_swap_max = \"0B\"\nmemory_high = \"1GiB\"",
+        );
+        assert!(parse(&too_high, "config.toml".into()).is_err());
+        let bad_unit = VALID.replace(
+            "memory_swap_max = \"0B\"",
+            "memory_swap_max = \"0B\"\nmemory_high = \"1MB\"",
+        );
+        assert!(parse(&bad_unit, "config.toml".into()).is_err());
     }
 }

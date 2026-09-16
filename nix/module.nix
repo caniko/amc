@@ -3,19 +3,16 @@
   lib,
   pkgs,
   ...
-}:
-
-let
+}: let
   cfg = config.programs.amc;
-  format = pkgs.formats.toml { };
-in
-{
+  format = pkgs.formats.toml {};
+in {
   options.programs.amc = {
-    enable = lib.mkEnableOption "Application Memory Contracts";
+    enable = lib.mkEnableOption "Application Memory Contracts (disposable fixture harness; real applications use native systemd units/drop-ins)";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix { };
+      default = pkgs.callPackage ./package.nix {};
       defaultText = lib.literalExpression "pkgs.callPackage ./nix/package.nix { }";
       description = "The amc package to install.";
     };
@@ -24,24 +21,28 @@ in
       inherit (format) type;
       default = {
         version = 1;
-        profiles = { };
-        applications = { };
+        profiles = {};
+        applications = {};
       };
       example = lib.literalExpression ''
         {
           version = 1;
-          profiles.interactive = {
+          profiles.proof = {
             slice = "app-amc.slice";
-            memory_max = "12GiB";
-            memory_swap_max = "1GiB";
+            memory_max = "256MiB";
+            memory_swap_max = "0B";
           };
-          applications."ai.opencode".profile = "interactive";
+          applications."amc.proof".profile = "proof";
         }
       '';
       description = ''
-        Configuration written to /etc/xdg/amc/config.toml. The example limits
-        are illustrative; replace them using measurements from your own RAM
-        and workload before enabling an application contract.
+        Fixture/compatibility configuration written to
+        /etc/xdg/amc/config.toml for amc run/launch test fixtures. The
+        example limits are illustrative fixture numbers, not production
+        policy; configure real applications with native systemd
+        units/drop-ins (see docs/rfc-v0.4/nixos-opencode.md). Supports an
+        optional per-profile memory_high (native MemoryHigh); when absent,
+        MemoryHigh is not emitted.
       '';
     };
 
@@ -83,7 +84,7 @@ in
 
     (lib.mkIf cfg.enable {
       environment.etc."xdg/amc/config.toml".source = format.generate "amc-config.toml" cfg.settings;
-      environment.systemPackages = [ cfg.package ];
+      environment.systemPackages = [cfg.package];
 
       systemd.user.slices = lib.mkIf cfg.createSlices {
         app-amc = {

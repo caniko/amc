@@ -22,6 +22,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct ExpectedLimits {
     pub memory_max: Option<String>,
     pub memory_swap_max: Option<String>,
+    pub memory_high: Option<String>,
     pub memory_oom_group: Option<u8>,
 }
 
@@ -31,6 +32,8 @@ pub struct SelfReport {
     pub cgroup_path: String,
     pub memory_max: String,
     pub memory_swap_max: String,
+    /// Kernel memory.high, or "unknown" with reason when unreadable.
+    pub memory_high: String,
     pub memory_oom_group: String,
 }
 
@@ -43,6 +46,9 @@ pub fn self_report(output: Option<&Path>, expected: &ExpectedLimits) -> Result<S
         cgroup_path,
         memory_max: read_value(directory.join("memory.max"))?,
         memory_swap_max: read_value(directory.join("memory.swap.max"))?,
+        // memory.high may be absent on older kernels: report unknown, not zero.
+        memory_high: read_value(directory.join("memory.high"))
+            .unwrap_or_else(|error| format!("unknown ({error:#})")),
         memory_oom_group: read_value(directory.join("memory.oom.group"))?,
     };
     check_expected(
@@ -55,6 +61,9 @@ pub fn self_report(output: Option<&Path>, expected: &ExpectedLimits) -> Result<S
         &report.memory_swap_max,
         expected.memory_swap_max.as_deref(),
     )?;
+    if let Some(high) = expected.memory_high.as_deref() {
+        check_expected("memory.high", &report.memory_high, Some(high))?;
+    }
     if let Some(expected) = expected.memory_oom_group {
         if expected > 1 {
             bail!("expected memory.oom.group must be 0 or 1");
@@ -133,6 +142,84 @@ pub fn hog(
     }
     std::hint::black_box(chunks);
     Ok(())
+}
+
+/// Finite useful-work task: touches a bounded working set with
+/// incompressible-ish data (xorshift, not zeros), checksums each iteration,
+/// and records per-iteration latency. A surviving heartbeat alone is not
+/// proof of usability; completions + latency are.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkReport {
+    pub iterations_completed: u64,
+    pub bytes_touched: u64,
+    pub checksum: u64,
+    pub max_iteration_us: u64,
+    pub median_iteration_us: u64,
+    pub p95_iteration_us: u64,
+}
+
+pub fn work(
+    report_output: Option<&Path>,
+    expected: &ExpectedLimits,
+    size: &str,
+    iterations: u64,
+) -> Result<WorkReport> {
+    // Helper-entry observation before allocation, not a loader/constructor guarantee.
+    self_report(None, expected)?;
+    let size = parse_bytes(size)?;
+    if size == 0 || iterations == 0 {
+        bail!("size and iterations must be greater than zero");
+    }
+    if size > 1 << 31 {
+        bail!("size must not exceed 2GiB per iteration");
+    }
+    if iterations > 10_000 {
+        bail!("iterations must not exceed 10000 (bounded fixture)");
+    }
+    let size = size as usize;
+    let mut state: u64 = 0x9e3779b97f4a7c15;
+    let mut checksum: u64 = 0;
+    let mut latencies = Vec::with_capacity(iterations as usize);
+    let mut bytes_touched = 0_u64;
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let mut chunk = vec![0_u8; size];
+        // xorshift64*: cheap, not trivially compressible, touches every page.
+        for word in chunk.chunks_mut(8) {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let value = state.wrapping_mul(0x2545f4914f6cdd1d);
+            word.copy_from_slice(&value.to_le_bytes()[..word.len()]);
+        }
+        // Checksum so the work cannot be optimized away.
+        let mut acc: u64 = 0;
+        for word in chunk.chunks(8) {
+            let mut bytes = [0; 8];
+            bytes[..word.len()].copy_from_slice(word);
+            acc = acc.wrapping_add(u64::from_le_bytes(bytes));
+        }
+        checksum = checksum.wrapping_add(acc);
+        std::hint::black_box(&chunk);
+        bytes_touched += size as u64;
+        latencies.push(micros(start.elapsed()));
+    }
+    latencies.sort_unstable();
+    let report = WorkReport {
+        iterations_completed: iterations,
+        bytes_touched,
+        checksum,
+        max_iteration_us: *latencies.last().unwrap_or(&0),
+        median_iteration_us: percentile(&latencies, 50),
+        p95_iteration_us: percentile(&latencies, 95),
+    };
+    let json = json_bytes(&report)?;
+    std::io::stdout().write_all(&json)?;
+    if let Some(output) = report_output {
+        atomic_write(output, &json)?;
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Serialize)]
