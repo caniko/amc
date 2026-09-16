@@ -1,133 +1,118 @@
-# Application Memory Contracts
+# AMC
 
-AMC v0.1 is a local NixOS proof that starts an application in a transient user
-service with hard memory and swap limits already applied. A process that exceeds
-the contract is killed as a cgroup without requiring a resident AMC daemon.
+AMC is a local fixture/compatibility launcher and diagnostic tool for systemd
+memory policy. RFC 0.4 in `docs/rfc-v0.4/` is authoritative. It is not a policy
+standard, resident daemon, sandbox, or transparent replacement for normal
+application launching.
 
-The narrow claim is: a directly executed Linux application can be bounded while
-an unrelated heartbeat remains responsive. Work brokered by another daemon is
-outside that claim.
+**Real applications stay with their existing native lifecycle owner.** For
+OpenCode, the discovered shared backend is `opencode.service`; wrapping an
+activation client does not configure that backend. See
+[native integration](docs/rfc-v0.4/nixos-opencode.md).
 
-```text
-terminal -> amc -> systemd-run --user -> app-amc-....service -> application
-                                           |
-                         MemoryMax + MemorySwapMax + group OOM
-```
-
-## NixOS installation
-
-```nix
-{
-  inputs.amc.url = "github:caniko/amc";
-  outputs = { nixpkgs, amc, ... }: {
-    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
-      modules = [
-        amc.nixosModules.default
-        {
-          programs.amc = {
-            enable = true;
-            settings = {
-              version = 1;
-              profiles.interactive = {
-                slice = "app-amc.slice";
-                # Measure your own workload and RAM before choosing these.
-                memory_max = "6GiB";
-                memory_swap_max = "512MiB";
-              };
-              applications."ai.opencode".profile = "interactive";
-            };
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-The module installs `amc`, writes `/etc/xdg/amc/config.toml`, and creates
-`app-amc.slice` and `background-amc.slice` beneath the standard user slices.
-It installs no service or timer.
-
-## Commands
+## Diagnostics
 
 ```sh
-amc doctor
-amc explain --id ai.opencode
-amc run --id ai.opencode -- command arg
-amc launch --id ai.opencode -- graphical-command
-amc inspect app-amc-ai-opencode-01234567@89abcdef.service
+amc inspect opencode.service --json
+amc inspect some-system-unit.service --system --json
+./scripts/prove-local.sh opencode.service
 ```
 
-`run` waits and uses a PTY only when all three standard streams are terminals;
-otherwise it uses inherited pipes. `launch` returns after systemd verifies
-`execve` startup and sends output to the journal. Add `--retain-unit` when
-post-mortem inspection is needed, then clean up with:
+Inspection is passive: it does not start services or change policy. It queries
+allowlisted manager metadata and samples the leaf and visible cgroup ancestry.
+Each snapshot has a timestamp; unavailable/malformed measurements have a null
+value and a reason, never an invented zero. The visible mount root is a
+namespace boundary, not proof that no hidden ancestor exists. Manager queries
+are bounded to 2 seconds and 64 KiB each; ancestry has a disclosed 64-cgroup
+limit and a 10-second manager-query budget (one in-flight query can add 2 seconds).
+
+Default text/JSON diagnostics omit application journal messages, `ExecStart`,
+`Environment`, and arbitrary subprocess error streams. This is omission, not
+a general-purpose secret scrubber. **`amc run` forwards workload output as a
+separate raw interface**; do not publish it as a sanitized diagnostic report.
+
+`amc doctor` is **not passive**: it creates and cleans up a short-lived transient
+capability probe with fixture settings. Run it only deliberately; the local
+script does not run it automatically. `--host-stress` is explicitly rejected.
+
+## Fixture Compatibility
 
 ```sh
-systemctl --user stop UNIT
-systemctl --user reset-failed UNIT
+amc --config examples/config.toml explain --id amc.proof --json
+amc --config examples/config.toml run --id amc.proof --unit-file /private/attempt.unit -- command arg
 ```
 
-Configuration search order is explicit `--config`,
-`$XDG_CONFIG_HOME/amc/config.toml`, `$HOME/.config/amc/config.toml`, then
-`/etc/xdg/amc/config.toml`. Files are not merged. Limits are integral `B`,
-`KiB`, `MiB`, `GiB`, or `TiB` values.
+The private TOML interface retains version 1 and its existing search order:
+explicit `--config`, XDG config, HOME config, then `/etc/xdg/amc/config.toml`.
+It is used only when these fixture tools are invoked. It does not configure
+native application services. Requested values are not effective values until
+observed; submitted properties and native drop-ins can conflict. No custom
+policy merge engine is provided.
 
-## Proofs
+Fixtures request `OOMPolicy=kill`, `Restart=no`, memory accounting, max/swap
+limits and optional `MemoryHigh`. They do not emit a `KillMode` override.
+An absent optional high value is not emitted. Fixture byte parsing is not a
+validator for every legal native systemd value. Fixture numbers are not
+production defaults, and max-only tests are not recommendations against high.
 
-The real-host proof is bounded to a 256 MiB cgroup and cleans up through a trap:
+The existing `systemd-run` service backend preserves literal argv,
+`--expand-environment=no`, cwd, environment-name allowlisting, and PTY/pipe
+selection. No scope or direct-D-Bus backend is added.
+
+Each attempt has one generated unit identity. `--unit-file` publishes it
+privately before submission. Spawn failure is distinct from rejected or
+ambiguous submission. Startup control is bounded; after an observed start,
+`amc run` has no AMC runtime deadline. `--runtime-max-sec` explicitly gives a
+disposable fixture a separate manager-enforced runtime bound. Detached launches
+remain running after successful acknowledgment.
+
+SIGINT/SIGTERM during submission triggers bounded cleanup of only that attempt.
+An absent/collected unit or unavailable manager leaves an explicit UNKNOWN
+outcome. There is no retry, unrestricted fallback, or promise of cleanup after
+SIGKILL or manager unavailability. Inspect the recorded identity before any
+manual retry; work may already have happened.
+
+Helper self-checks observe settings at helper entry, before allocation. They
+do **not** prove arbitrary loader/constructor ordering or fail-closed launch
+under every controller failure. That stronger strict-launch guarantee remains
+unsupported. Systemd continues to own execution and placement.
+
+`--retain-unit` does not retain kernel counters. Collect evidence while the
+cgroup exists; holding file descriptors also provides no indefinite retention
+guarantee. Limits are accounting/reclaim controls, not preallocated RAM, an exact
+instantaneous physical ceiling, or a fixed-time recovery promise.
+
+## Checks And Evidence
+
+Use the project-local direnv environment pinned by `flake.lock`. Review `.envrc`
+and authorize it once with `direnv allow .`; it deliberately does not source the
+parent canix environment or fall back to a stale shell. The first load may fetch
+the pinned toolchain. `direnv exec` also works in noninteractive agent sessions:
 
 ```sh
-nix develop -c ./scripts/prove-local.sh
+direnv allow .
+direnv exec . cargo fmt --all --check
+direnv exec . cargo test --all-targets --locked -j 2
+direnv exec . cargo clippy --all-targets --locked -j 2 -- -D warnings
+direnv exec . python3 scripts/check-fixtures.py
+nix flake check --no-build --no-write-lock-file --all-systems
 ```
 
-Fast checks do not build a VM:
+VM tests remain outside ordinary checks. Only after cheap gates pass:
 
 ```sh
-nix flake check
+nix build --no-write-lock-file --max-jobs 1 --cores 2 .#nixosTests.x86_64-linux.generic
 ```
 
-Run the heavyweight VM proof explicitly:
+The VM target contains mechanism tests and small A/B/C **smoke tests**, not a
+validated pressure benchmark. It exports observer snapshots and explicit work
+report files. Pressure/high-max/aggregate comparisons and OpenCode UX trials are
+deferred until mechanism gates actually pass. See the
+[corrective results](docs/rfc-v0.4/proof-results.md) and
+[checklist](docs/rfc-v0.4/migration-checklist.md).
 
-```sh
-nix build .#nixosTests.x86_64-linux.generic
-```
-
-## OpenCode trial
-
-`examples/config.toml` uses a prepared 6 GiB memory / 512 MiB swap contract,
-based on one Atlas observation with headroom. Re-measure before production use.
-After the synthetic proof passes, run manually:
-
-```sh
-amc --config examples/config.toml explain --id ai.opencode
-amc --config examples/config.toml run --id ai.opencode -- opencode
-```
-
-Monitor the reported unit with `amc inspect UNIT`, `systemd-cgtop`, and
-`/proc/pressure/memory`. Test OpenCode without a Nix build first.
-
-## Nix boundary
-
-Multi-user Nix builders run under `nix-daemon.service`, not the calling AMC user
-cgroup. `amc run -- nix build ...` limits only the client. The VM includes a
-synthetic derivation that demonstrates the escape location.
-
-`programs.amc.nixBuildPool` is disabled and rejects enablement. An aggregate
-daemon cap has host-wide blast radius and requires a separate VM test proving
-OOM behavior, socket recovery, and a subsequent successful build before it can
-be offered.
-
-## Rollback
-
-Remove the AMC module and rebuild NixOS. Stop/reset any retained transient unit;
-there is no resident daemon or persistent state to remove. User slice units
-disappear with the module on the next activation/login.
-
-## Non-goals
-
-v0.1 has no automatic sizing, percentages, learning, dynamic resize,
-`MemoryHigh`, systemd-oomd policy, restart, CPU/I/O controls, desktop metadata,
-portal, direct D-Bus client, or cross-daemon contract propagation. The next
-phase is the isolated Nix build-pool recovery experiment described in
-`docs/known-boundaries.md`.
+The optional NixOS AMC module installs the tool and private compatibility
+configuration. Its slices remain fixture-specific. Nix/Lix daemon builders,
+containers, remote work and independently launched servers are separate execution
+domains. `nixBuildPool` remains disabled and blocked; this milestone neither caps
+nor restarts a broker or production backend.
