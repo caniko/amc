@@ -1130,7 +1130,11 @@ mod tests {
         use amc_telemetry::Comparability;
         // Clean disappearance with no contrary evidence: prefix preserved.
         assert_eq!(
-            final_comparability("disappeared-or-empty", Comparability::MissingIdentity, false),
+            final_comparability(
+                "disappeared-or-empty",
+                Comparability::MissingIdentity,
+                false
+            ),
             Comparability::Compatible
         );
         assert_eq!(
