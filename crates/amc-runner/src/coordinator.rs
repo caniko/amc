@@ -204,23 +204,8 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{MemoryProvider, MemoryStats, ProviderError};
+    use crate::test_support::AtomicAvailable;
     use std::sync::Arc as StdArc;
-
-    struct FixedBytes {
-        total: u64,
-        available: u64,
-    }
-
-    impl MemoryProvider for FixedBytes {
-        fn used_fraction(&self) -> Result<f64, ProviderError> {
-            Ok(self.stats()?.used_fraction())
-        }
-
-        fn stats(&self) -> Result<MemoryStats, ProviderError> {
-            MemoryStats::new(self.total, self.available, 0)
-        }
-    }
 
     fn coordinator() -> Coordinator {
         let config = WeightedConfig {
@@ -228,13 +213,7 @@ mod tests {
             max_single_weight_bytes: u64::MAX,
             ..WeightedConfig::default()
         };
-        Coordinator::new(
-            config,
-            StdArc::new(FixedBytes {
-                total: 1000,
-                available: 1000,
-            }),
-        )
+        Coordinator::new(config, AtomicAvailable::shared(1000, 1000))
     }
 
     #[test]

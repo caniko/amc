@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Result, bail};
 
+/// Default bound for one manager query.
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -17,7 +18,18 @@ pub fn capture(command: &mut Command) -> Result<String> {
     capture_with_limit(command, QUERY_TIMEOUT, OUTPUT_LIMIT)
 }
 
+/// Run a bounded manager query with a caller-supplied timeout, clamped to
+/// at `QUERY_TIMEOUT`, never extending the caller's budget. A zero timeout fails immediately without
+/// spawning: the caller's deadline is already exhausted.
+pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
+    if timeout.is_zero() {
+        bail!("diagnostic deadline exhausted; state unknown");
+    }
+    capture_with_limit(command, timeout.min(QUERY_TIMEOUT), OUTPUT_LIMIT)
+}
+
 fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     // A nonblocking socket avoids both pipe-reader threads and a descendant
     // holding stdout open indefinitely after the queried process has exited.
     //
@@ -26,6 +38,9 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
     // failures surface after ~100ms with the OS error preserved.
     let mut attempts = 0;
     let (mut reader, mut child) = loop {
+        if Instant::now() >= deadline {
+            bail!("diagnostic deadline exhausted; state unknown");
+        }
         let (reader, writer) = UnixStream::pair()?;
         reader.set_nonblocking(true)?;
         match command
@@ -37,7 +52,10 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
             Ok(child) => break (reader, child),
             Err(_) if attempts < 20 => {
                 attempts += 1;
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
@@ -47,7 +65,6 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
         }
     };
     command.stdout(Stdio::null());
-    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let result = (|| {
         let mut eof = false;

@@ -359,7 +359,6 @@ impl Drop for Attempt<'_> {
 mod tests {
     use super::*;
     use crate::providers::FixedProvider;
-    use crate::{MemoryStats, ProviderError};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -378,6 +377,17 @@ mod tests {
     fn script(path: &std::path::Path, text: &str) {
         fs::write(path, format!("#!{}\n{text}\n", shell().display())).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn assert_next_blocked_while_unreconciled(runner: &Runner, launcher: &Path) {
+        let next_argv = workload("exit 0");
+        assert!(matches!(
+            runner.run(
+                request(launcher, &next_argv, "app-amc-next@2.service", true),
+                || None,
+            ),
+            Err(RunError::Unreconciled)
+        ));
     }
 
     struct Fixture(PathBuf);
@@ -623,14 +633,7 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
             }
         ));
         assert_eq!(runner.committed_bytes(), 100);
-        let next_argv = workload("exit 0");
-        assert!(matches!(
-            runner.run(
-                request(&launcher, &next_argv, "app-amc-next@2.service", true),
-                || None,
-            ),
-            Err(RunError::Unreconciled)
-        ));
+        assert_next_blocked_while_unreconciled(&runner, &launcher);
         assert_eq!(runner.reconcile(unit, true).unwrap(), Cleanup::Unknown);
         assert_eq!(runner.committed_bytes(), 100);
         fixture.state("inactive");
@@ -735,14 +738,7 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
         // The service is stopped but its domain still holds this process.
         assert_eq!(runner.reconcile(unit, false).unwrap(), Cleanup::Unknown);
         assert_eq!(runner.committed_bytes(), 100);
-        let next_argv = workload("exit 0");
-        assert!(matches!(
-            runner.run(
-                request(&launcher, &next_argv, "app-amc-next@2.service", true),
-                || None,
-            ),
-            Err(RunError::Unreconciled)
-        ));
+        assert_next_blocked_while_unreconciled(&runner, &launcher);
     }
 
     #[test]
@@ -791,27 +787,10 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
         );
     }
 
-    struct FlipFlop {
-        calls: AtomicUsize,
-    }
-
-    impl crate::MemoryProvider for FlipFlop {
-        fn used_fraction(&self) -> Result<f64, ProviderError> {
-            Ok(self.stats()?.used_fraction())
-        }
-
-        fn stats(&self) -> Result<MemoryStats, ProviderError> {
-            let calls = self.calls.fetch_add(1, Ordering::SeqCst);
-            MemoryStats::new(1024, if calls == 0 { 100 } else { 1024 }, 0)
-        }
-    }
-
     #[test]
     fn expired_admission_deadline_starts_no_new_probe() {
         let fixture = Fixture::new();
-        let provider = std::sync::Arc::new(FlipFlop {
-            calls: AtomicUsize::new(0),
-        });
+        let provider = crate::test_support::FirstLowThenFull::shared();
         let runner = Runner::new(
             WeightedConfig {
                 safety_reserve_bytes: 0,
@@ -832,7 +811,7 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
             ),
             Err(RunError::Admission(AdmitError::TimedOut))
         ));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.calls(), 1);
         assert_eq!(runner.committed_bytes(), 0);
     }
 

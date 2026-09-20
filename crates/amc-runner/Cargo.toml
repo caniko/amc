@@ -15,6 +15,7 @@ sysinfo = ["dep:sysinfo"]
 systemd = ["sync", "dep:anyhow"]
 
 [dependencies]
+amc-telemetry = { path = "../amc-telemetry" }
 anyhow = { version = "1", optional = true }
 tracing = "0.1"
 tokio = { version = "1", features = [
@@ -34,3 +35,7 @@ tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
 ] }
+
+[[example]]
+name = "admission-diagnostics"
+required-features = ["sync"]

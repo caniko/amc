@@ -54,8 +54,13 @@
 mod config;
 #[cfg(feature = "sync")]
 pub mod coordinator;
+pub mod diagnostics;
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) mod gate_common;
 pub mod provider;
 pub mod providers;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod weighted;
 
 #[cfg(all(feature = "systemd", target_os = "linux"))]
@@ -92,7 +97,13 @@ impl std::fmt::Display for AdmitError {
             Self::Impossible { weight, budget } => {
                 write!(f, "reservation {weight} exceeds available budget {budget}")
             }
-            Self::Provider(error) => write!(f, "memory provider failed: {error}"),
+            // Never reprint ProviderError::Source text: it may contain
+            // downstream paths or custom provider messages.
+            Self::Provider(error) => write!(
+                f,
+                "memory provider failed: {}",
+                crate::diagnostics::sanitize_provider_error(error)
+            ),
             Self::TimedOut => f.write_str("timed out waiting for memory admission"),
         }
     }

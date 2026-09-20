@@ -8,7 +8,7 @@
 
 mod control;
 mod managed;
-pub use control::capture;
+pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
 
 use std::{
@@ -476,7 +476,6 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn waited_workloads_have_no_startup_deadline_after_acknowledgment() {
@@ -573,33 +572,15 @@ mod tests {
     /// using numeric `CLD_*` codes exactly like `systemctl show`.
     #[test]
     fn waited_success_still_requires_termination_evidence() {
-        let dir = std::env::temp_dir().join(format!(
-            "amc-bound-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|p| p.join("sh"))
-            .find(|p| p.is_file())
-            .unwrap();
-        let manager = dir.join("manager");
-        std::fs::write(
-            &manager,
-            format!(
-                "#!{}\n{}",
-                shell.display(),
-                r#"
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-bound");
+        let manager = show_manager(
+            &dir,
+            r#"
 case " $* " in *' stop '*|*' reset-failed '*) exit 0;; esac
 printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactive\nExecMainCode=1\nExecMainStatus=0\nControlGroup=/amc-test-collected\n'
-"#
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+        );
         let record = ClientRecord::default();
         assert_eq!(
             execute(
@@ -628,33 +609,10 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         );
     }
 
-    fn show_manager(dir: &std::path::Path, body: &str) -> PathBuf {
-        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|p| p.join("sh"))
-            .find(|p| p.is_file())
-            .unwrap();
-        let manager = dir.join("manager");
-        std::fs::write(&manager, format!("#!{}\n{body}\n", shell.display())).unwrap();
-        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
-        manager
-    }
-
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "amc-unit-cgroup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn unit_cgroup_dir_resolves_reported_groups() {
-        let dir = scratch();
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-unit-cgroup");
         let manager = show_manager(
             &dir,
             "printf 'LoadState=loaded\\nActiveState=active\\nControlGroup=/amc-test-x\\n'",
@@ -668,7 +626,8 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
 
     #[test]
     fn unit_cgroup_dir_rejects_unobservable_units() {
-        let dir = scratch();
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-unit-cgroup");
         let failing = show_manager(&dir, "exit 1");
         assert_eq!(unit_cgroup_dir(&failing, "app-amc-x@1.service"), None);
         let absent = show_manager(

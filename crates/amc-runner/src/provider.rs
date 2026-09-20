@@ -86,10 +86,20 @@ impl MemoryDomain {
 }
 
 /// Absolute memory state in bytes, one entry per observed domain.
+///
+/// `page_cache_bytes` is `None` when leaf cache accounting is unavailable
+/// (e.g. `memory.stat` unreadable). `None` is unknown, never zero: callers
+/// must not treat missing accounting as observed zero.
+///
+/// `page_cache_total` is the total the cache bytes belong to (the leaf
+/// cgroup's effective limit, or the host total for host accounting). A
+/// cache fraction must divide by this domain's total, never by an
+/// unrelated aggregated minimum across independently limited domains.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryStats {
     domains: Vec<MemoryDomain>,
-    page_cache_bytes: u64,
+    page_cache_bytes: Option<u64>,
+    page_cache_total: Option<u64>,
 }
 
 impl MemoryStats {
@@ -104,6 +114,22 @@ impl MemoryStats {
     ) -> Result<Self, ProviderError> {
         Self::from_domains(
             vec![MemoryDomain::new(total_bytes, available_bytes)?],
+            Some(page_cache_bytes),
+        )
+    }
+
+    /// Single-domain stats with explicit cache knowledge. `None` means
+    /// cache accounting was unavailable and must not be read as zero.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError`] when available exceeds total.
+    pub fn new_with_cache(
+        total_bytes: u64,
+        available_bytes: u64,
+        page_cache_bytes: Option<u64>,
+    ) -> Result<Self, ProviderError> {
+        Self::from_domains(
+            vec![MemoryDomain::new(total_bytes, available_bytes)?],
             page_cache_bytes,
         )
     }
@@ -115,15 +141,25 @@ impl MemoryStats {
     /// Returns [`ProviderError`] when `domains` is empty.
     pub fn from_domains(
         domains: Vec<MemoryDomain>,
-        page_cache_bytes: u64,
+        page_cache_bytes: impl Into<Option<u64>>,
     ) -> Result<Self, ProviderError> {
         if domains.is_empty() {
             return Err(ProviderError::new("no memory domains"));
         }
         Ok(Self {
             domains,
-            page_cache_bytes,
+            page_cache_bytes: page_cache_bytes.into(),
+            page_cache_total: None,
         })
+    }
+
+    /// Attach the total the cache bytes belong to. Single-domain providers
+    /// pass their own total; the cgroup provider passes the leaf's
+    /// effective limit (or the host total when the leaf is unlimited).
+    #[must_use]
+    pub fn with_cache_total(mut self, total_bytes: u64) -> Self {
+        self.page_cache_total = Some(total_bytes);
+        self
     }
 
     /// Observed domains, host first when present.
@@ -152,10 +188,46 @@ impl MemoryStats {
             .unwrap_or(0)
     }
 
-    /// Leaf page-cache bytes, or 0 if unknown.
+    /// Leaf page-cache bytes, or 0 if unknown (legacy compat).
+    ///
+    /// Prefer [`Self::page_cache_opt`]: a return of 0 here conflates
+    /// observed zero with unavailable accounting.
     #[must_use]
     pub fn page_cache_bytes(&self) -> u64 {
+        self.page_cache_bytes.unwrap_or(0)
+    }
+
+    /// Leaf page-cache bytes with explicit unknown. `None` must not be
+    /// treated as observed zero; when a policy requires this measurement,
+    /// callers use an explicit failure policy, otherwise they skip the
+    /// cache check without invalidating the observation.
+    #[must_use]
+    pub fn page_cache_opt(&self) -> Option<u64> {
         self.page_cache_bytes
+    }
+
+    /// Whether cache accounting is known.
+    #[must_use]
+    pub fn page_cache_known(&self) -> bool {
+        self.page_cache_bytes.is_some()
+    }
+
+    /// Total the cache bytes belong to, if the provider reported one.
+    /// Callers without an explicit total must fall back to their own
+    /// single domain total — never to a minimum aggregated across
+    /// independently limited domains.
+    #[must_use]
+    pub fn page_cache_total(&self) -> Option<u64> {
+        self.page_cache_total
+    }
+
+    /// Infer the total for cache accounting when none was explicitly attached.
+    /// Returns the explicit total if present, or the single domain's total
+    /// if there is exactly one domain. Otherwise returns `None`.
+    #[must_use]
+    pub fn infer_cache_total(&self) -> Option<u64> {
+        self.page_cache_total
+            .or_else(|| (self.domains.len() == 1).then(|| self.domains[0].total_bytes))
     }
 
     /// Highest used fraction among domains.

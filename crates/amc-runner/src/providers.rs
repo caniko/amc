@@ -12,13 +12,15 @@ use crate::provider::{
 ///
 /// Provider precedence is:
 ///
-/// 1. Linux cgroup-v2 accounting when the current process is in a cgroup-v2
-///    hierarchy.
-/// 2. Linux `/proc/meminfo`.
-/// 3. `sysinfo` when the `sysinfo` feature is enabled.
+/// 1. Linux: cgroup-v2 accounting for the calling process when it is in a
+///    cgroup-v2 hierarchy (host domains plus limited ancestors).
+/// 2. Linux: `/proc/meminfo` when no cgroup-v2 hierarchy is present.
+///    `sysinfo` is not consulted on Linux even when the feature is enabled.
+/// 3. Non-Linux with the `sysinfo` feature: `SysinfoProvider`.
 ///
 /// On unsupported target/feature combinations this returns a provider that
-/// reports [`ProviderError::Unsupported`].
+/// reports [`ProviderError::Unsupported`]. A cgroup placement error yields a
+/// failing provider that reports that error (sanitized by diagnostics).
 #[must_use]
 pub fn default_provider() -> SharedMemoryProvider {
     #[cfg(target_os = "linux")]
@@ -157,14 +159,17 @@ impl CgroupV2Provider {
     }
 
     fn read_current_at(dir: &std::path::Path) -> Option<u64> {
-        std::fs::read_to_string(dir.join("memory.current"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        // Shared strict parser from the observation core: rejects signs,
+        // overflow, and non-numeric text rather than coercing them.
+        let text = std::fs::read_to_string(dir.join("memory.current")).ok()?;
+        amc_telemetry::parse("memory.current", text.trim()).and_then(|v| v.as_u64())
     }
 
+    /// Leaf `memory.stat` file-cache bytes. `None` means unavailable and
+    /// must not be read as observed zero; see `MemoryStats::page_cache_opt`.
     fn read_file_cache_at(dir: &std::path::Path) -> Option<u64> {
         let stat = std::fs::read_to_string(dir.join("memory.stat")).ok()?;
-        Some(parse_cgroup_file_cache_bytes(&stat))
+        parse_cgroup_file_cache_opt(&stat)
     }
 }
 
@@ -205,7 +210,7 @@ impl MemoryProvider for CgroupV2Provider {
                 "cgroup ancestry truncated; remaining limits unknown",
             ));
         }
-        combine_domain(&host, &layers, leaf_cache.unwrap_or(0))
+        combine_domain(&host, &layers, leaf_cache)
     }
 }
 
@@ -286,23 +291,37 @@ fn tighter_limit(high: LimitObservation, max: LimitObservation) -> LimitObservat
 }
 
 /// Host plus each limited ancestor as separate domains.
+///
+/// `page_cache_bytes` is `None` when leaf cache accounting is unavailable;
+/// it is carried as unknown, never coerced to observed zero. The cache
+/// belongs to the leaf layer: its denominator is the leaf's effective
+/// limit when the leaf is limited, else the host total.
 #[cfg(target_os = "linux")]
 fn combine_domain(
     host: &MemoryStats,
     layers: &[(LimitObservation, Option<u64>)],
-    page_cache_bytes: u64,
+    page_cache_bytes: Option<u64>,
 ) -> Result<MemoryStats, ProviderError> {
     let mut domains = host.domains().to_vec();
-    for &(limit, current) in layers {
+    let mut leaf_total = None;
+    for (index, &(limit, current)) in layers.iter().enumerate() {
         let LimitObservation::Bytes(limit) = limit else {
             continue;
         };
+        if index == 0 {
+            leaf_total = Some(limit);
+        }
         let current = current.ok_or_else(|| {
             ProviderError::new("cgroup memory.current unreadable under a configured limit")
         })?;
         domains.push(MemoryDomain::new(limit, limit.saturating_sub(current))?);
     }
-    MemoryStats::from_domains(domains, page_cache_bytes)
+    let stats = MemoryStats::from_domains(domains, page_cache_bytes)?;
+    match (page_cache_bytes, leaf_total) {
+        (Some(_), Some(leaf)) => Ok(stats.with_cache_total(leaf)),
+        (Some(_), None) => Ok(stats.with_cache_total(host.total_bytes())),
+        (None, _) => Ok(stats),
+    }
 }
 
 /// Returns a fixed value (useful for tests).
@@ -336,7 +355,8 @@ impl MemoryProvider for FixedProvider {
         const ONE_GIB: u64 = 1024 * 1024 * 1024;
         let total = ONE_GIB;
         let available = (((1.0 - fraction).max(0.0)) * total as f64) as u64;
-        MemoryStats::new(total, available.min(total), 0)
+        // Test double with a declared zero cache over its own total.
+        Ok(MemoryStats::new(total, available.min(total), 0)?.with_cache_total(total))
     }
 }
 
@@ -391,7 +411,10 @@ impl MemoryProvider for SysinfoProvider {
             return Err(ProviderError::new("sysinfo reports total_memory = 0"));
         }
         let available = system.available_memory().min(total);
-        MemoryStats::new(total, available, 0)
+        // sysinfo reports no page-cache accounting: unknown, never a
+        // fabricated zero. Callers that require the measurement fail
+        // through the explicit policy instead.
+        Ok(MemoryStats::new_with_cache(total, available, None)?.with_cache_total(total))
     }
 }
 
@@ -403,18 +426,19 @@ fn parse_proc_meminfo(contents: &str) -> Result<f64, ProviderError> {
 fn parse_proc_meminfo_stats(contents: &str) -> Result<MemoryStats, ProviderError> {
     let mut total_kib = None;
     let mut available_kib = None;
-    let mut buffers_kib: u64 = 0;
-    let mut cached_kib: u64 = 0;
+    let mut buffers_kib: Option<u64> = None;
+    let mut cached_kib: Option<u64> = None;
 
     for line in contents.lines() {
         if let Some(v) = parse_meminfo_line(line, "MemTotal") {
             total_kib = Some(v);
         } else if let Some(v) = parse_meminfo_line(line, "MemAvailable") {
             available_kib = Some(v);
-        } else if let Some(v) = parse_meminfo_line(line, "Buffers") {
-            buffers_kib = v;
-        } else if let Some(v) = parse_meminfo_line(line, "Cached") {
-            cached_kib = v;
+        } else if is_meminfo_key(line, "Buffers") {
+            // Present-but-malformed is unknown, not zero: coerce neither.
+            buffers_kib = parse_meminfo_line(line, "Buffers");
+        } else if is_meminfo_key(line, "Cached") {
+            cached_kib = parse_meminfo_line(line, "Cached");
         }
     }
 
@@ -428,11 +452,22 @@ fn parse_proc_meminfo_stats(contents: &str) -> Result<MemoryStats, ProviderError
         return Err(ProviderError::new("MemAvailable cannot exceed MemTotal"));
     }
 
-    MemoryStats::new(
-        total.saturating_mul(1024),
-        available.saturating_mul(1024),
-        buffers_kib.saturating_add(cached_kib).saturating_mul(1024),
+    // Host page cache is Buffers+Cached, but only when both lines parsed.
+    // A missing or malformed line is unknown accounting, never observed zero.
+    let page_cache = match (buffers_kib, cached_kib) {
+        (Some(buffers), Some(cached)) => Some(buffers.saturating_add(cached).saturating_mul(1024)),
+        _ => None,
+    };
+    let total = total.saturating_mul(1024);
+    Ok(
+        MemoryStats::new_with_cache(total, available.saturating_mul(1024), page_cache)?
+            .with_cache_total(total),
     )
+}
+
+fn is_meminfo_key(line: &str, key: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(name, _)| name.trim() == key)
 }
 
 fn parse_meminfo_line(line: &str, key: &str) -> Option<u64> {
@@ -440,18 +475,23 @@ fn parse_meminfo_line(line: &str, key: &str) -> Option<u64> {
     if name.trim() != key {
         return None;
     }
-    rest.split_whitespace().next()?.parse::<u64>().ok()
+    // Strict digits-only: `str::parse::<u64>` would accept a leading `+`.
+    let digits = rest.split_whitespace().next()?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 #[cfg(target_os = "linux")]
-fn parse_cgroup_file_cache_bytes(contents: &str) -> u64 {
-    contents
-        .lines()
-        .find_map(|line| {
-            let rest = line.strip_prefix("file ")?;
-            rest.trim().parse::<u64>().ok()
-        })
-        .unwrap_or(0)
+fn parse_cgroup_file_cache_opt(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let rest = line.strip_prefix("file ")?.trim();
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest.parse::<u64>().ok()
+    })
 }
 
 #[cfg(test)]
@@ -492,7 +532,7 @@ mod tests {
     #[test]
     fn parses_cgroup_file_cache() {
         let contents = "anon 1024\nfile 4096\nkernel 512\n";
-        assert_eq!(parse_cgroup_file_cache_bytes(contents), 4096);
+        assert_eq!(parse_cgroup_file_cache_opt(contents), Some(4096));
     }
 
     #[cfg(target_os = "linux")]
@@ -505,7 +545,7 @@ mod tests {
                 (LimitObservation::Unlimited, Some(200 << 20)),
                 (LimitObservation::Bytes(1 << 30), Some(800 << 20)),
             ],
-            0,
+            Some(0),
         )
         .unwrap();
         assert_eq!(stats.total_bytes(), 1 << 30);
@@ -517,7 +557,8 @@ mod tests {
     #[test]
     fn host_pressure_is_not_hidden_by_empty_leaf() {
         let host = MemoryStats::new(1000, 200, 0).unwrap();
-        let stats = combine_domain(&host, &[(LimitObservation::Bytes(100), Some(0))], 0).unwrap();
+        let stats =
+            combine_domain(&host, &[(LimitObservation::Bytes(100), Some(0))], Some(0)).unwrap();
         assert_eq!(stats.total_bytes(), 100);
         assert_eq!(stats.available_bytes(), 100);
         assert!((stats.used_fraction() - 0.80).abs() < 1e-9);
@@ -532,7 +573,8 @@ mod tests {
             LimitObservation::Bytes(256)
         );
         let host = MemoryStats::new(1000, 900, 0).unwrap();
-        let stats = combine_domain(&host, &[(LimitObservation::Bytes(0), Some(0))], 0).unwrap();
+        let stats =
+            combine_domain(&host, &[(LimitObservation::Bytes(0), Some(0))], Some(0)).unwrap();
         assert_eq!(stats.total_bytes(), 0);
         assert_eq!(stats.available_bytes(), 0);
         assert_eq!(stats.used_fraction(), 1.0);
@@ -554,27 +596,15 @@ mod tests {
     #[test]
     fn unreadable_current_under_limit_is_error() {
         let host = MemoryStats::new(8 << 30, 4 << 30, 0).unwrap();
-        assert!(combine_domain(&host, &[(LimitObservation::Bytes(1 << 30), None)], 0).is_err());
-    }
-
-    #[cfg(target_os = "linux")]
-    fn scratch_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "amc-runner-cgroup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        assert!(
+            combine_domain(&host, &[(LimitObservation::Bytes(1 << 30), None)], Some(0)).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn sys_root_without_memory_files_is_not_an_error() {
-        let dir = scratch_dir();
+        let dir = crate::test_support::scratch_dir("amc-runner-cgroup");
         assert!(layer_limit(&dir, true).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -582,7 +612,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn for_dir_rejects_missing_directories() {
-        let dir = scratch_dir();
+        let dir = crate::test_support::scratch_dir("amc-runner-cgroup");
         assert!(CgroupV2Provider::for_dir(dir.join("missing")).is_err());
         assert!(CgroupV2Provider::for_dir(dir.clone()).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -606,7 +636,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn partial_limits_are_unknown() {
-        let dir = scratch_dir();
+        let dir = crate::test_support::scratch_dir("amc-runner-cgroup");
         std::fs::write(dir.join("memory.high"), b"512\n").unwrap();
         assert!(layer_limit(&dir, true).is_err());
         assert!(layer_limit(&dir, false).is_err());
@@ -616,9 +646,114 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn non_file_memory_interface_is_unknown() {
-        let dir = scratch_dir();
+        let dir = crate::test_support::scratch_dir("amc-runner-cgroup");
         std::fs::create_dir(dir.join("memory.max")).unwrap();
         assert!(observe_limit_file(&dir, "memory.max").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_denominator_is_the_leaf_limit_not_the_aggregate_minimum() {
+        // Leaf limit 2000, tighter ancestor 1000, host 8000: the aggregate
+        // minimum is 1000, but the leaf cache belongs to the leaf domain.
+        let host = MemoryStats::new(8000, 7000, 0).unwrap();
+        let stats = combine_domain(
+            &host,
+            &[
+                (LimitObservation::Bytes(2000), Some(500)),
+                (LimitObservation::Bytes(1000), Some(200)),
+            ],
+            Some(600),
+        )
+        .unwrap();
+        assert_eq!(stats.total_bytes(), 1000);
+        assert_eq!(stats.page_cache_total(), Some(2000));
+        // Unlimited leaf: the cache belongs to the host domain.
+        let stats = combine_domain(
+            &host,
+            &[(LimitObservation::Unlimited, Some(500))],
+            Some(600),
+        )
+        .unwrap();
+        assert_eq!(stats.page_cache_total(), Some(8000));
+        // Unknown cache carries no denominator either.
+        let stats =
+            combine_domain(&host, &[(LimitObservation::Bytes(2000), Some(500))], None).unwrap();
+        assert_eq!(stats.page_cache_opt(), None);
+        assert_eq!(stats.page_cache_total(), None);
+        // Host accounting: cache denominator is the host total.
+        let stats = parse_proc_meminfo_stats(
+            "MemTotal: 8000 kB\nMemAvailable: 7000 kB\nBuffers: 100 kB\nCached: 500 kB\n",
+        )
+        .unwrap();
+        assert_eq!(stats.page_cache_total(), Some(8000 * 1024));
+    }
+
+    #[test]
+    fn strict_current_parser_rejects_signs_and_overflow() {
+        // Shared core parser via the provider: signs and overflow are
+        // unknown, not coerced.
+        assert_eq!(
+            amc_telemetry::parse("memory.current", "18446744073709551616"),
+            None
+        );
+        assert_eq!(amc_telemetry::parse("memory.current", "-1"), None);
+        assert_eq!(amc_telemetry::parse("memory.current", "+1"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_cache_is_unknown_not_zero() {
+        // `memory.stat` without a `file` line: cache unknown, not observed 0.
+        assert_eq!(parse_cgroup_file_cache_opt("anon 1024\nkernel 512\n"), None);
+        assert_eq!(
+            parse_cgroup_file_cache_opt("anon 1024\nfile 4096\n"),
+            Some(4096)
+        );
+        // Explicit zero stays zero and known.
+        let known_zero = MemoryStats::new(1000, 500, 0).unwrap();
+        assert!(known_zero.page_cache_known());
+        assert_eq!(known_zero.page_cache_opt(), Some(0));
+        let unknown =
+            MemoryStats::from_domains(vec![MemoryDomain::new(1000, 500).unwrap()], None).unwrap();
+        assert!(!unknown.page_cache_known());
+        assert_eq!(unknown.page_cache_opt(), None);
+        // Legacy accessor conflates for compat; new code must use opt().
+        assert_eq!(unknown.page_cache_bytes(), 0);
+    }
+
+    #[test]
+    fn meminfo_cache_is_unknown_when_lines_missing_or_malformed() {
+        // Both lines present and numeric: known Buffers+Cached.
+        let stats = parse_proc_meminfo_stats(
+            "MemTotal: 8000 kB\nMemAvailable: 7000 kB\nBuffers: 100 kB\nCached: 500 kB\n",
+        )
+        .unwrap();
+        assert_eq!(stats.page_cache_opt(), Some(600 * 1024));
+        // Missing lines: unknown, not zero.
+        let stats = parse_proc_meminfo_stats("MemTotal: 8000 kB\nMemAvailable: 7000 kB\n").unwrap();
+        assert_eq!(stats.page_cache_opt(), None);
+        assert!(!stats.page_cache_known());
+        // Malformed line: unknown, not zero and not partial.
+        let stats = parse_proc_meminfo_stats(
+            "MemTotal: 8000 kB\nMemAvailable: 7000 kB\nBuffers: nope kB\nCached: 500 kB\n",
+        )
+        .unwrap();
+        assert_eq!(stats.page_cache_opt(), None);
+        // Signed values are rejected, not coerced.
+        let stats = parse_proc_meminfo_stats(
+            "MemTotal: 8000 kB\nMemAvailable: 7000 kB\nBuffers: +100 kB\nCached: 500 kB\n",
+        )
+        .unwrap();
+        assert_eq!(stats.page_cache_opt(), None);
+    }
+
+    #[test]
+    fn admit_error_display_never_reprints_provider_source() {
+        let sensitive = ProviderError::new("SENSITIVE token=abc pid=1234");
+        let rendered = format!("{}", crate::AdmitError::Provider(sensitive));
+        assert!(!rendered.contains("SENSITIVE"));
+        assert!(rendered.contains("provider-source-unavailable"));
     }
 }

@@ -9,34 +9,8 @@ use tokio::sync::Notify;
 
 use crate::AdmitError;
 use crate::config::Config;
-use crate::provider::{ProviderError, SharedMemoryProvider, finite_fraction};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemorySource {
-    Disabled,
-    Provider,
-    ThreadCapOnly,
-}
-
-impl MemorySource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Provider => "provider",
-            Self::ThreadCapOnly => "thread_cap_only",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct GateState {
-    active_tasks: usize,
-    throttled: bool,
-    throttle_logged: bool,
-    memory_scheduler_active: bool,
-    memory_source: MemorySource,
-    provider_failure_logged: bool,
-}
+use crate::gate_common::{Decision, GateState, decide};
+use crate::provider::{SharedMemoryProvider, finite_fraction};
 
 struct Inner {
     state: Mutex<GateState>,
@@ -71,108 +45,68 @@ impl AdmissionGate {
     /// Build a gate from a validated config and memory provider.
     #[must_use]
     pub fn new(config: Config, provider: SharedMemoryProvider) -> Self {
-        let mut memory_source = if config.memory_scheduler_enabled {
-            MemorySource::Provider
-        } else {
-            MemorySource::Disabled
-        };
-        let mut scheduler_active = config.memory_scheduler_enabled;
-        let mut provider_failure_logged = false;
-
-        if scheduler_active && let Err(e) = provider.used_fraction() {
-            tracing::warn!(
-                error = %e,
-                fail_open = config.fail_open_on_provider_error,
-                "memory provider failed at init"
-            );
-            if config.fail_open_on_provider_error {
-                scheduler_active = false;
-                memory_source = MemorySource::ThreadCapOnly;
-            }
-            provider_failure_logged = true;
-        }
-
-        Self {
+        let (state, init_event) = GateState::new(&config, &provider);
+        let gate = Self {
             inner: Arc::new(Inner {
-                state: Mutex::new(GateState {
-                    active_tasks: 0,
-                    throttled: false,
-                    throttle_logged: false,
-                    memory_scheduler_active: scheduler_active,
-                    memory_source,
-                    provider_failure_logged,
-                }),
+                state: Mutex::new(state),
                 notify: Notify::new(),
                 provider,
                 config,
             }),
+        };
+        if let Some(event) = init_event {
+            crate::gate_common::emit_gate_event(event);
         }
+        gate
     }
 
     /// Yield until a slot is available, then return a permit.
     pub async fn acquire(&self) -> Result<AdmissionPermit, AdmitError> {
         loop {
-            {
+            let usage = self
+                .inner
+                .provider
+                .used_fraction()
+                .and_then(finite_fraction);
+            let (decision, event) = {
                 let mut state = self.lock();
-                if !state.memory_scheduler_active {
-                    state.active_tasks += 1;
-                    return Ok(AdmissionPermit {
+                decide(&mut state, usage, &self.inner.config)
+            };
+            match decision {
+                Decision::Admitted => {
+                    // RAII ownership before subscriber work (see sync gate).
+                    let permit = AdmissionPermit {
                         gate: Some(self.clone()),
-                    });
-                }
-
-                match self
-                    .inner
-                    .provider
-                    .used_fraction()
-                    .and_then(finite_fraction)
-                {
-                    Ok(usage) => {
-                        if state.throttled {
-                            if usage < self.inner.config.resume_ram_fraction() {
-                                state.throttled = false;
-                                state.throttle_logged = false;
-                                tracing::info!(
-                                    current_ram_fraction = usage,
-                                    resume_ram_fraction = self.inner.config.resume_ram_fraction(),
-                                    active_tasks = state.active_tasks,
-                                    "RAM usage back below resume threshold; resuming admissions"
-                                );
-                                state.active_tasks += 1;
-                                return Ok(AdmissionPermit {
-                                    gate: Some(self.clone()),
-                                });
-                            }
-                            self.log_throttle(&mut state, usage);
-                        } else if usage > self.inner.config.max_ram_fraction {
-                            state.throttled = true;
-                            state.throttle_logged = false;
-                            self.log_throttle(&mut state, usage);
-                        } else {
-                            state.active_tasks += 1;
-                            return Ok(AdmissionPermit {
-                                gate: Some(self.clone()),
-                            });
-                        }
+                    };
+                    if let Some(event) = event {
+                        crate::gate_common::emit_gate_event(event);
                     }
-                    Err(e) => {
-                        if self.inner.config.fail_open_on_provider_error {
-                            self.disable_memory_scheduler(&mut state, &e);
-                            state.active_tasks += 1;
-                            return Ok(AdmissionPermit {
-                                gate: Some(self.clone()),
-                            });
-                        }
-                        return Err(AdmitError::Provider(e));
+                    return Ok(permit);
+                }
+                Decision::ProviderFailed(e) => {
+                    if let Some(event) = event {
+                        crate::gate_common::emit_gate_event(event);
+                    }
+                    return Err(AdmitError::Provider(e));
+                }
+                Decision::Wait => {
+                    if let Some(event) = event {
+                        crate::gate_common::emit_gate_event(event);
+                    }
+                    // Parked guard spans the sleep only: dropping this
+                    // future (cancellation) converges both the count and
+                    // the parked duration.
+                    let _parked = crate::gate_common::WaiterGuard::enter(
+                        &self.inner.state,
+                        crate::diagnostics::WaitReason::Pressure,
+                    );
+                    // Wait for either a release or the poll interval, whichever comes first.
+                    let notified = self.inner.notify.notified();
+                    tokio::select! {
+                        () = notified => {}
+                        () = tokio::time::sleep(self.inner.config.poll_interval) => {}
                     }
                 }
-            }
-
-            // Wait for either a release or the poll interval, whichever comes first.
-            let notified = self.inner.notify.notified();
-            tokio::select! {
-                () = notified => {}
-                () = tokio::time::sleep(self.inner.config.poll_interval) => {}
             }
         }
     }
@@ -192,6 +126,11 @@ impl AdmissionGate {
         self.lock().active_tasks
     }
 
+    /// Consistent diagnostics snapshot (see sync gate).
+    pub fn diagnostics(&self) -> crate::diagnostics::DiagnosticsSnapshot {
+        self.lock().snapshot()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
         self.inner
             .state
@@ -208,41 +147,6 @@ impl AdmissionGate {
         // each waiter's await branch goes through select! and re-acquires the
         // lock briefly before deciding whether to resume.
         self.inner.notify.notify_waiters();
-    }
-
-    fn log_throttle(&self, state: &mut GateState, usage: f64) {
-        if state.throttle_logged {
-            return;
-        }
-        if state.active_tasks > 0 {
-            tracing::warn!(
-                current_ram_fraction = usage,
-                max_ram_fraction = self.inner.config.max_ram_fraction,
-                active_tasks = state.active_tasks,
-                "RAM usage above threshold while tasks are in flight; throttling new admissions"
-            );
-        } else {
-            tracing::info!(
-                current_ram_fraction = usage,
-                max_ram_fraction = self.inner.config.max_ram_fraction,
-                "RAM usage above threshold; waiting before admitting more work"
-            );
-        }
-        state.throttle_logged = true;
-    }
-
-    fn disable_memory_scheduler(&self, state: &mut GateState, error: &ProviderError) {
-        if !state.provider_failure_logged {
-            tracing::warn!(
-                error = %error,
-                "memory provider failed at runtime; falling back to thread-cap-only scheduling"
-            );
-            state.provider_failure_logged = true;
-        }
-        state.memory_scheduler_active = false;
-        state.throttled = false;
-        state.throttle_logged = false;
-        state.memory_source = MemorySource::ThreadCapOnly;
     }
 }
 
@@ -301,10 +205,8 @@ mod tests {
     async fn falls_back_when_disabled() {
         let cfg = Config {
             memory_scheduler_enabled: false,
-            ..Config::default()
-        }
-        .validate()
-        .unwrap();
+            ..Config::validated_default()
+        };
         let gate = AdmissionGate::new(cfg, FixedProvider::shared(0.99));
         let _p = gate.acquire().await.unwrap();
         assert!(!gate.memory_scheduler_active());
@@ -322,5 +224,28 @@ mod tests {
     #[test]
     fn new_default_constructs() {
         let _gate = AdmissionGate::new_default();
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_waiter_count() {
+        let gate = AdmissionGate::new(
+            Config {
+                poll_interval: Duration::from_millis(5),
+                ..Config::default()
+            }
+            .validate()
+            .unwrap(),
+            FixedProvider::shared(0.99),
+        );
+        let gate_clone = gate.clone();
+        let handle = tokio::spawn(async move { gate_clone.acquire().await });
+        let started = std::time::Instant::now();
+        while gate.diagnostics().waiters == 0 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(gate.diagnostics().waiters, 1);
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(gate.diagnostics().waiters, 0);
     }
 }
