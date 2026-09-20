@@ -7,6 +7,7 @@ name = "amc"
 version = "0.1.0"
 dependencies = [
  "amc-runner",
+ "amc-telemetry",
  "anyhow",
  "clap",
  "serde",
@@ -18,10 +19,19 @@ dependencies = [
 name = "amc-runner"
 version = "0.1.0"
 dependencies = [
+ "amc-telemetry",
  "anyhow",
  "sysinfo",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "amc-telemetry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

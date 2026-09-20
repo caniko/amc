@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/amc-runner"]
+members = ["crates/amc-runner", "crates/amc-telemetry"]
 resolver = "3"
 
 [package]
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 amc-runner = { path = "crates/amc-runner", default-features = false, features = ["systemd"] }
+amc-telemetry = { path = "crates/amc-telemetry" }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
