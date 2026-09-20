@@ -3,6 +3,7 @@ mod control;
 mod helpers;
 mod systemd;
 mod telemetry;
+mod watch;
 
 use std::{path::PathBuf, thread, time::Duration};
 
@@ -59,6 +60,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Observe one unit's cgroup telemetry for a finite interval (read-only).
+    Watch {
+        unit: String,
+        /// Query a system unit rather than a unit in the current user manager.
+        #[arg(long)]
+        system: bool,
+        /// Observation length in seconds (1..=60).
+        #[arg(long, default_value_t = crate::watch::DEFAULT_SECONDS)]
+        seconds: u64,
+        /// Sampling interval in milliseconds (10..=1000).
+        #[arg(long, default_value_t = crate::watch::DEFAULT_INTERVAL_MS)]
+        interval_ms: u64,
+        /// Output directory (must not exist; created 0700).
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Offline comparison of two Snapshot JSON files.
+    Diff { before: PathBuf, after: PathBuf },
     /// Internal deterministic helpers used by proof tests.
     Test {
         #[command(subcommand)]
@@ -268,6 +287,20 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Watch {
+            unit,
+            system,
+            seconds,
+            interval_ms,
+            output,
+        } => crate::watch::watch(&crate::watch::WatchArgs {
+            unit,
+            system,
+            seconds,
+            interval_ms,
+            output,
+        }),
+        Command::Diff { before, after } => crate::watch::diff(&before, &after),
         Command::Test { command } => test_helper(command),
     }
 }

@@ -95,7 +95,7 @@ fn check_expected(name: &str, actual: &str, expected: Option<&str>) -> Result<()
     Ok(())
 }
 
-fn read_value(path: PathBuf) -> Result<String> {
+pub(crate) fn read_value(path: PathBuf) -> Result<String> {
     fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))
         .map(|value| value.trim().to_owned())

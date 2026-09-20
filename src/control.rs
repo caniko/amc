@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicI32, Ordering},
 };
 
-pub use amc_runner::systemd::capture;
+pub use amc_runner::systemd::{QUERY_TIMEOUT, capture, capture_with_timeout};
 
 static CANCELLED: AtomicI32 = AtomicI32::new(0);
 

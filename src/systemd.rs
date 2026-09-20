@@ -544,9 +544,9 @@ fn probe_transient_service(
             .get("ControlGroup")
             .context("systemctl did not report ControlGroup")?;
         let cgroup = cgroup_directory(control_group)?;
-        let memory_max = read_trimmed(cgroup.join("memory.max"))?;
-        let memory_swap_max = read_trimmed(cgroup.join("memory.swap.max"))?;
-        let oom_group = read_trimmed(cgroup.join("memory.oom.group"))?;
+        let memory_max = crate::helpers::read_value(cgroup.join("memory.max"))?;
+        let memory_swap_max = crate::helpers::read_value(cgroup.join("memory.swap.max"))?;
+        let oom_group = crate::helpers::read_value(cgroup.join("memory.oom.group"))?;
         let cgroup_ok = memory_max == expected_memory_max.to_string() && memory_swap_max == "0";
         Ok(ProbeEvidence {
             properties_ok: cgroup_ok,
@@ -693,6 +693,13 @@ fn parse_properties(text: &str) -> BTreeMap<String, String> {
                             && value.len() <= 4096
                             && !value.chars().any(char::is_control))
                 }
+                "InvocationID" => {
+                    // systemd InvocationID: 32 lowercase hex chars, empty when
+                    // the unit never ran in this boot. Reject anything else
+                    // rather than echoing it.
+                    value.is_empty()
+                        || (value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                }
                 _ => return None,
             };
             Some((
@@ -740,18 +747,17 @@ pub fn cgroup_directory(control_group: &str) -> Result<PathBuf> {
     Ok(Path::new("/sys/fs/cgroup").join(relative))
 }
 
-fn read_trimmed(path: PathBuf) -> Result<String> {
-    fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))
-        .map(|value| value.trim().to_owned())
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Inspection {
+    pub schema_version: u32,
     pub unit: String,
     pub manager_context: &'static str,
     pub observed_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     pub requested: &'static str,
     /// Manager-reported (systemctl show) settings.
     pub properties: BTreeMap<String, String>,
@@ -780,6 +786,7 @@ const MANAGER_PROPERTIES: &[&str] = &[
     "ActiveState",
     "SubState",
     "Result",
+    "InvocationID",
     "ExecMainCode",
     "ExecMainStatus",
     "Slice",
@@ -802,6 +809,66 @@ const MANAGER_PROPERTIES: &[&str] = &[
     "ManagedOOMMemoryPressure",
     "MemoryPressureWatch",
 ];
+
+/// Query a bounded subset of manager properties for one unit. Every
+/// requested name must be in the allowlist; anything else is rejected
+/// rather than forwarded to the manager.
+/// Leaf-only manager query bounded by the caller's remaining deadline.
+/// `timeout` is clamped to the query bounds by the transport; a zero
+/// timeout fails without spawning.
+pub fn leaf_status_with_timeout(
+    program: &Path,
+    unit: &str,
+    system: bool,
+    properties: &[&str],
+    timeout: Duration,
+) -> Result<BTreeMap<String, String>> {
+    validate_unit(unit)?;
+    for name in properties {
+        if !MANAGER_PROPERTIES.contains(name) {
+            bail!("property {name} is not in the diagnostic allowlist");
+        }
+    }
+    let mut command = Command::new(program);
+    command.args([
+        if system { "--system" } else { "--user" },
+        "show",
+        "--no-pager",
+    ]);
+    for property in properties {
+        command.arg(format!("--property={property}"));
+    }
+    let output = crate::control::capture_with_timeout(command.arg("--").arg(unit), timeout)?;
+    let mut parsed = parse_properties(&output);
+    for property in properties {
+        parsed
+            .entry(property.to_string())
+            .or_insert_with(|| "unknown (not reported)".into());
+    }
+    Ok(parsed)
+}
+
+/// Manager version from `systemctl --version` (first line, bounded).
+/// Best-effort: returns `"unknown (...)"` rather than failing the caller.
+pub fn manager_version(program: &Path, system: bool) -> String {
+    let mut command = Command::new(program);
+    command.args([
+        if system { "--system" } else { "--user" },
+        "--version",
+        "--no-pager",
+    ]);
+    match capture(&mut command) {
+        Ok(output) => {
+            let first = output.lines().next().unwrap_or("").trim();
+            if first.is_empty() || first.len() > 128 || first.chars().any(char::is_control) {
+                "unknown (malformed version output)".to_string()
+            } else {
+                first.to_string()
+            }
+        }
+        Err(_) => "unknown (manager version unavailable)".to_string(),
+    }
+}
 
 fn metadata(program: &Path, unit: &str, system: bool) -> Result<BTreeMap<String, String>> {
     let mut command = Command::new(program);
@@ -914,16 +981,27 @@ pub fn inspect(unit: &str, system: bool) -> Result<Inspection> {
         evidence_notes
             .push("no ControlGroup reported; kernel state unknown (unit may be gone)".into());
     }
+    let invocation_id = properties
+        .get("InvocationID")
+        .filter(|v| !v.is_empty() && !v.starts_with("unknown"))
+        .cloned();
     Ok(Inspection {
+        schema_version: 1,
         unit: unit.to_owned(),
         manager_context: if system { "system" } else { "user" },
         observed_unix_ms,
+        boot_id: amc_telemetry::read_boot_id(),
+        invocation_id,
         requested: "unknown: no launch request supplied to inspect; native units/drop-ins remain authoritative",
         properties,
         kernel,
         ancestors,
         evidence_notes,
     })
+}
+
+pub fn validate_unit_public(unit: &str) -> Result<()> {
+    validate_unit(unit)
 }
 
 fn validate_unit(unit: &str) -> Result<()> {
@@ -953,6 +1031,57 @@ mod tests {
                 .unwrap()
                 .contains("SENSITIVE")
         );
+    }
+
+    #[test]
+    fn leaf_status_rejects_non_allowlisted_properties_without_spawning() {
+        // Rejection happens before any subprocess: no manager interaction,
+        // no attacker-controlled property name forwarded to systemctl.
+        let program = Path::new("/nonexistent/systemctl");
+        let error = leaf_status_with_timeout(
+            program,
+            "app-amc-test@1.service",
+            false,
+            &["ExecStart"],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("allowlist"));
+        let error = leaf_status_with_timeout(
+            program,
+            "app-amc-test@1.service",
+            false,
+            &["Result"],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        // Allowlisted names pass validation and fail only on the missing
+        // program, proving the check order.
+        assert!(!format!("{error:#}").contains("allowlist"));
+    }
+
+    #[test]
+    fn leaf_status_zero_timeout_fails_without_spawning() {
+        // An exhausted deadline never spawns a client, even for an
+        // allowlisted property on an existing program.
+        let error = leaf_status_with_timeout(
+            Path::new("/bin/true"),
+            "app-amc-test@1.service",
+            false,
+            &["Result"],
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("deadline exhausted"));
+    }
+
+    #[test]
+    fn manager_version_never_fails_the_caller() {
+        // Best-effort metadata: an unreachable manager yields an explicit
+        // unknown marker, never an error that aborts observation.
+        let version = manager_version(Path::new("/nonexistent/systemctl"), false);
+        assert!(version.starts_with("unknown"));
+        assert!(!version.contains('\n'));
     }
 
     #[test]
