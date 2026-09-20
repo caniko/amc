@@ -15,6 +15,8 @@ activation client does not configure that backend. See
 ```sh
 amc inspect opencode.service --json
 amc inspect some-system-unit.service --system --json
+amc watch some-unit.service --seconds 10 --output /tmp/amc-watch-out
+amc diff /tmp/amc-watch-out/before.json /tmp/amc-watch-out/after.json
 ./scripts/prove-local.sh opencode.service
 ```
 
@@ -25,6 +27,14 @@ value and a reason, never an invented zero. The visible mount root is a
 namespace boundary, not proof that no hidden ancestor exists. Manager queries
 are bounded to 2 seconds and 64 KiB each; ancestry has a disclosed 64-cgroup
 limit and a 10-second manager-query budget (one in-flight query can add 2 seconds).
+
+`amc watch` observes one unit for a finite interval (read-only; never starts,
+stops, or reconfigures the target) and writes bounded `samples.jsonl` plus an
+atomic `summary.json` with explicit coverage flags — completion is earned, and
+counter deltas require verified lifetime continuity, never matching paths
+alone. `amc diff` compares two observation files offline with per-field
+reasons for unsupported comparisons. See [telemetry](docs/telemetry.md) for
+the observation model, identity rules, and remaining limits.
 
 Default text/JSON diagnostics omit application journal messages, `ExecStart`,
 `Environment`, and arbitrary subprocess error streams. This is omission, not
