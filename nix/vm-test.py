@@ -48,7 +48,7 @@ ARTIFACTS = (
     "/tmp/entry.json", "/tmp/high.json", "/tmp/hog-entry.json",
     "/tmp/work-a.json", "/tmp/work-b.json", "/tmp/work-c.json",
     "/tmp/precedence-one.json", "/tmp/precedence-two.json", "/tmp/precedence-winner.json",
-    "/tmp/oom-watch/samples.jsonl", "/tmp/oom-watch/summary.json",
+    "/tmp/oom-watch/samples.jsonl", "/tmp/oom-watch/summary.json", "/tmp/oom-watch/manifest.json",
 )
 
 
@@ -499,8 +499,10 @@ try:
         pids = machine.succeed(f"cat /sys/fs/cgroup{path}/cgroup.procs").split()
         assert len(pids) >= 2
         own("amc-observer.service")
+        # Rust observer runs outside the tested failure domain in its own
+        # unit; placement (shared ancestors) is recorded in manifest.json.
         user("systemd-run --user --unit=amc-observer.service -p RuntimeMaxSec=45 "
-             f"-- python3 /etc/amc-watch-cgroup.py /sys/fs/cgroup{path} /tmp/oom-watch --seconds 40")
+             f"-- amc watch {shlex.quote(unit)} --seconds 40 --interval-ms 20 --output /tmp/oom-watch")
         machine.wait_for_file("/tmp/oom-watch/ready", timeout=10)
         machine.fail("test -e /tmp/oom-watch/done")
         user("touch /tmp/release-oom")

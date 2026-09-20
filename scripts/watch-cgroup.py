@@ -9,15 +9,41 @@ FILES = ("cgroup.events", "memory.events", "memory.current", "memory.peak",
          "memory.swap.current", "memory.pressure")
 
 
+# DEPRECATED: `amc watch` (src/watch.rs over crates/amc-telemetry) is the
+# authoritative observer. This module remains only until the VM migration is
+# verified, then it is deleted. `parse` below deliberately matches the Rust
+# core byte-for-byte: lowercase+underscore keys, strict u64 values, duplicate
+# rejection, finite 0..=100 PSI averages, `max` literal only for limit files,
+# and `memory.oom.group` in {0,1}.
+import math
+
+_U64_MAX = 18446744073709551615
+
+
+def _u64(text):
+    if not text.isdigit():
+        raise ValueError("malformed")
+    value = int(text)
+    if value > _U64_MAX:
+        raise ValueError("malformed")
+    return value
+
+
 def parse(name, text):
-    if name.endswith("events"):
+    text = text.strip()
+    if name.endswith("events") or name == "memory.events.local":
         values = {}
         for line in text.splitlines():
-            key, value = line.split()
-            if key in values or not key.replace("_", "").isalpha():
+            parts = line.split()
+            if len(parts) != 2:
                 raise ValueError("malformed")
-            values[key] = int(value)
-        if not values or any(value < 0 for value in values.values()):
+            key, value = parts
+            if not key or any(not (c.isascii() and (c.islower() or c == "_")) for c in key):
+                raise ValueError("malformed")
+            if key in values:
+                raise ValueError("malformed")
+            values[key] = _u64(value)
+        if not values:
             raise ValueError("malformed")
         return values
     if name == "memory.pressure":
@@ -26,18 +52,37 @@ def parse(name, text):
             kind, *fields = line.split()
             if kind not in ("some", "full") or kind in values:
                 raise ValueError("malformed")
-            row = dict(field.split("=") for field in fields)
-            if set(row) != {"avg10", "avg60", "avg300", "total"} or len(fields) != 4:
+            if len(fields) != 4:
                 raise ValueError("malformed")
-            values[kind] = {key: int(value) if key == "total" else float(value)
-                            for key, value in row.items()}
-            if any(not 0 <= values[kind][key] <= 100 for key in ("avg10", "avg60", "avg300")):
+            row = {}
+            for field in fields:
+                if "=" not in field:
+                    raise ValueError("malformed")
+                key, value = field.split("=", 1)
+                if key in row:
+                    raise ValueError("malformed")
+                if key == "total":
+                    row[key] = _u64(value)
+                elif key in ("avg10", "avg60", "avg300"):
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        raise ValueError("malformed")
+                    if not math.isfinite(parsed) or not 0.0 <= parsed <= 100.0:
+                        raise ValueError("malformed")
+                    row[key] = parsed
+                else:
+                    raise ValueError("malformed")
+            if set(row) != {"avg10", "avg60", "avg300", "total"}:
                 raise ValueError("malformed")
+            values[kind] = row
         if set(values) != {"some", "full"}:
             raise ValueError("malformed")
         return values
-    value = int(text)
-    if value < 0:
+    if text == "max" and name in ("memory.max", "memory.high", "memory.swap.max"):
+        return text
+    value = _u64(text)
+    if name == "memory.oom.group" and value > 1:
         raise ValueError("malformed")
     return value
 

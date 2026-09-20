@@ -55,13 +55,22 @@ with tempfile.TemporaryDirectory() as directory:
     assert report["eventDeltas"] is None
     assert report["reason"] == "observer-not-ready"
     assert not (path / "report/ready").exists()
-for name, bad in [("memory.events", "oom -1"), ("memory.swap.current", "SENSITIVE"), ("memory.pressure", "some avg10=NaN")]:
+# Rust core (crates/amc-telemetry) is authoritative; the Python parser must
+# match it byte-for-byte until the deprecated module is deleted.
+for name, bad in [("memory.events", "oom -1"), ("memory.swap.current", "SENSITIVE"), ("memory.pressure", "some avg10=NaN"),
+                  ("memory.events", "OOM 1"), ("memory.events", "oom 1\noom 2"),
+                  ("memory.events", "oom 18446744073709551616"), ("memory.events", ""),
+                  ("memory.oom.group", "2"), ("memory.current", "max"),
+                  ("memory.pressure", "some avg10=inf avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0")]:
     try:
         watch.parse(name, bad)
     except ValueError:
         pass
     else:
         raise AssertionError("malformed telemetry accepted")
+assert watch.parse("memory.max", "max") == "max"
+assert watch.parse("memory.oom.group", "1") == 1
+assert watch.parse("memory.current", "0") == 0
 
 # Reuse the actual driver finalizer and outer finally, not a parallel harness.
 functions: list[ast.stmt] = [
@@ -152,15 +161,18 @@ else:
     raise AssertionError("host-side control wait was not bounded")
 assert time.monotonic() - started < 1
 
-with tempfile.TemporaryDirectory() as directory:
-    guest = FailedGuest("none")
-    budget_scope = {
+def driver_scope(guest, directory):
+    return {
         "json": json, "re": re, "shlex": shlex, "signal": signal, "time": time, "sys": sys,
         "ARTIFACTS": ("/tmp/work-a.json",), "machine": guest, "prefix": "fixture-user",
         "owned": {"app-amc-proof-abcd@1.service"}, "identity_files": {"/tmp/identity"},
         "observed_cgroups": {"app-amc-proof-abcd@1.service": "/fixture/app-amc-proof-abcd@1.service"},
         "artifact_dir": Path(directory), "recorded_artifacts": [],
     }
+
+with tempfile.TemporaryDirectory() as directory:
+    guest = FailedGuest("none")
+    budget_scope = driver_scope(guest, directory)
     exec(compile(ast.Module(body=functions, type_ignores=[]), "driver-budget", "exec"), budget_scope)
     report = budget_scope["finalize_run"](
         guest, "fixture-user", {"app-amc-proof-abcd@1.service"}, {"/tmp/identity"},
@@ -172,13 +184,7 @@ with tempfile.TemporaryDirectory() as directory:
 
 with tempfile.TemporaryDirectory() as directory:
     guest = FailedGuest("none")
-    time_scope = {
-        "json": json, "re": re, "shlex": shlex, "signal": signal, "time": time, "sys": sys,
-        "ARTIFACTS": ("/tmp/work-a.json",), "machine": guest, "prefix": "fixture-user",
-        "owned": {"app-amc-proof-abcd@1.service"}, "identity_files": {"/tmp/identity"},
-        "observed_cgroups": {"app-amc-proof-abcd@1.service": "/fixture/app-amc-proof-abcd@1.service"},
-        "artifact_dir": Path(directory), "recorded_artifacts": [],
-    }
+    time_scope = driver_scope(guest, directory)
     exec(compile(ast.Module(body=functions, type_ignores=[]), "driver-time-budget", "exec"), time_scope)
     report = time_scope["finalize_run"](
         guest, "fixture-user", {"app-amc-proof-abcd@1.service"}, {"/tmp/identity"},
@@ -190,13 +196,7 @@ with tempfile.TemporaryDirectory() as directory:
 
 with tempfile.TemporaryDirectory() as directory:
     guest = FailedGuest("transport-once")
-    pipe_scope = {
-        "json": json, "re": re, "shlex": shlex, "signal": signal, "time": time, "sys": sys,
-        "ARTIFACTS": ("/tmp/work-a.json",), "machine": guest, "prefix": "fixture-user",
-        "owned": {"app-amc-proof-abcd@1.service"}, "identity_files": {"/tmp/identity"},
-        "observed_cgroups": {"app-amc-proof-abcd@1.service": "/fixture/app-amc-proof-abcd@1.service"},
-        "artifact_dir": Path(directory), "recorded_artifacts": [],
-    }
+    pipe_scope = driver_scope(guest, directory)
     exec(compile(ast.Module(body=functions, type_ignores=[]), "driver-transport", "exec"), pipe_scope)
     report = pipe_scope["finalize_run"](
         guest, "fixture-user", {"app-amc-proof-abcd@1.service"}, {"/tmp/identity"},

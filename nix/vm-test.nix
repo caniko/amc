@@ -42,7 +42,6 @@ pkgs.testers.runNixOSTest {
       };
     };
     environment.systemPackages = [ pkgs.busybox pkgs.python3 ];
-    environment.etc."amc-watch-cgroup.py".source = ../scripts/watch-cgroup.py;
     environment.etc."amc-native-executable".text = "${pkgs.coreutils}/bin/sleep";
     # The package mechanism only scans etc/systemd/user and lib/systemd/user
     # (nixpkgs nixos/lib/systemd-lib.nix), so the fixture fragment lives at
