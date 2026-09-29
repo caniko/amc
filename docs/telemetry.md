@@ -22,6 +22,13 @@ Tokio runtime, subscribers, or exporters in the core. No `unsafe`.
 - `amc diff BEFORE AFTER`: offline comparison of two Snapshot files with
   per-field supported/unsupported outcomes. Inputs are size-checked
   before reading; identity comes only from fields the files carry.
+- `amc report CAPTURE_DIR [--json]`: offline validation and summary of one
+  watch capture. Markdown is the default; JSON includes coverage, suppressed
+  metrics, and collection integrity. Requires Python 3.11+ at runtime;
+  the Nix package supplies it. Malformed artifacts exit 2, while structurally
+  valid but incomplete captures remain explicitly incomplete in the report.
+  It reuses `scripts/validate-capture.py` rather than independently parsing
+  sample lifetimes. It never queries or changes the target.
 - `amc-runner` diagnostics: structured `tracing` events with stable names
   (`amc.admission.*`) and reason codes, plus `diagnostics()` snapshots
   with real timeout/waiter/transition counters. The library never

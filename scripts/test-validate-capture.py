@@ -114,6 +114,17 @@ with tempfile.TemporaryDirectory() as directory:
     assert report["metrics"]["hostUnknownCells"] == 0
     assert report["identity"]["clockDomain"] == "monotonic-clock"
     assert "nested" not in json.dumps(report)
+    hostile = {**report, "directory": "capture\n## Forged <script> ![img](https://example.invalid)",
+               "collection": {**report["collection"], "complete": False,
+                              "reason": "cancelled\nCollection: complete=True<script>"},
+               "identity": {**report["identity"], "clockDomain": None}}
+    markdown = validator.as_markdown(hostile)
+    assert "\n## Forged" not in markdown
+    assert "<script>" not in markdown
+    assert "Forged" in markdown and "\\n" in markdown
+    assert "&lt;script&gt;" in markdown
+    assert "![img](https://example.invalid)" not in markdown
+    assert "clock=unavailable" in markdown
     write_capture(directory / "pct", lagged)
     assert validator.validate(directory / "pct")["metrics"]["scheduleLagMs"]["p99"] == 9
 
@@ -442,6 +453,11 @@ with tempfile.TemporaryDirectory() as directory:
     assert report["collection"]["reason"] == "no-summary"
     assert report["collection"]["complete"] is False
     assert report["integrity"]["countsReconciled"] is False
+    write_capture(directory / "runningempty", [], summary=False)
+    empty = validator.as_markdown(validator.validate(directory / "runningempty"))
+    assert "reason=no-summary complete=False" in empty
+    assert "Identity: clock=unavailable" in empty
+    assert "Host MemAvailable (sampled): unavailable" in empty
 
     # Aborted shape stays valid but incomplete.
     write_capture(directory / "aborted", samples[:2],

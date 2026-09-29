@@ -24,9 +24,11 @@ verified as regular files via their descriptors without following symlinks,
 and only consumed metric fields are retained. Errors are sanitized
 (truncated, no raw input echoed). Behavior is identical under `python -O`.
 """
+import html
 import json
 import math
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -655,31 +657,67 @@ def format_percent(totals):
             f"windowMs={totals['windowMs']}")
 
 
+def markdown_text(value):
+    """Keep artifact-provided text on one line and inert in rendered HTML."""
+    if value is None:
+        return "unavailable"
+    text = json.dumps(value, ensure_ascii=False)[1:-1]
+    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", html.escape(text, quote=True))
+
+
+def sampled_gib(values):
+    if values is None:
+        return "unavailable (see suppressed metrics below)"
+    gib = 1 << 30
+    return (f"first {values['first'] / gib:.2f} GiB; "
+            f"minimum {values['min'] / gib:.2f} GiB; "
+            f"last {values['last'] / gib:.2f} GiB "
+            f"({values['knownPoints']}/{values['totalPoints']} samples)")
+
+
 def as_markdown(report):
-    lines = [f"# Capture validation: {report['directory']}", ""]
+    lines = [f"# Capture validation: {markdown_text(report['directory'])}", ""]
+    lines.append(f"Target: {markdown_text(report['manifest']['target']['unit'])}")
     collection = report["collection"]
-    lines.append(f"Collection: reason={collection['reason']} complete={collection['complete']}")
+    lines.append(f"Collection: reason={markdown_text(collection['reason'])} complete={collection['complete']}")
     identity = report["identity"]
-    lines.append(f"Identity: clock={identity['clockDomain']} observations={len(identity['observationIds'])} "
+    lines.append(f"Identity: clock={markdown_text(identity['clockDomain'])} observations={len(identity['observationIds'])} "
                  f"units={len(identity['units'])} invocations={len(identity['invocations'])} "
                  f"boots={len(identity['bootIds'])} inodes={len(identity['inodes'])}")
     metrics = report["metrics"]
     lines.append(f"Samples: {metrics['samples']} reconciled={report['integrity']['countsReconciled']}")
-    for label in ("memAvailableBytes", "swapFreeBytes"):
-        values = metrics[label]
-        lines.append(f"{label}: {values}" if values else f"{label}: unavailable")
+    lines.extend(["", "## Target cgroup (largest sampled values; not lifetime peaks)"])
+    for field in ("memory.current", "memory.swap.current"):
+        value = metrics["targetSampledMax"].get(field)
+        rendered = f"{value / (1 << 30):.2f} GiB" if value is not None else "unavailable"
+        lines.append(f"{field}: {rendered}")
+    events = report["collection"]["eventDeltas"]
+    if isinstance(events, dict):
+        rendered = []
+        for key in ("high", "max", "oom", "oom_kill", "oom_group_kill"):
+            value = events.get(key)
+            rendered.append(f"{key}={value if type(value) is int and 0 <= value < 2**64 else 'unavailable'}")
+        lines.append("Memory events (summary-reported deltas): " + ", ".join(rendered))
+    else:
+        lines.append("Memory events (summary-reported deltas): unavailable")
+    lines.extend(["", "## Host context (observer's /proc; not target attribution)"])
+    for field, label in (("memAvailableBytes", "MemAvailable"), ("swapFreeBytes", "SwapFree")):
+        lines.append(f"Host {label} (sampled): {sampled_gib(metrics[field])}")
     for label in ("swapPagesIn", "swapPagesOut", "majorFaults"):
         values = metrics[label]
         if values and values.get("windowMs"):
             lines.append(f"{label}: delta={values['delta']} perSecond={values['perSecond']:.3f} "
-                         f"windowMs={values['windowMs']} points={values['knownPoints']}/{values['totalPoints']}")
+                          f"windowMs={values['windowMs']} points={values['knownPoints']}/{values['totalPoints']}")
         else:
-            lines.append(f"{label}: {values}")
+            lines.append(f"{label}: unavailable (see suppressed metrics below)")
     for resource in ("Memory", "Cpu", "Io"):
         for row in ("some", "full"):
             lines.append(f"pressure.{resource.lower()}.{row}: "
                          f"{format_percent(report['metrics'][f'pressure{resource}'][row])}")
-    lines.append(f"timing: {metrics['scheduleLagMs']} {metrics['captureDurationUs']}")
+    lines.append(f"Schedule lag: p99={metrics['scheduleLagMs']['p99']} ms; "
+                 f"max={metrics['scheduleLagMs']['max']} ms")
+    lines.append(f"Capture read time: p99={metrics['captureDurationUs']['p99']} us; "
+                 f"max={metrics['captureDurationUs']['max']} us (not whole-observer CPU)")
     lines.append(f"unknown host cells: {metrics['hostUnknownCells']}")
     if report["suppressed"]:
         lines.append(f"suppressed: {', '.join(report['suppressed'])}")

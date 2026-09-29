@@ -20,7 +20,7 @@ use crate::{
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Disposable memory-policy fixtures on transient user services; real apps use native units/drop-ins"
+    about = "Inspect Linux memory controls, capture unit telemetry, and test fixture policies"
 )]
 struct Cli {
     /// Use this configuration file instead of searching standard locations.
@@ -81,6 +81,13 @@ enum Command {
     },
     /// Offline comparison of two Snapshot JSON files.
     Diff { before: PathBuf, after: PathBuf },
+    /// Validate and summarize one capture offline (Markdown by default).
+    Report {
+        capture: PathBuf,
+        /// Emit machine-readable JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal deterministic helpers used by proof tests.
     Test {
         #[command(subcommand)]
@@ -313,6 +320,24 @@ fn execute(cli: Cli) -> Result<i32> {
             }),
             output,
         }),
+        Command::Report { capture, json } => {
+            let mut command = std::process::Command::new("python3");
+            command
+                .args([
+                    "-I",
+                    "-B",
+                    "-c",
+                    include_str!("../scripts/validate-capture.py"),
+                ])
+                .arg(capture);
+            if !json {
+                command.arg("--markdown");
+            }
+            let status = command
+                .status()
+                .map_err(|_| anyhow::anyhow!("amc report requires Python 3.11+ on PATH"))?;
+            Ok(status.code().unwrap_or(1))
+        }
         Command::Diff { before, after } => crate::watch::diff(&before, &after),
         Command::Test { command } => test_helper(command),
     }

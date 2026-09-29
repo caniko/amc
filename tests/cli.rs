@@ -238,3 +238,111 @@ fn failed_client_spawn_publishes_identity_without_submission() {
     assert!(f.0.join("unit").exists());
     assert!(!f.0.join("calls").exists());
 }
+
+#[test]
+fn report_renders_a_complete_capture_offline_and_rejects_corruption() {
+    let f = Fixture::new();
+    let capture = f.0.join("capture");
+    fs::create_dir(&capture).unwrap();
+    let target = serde_json::json!({
+        "unit": "test.service", "cgroupPath": "/test.service", "invocationId": "inv-1"
+    });
+    let manifest = serde_json::json!({
+        "schemaVersion": 1, "observationId": "obs-1", "bootId": "boot-1",
+        "production": true, "seconds": 2, "intervalMs": 1000, "target": target
+    });
+    fs::write(capture.join("manifest.json"), manifest.to_string()).unwrap();
+    let samples: Vec<String> = (0..2)
+        .map(|seq| {
+            serde_json::json!({
+                "observationId": "obs-1", "clockDomain": "monotonic-clock",
+                "target": target,
+                "observation": {
+                    "schemaVersion": 1, "sequence": seq, "observedMonotonicMs": seq * 1000,
+                    "observedUnixMs": 1_700_000_000_000_u64 + seq * 1000,
+                    "invocationId": "inv-1", "bootId": "boot-1", "inode": 10,
+                    "path": "/test.service", "files": {
+                        "memory.current": {"value": 1_073_741_824_u64 + seq * 1024, "unknown": null},
+                        "memory.events": {"value": {"oom": 0, "max": seq}, "unknown": null},
+                        "cgroup.events": {"value": {"populated": 1}, "unknown": null}
+                    }
+                },
+                "host": {
+                    "observedMonotonicMs": seq * 1000,
+                    "observedUnixMs": 1_700_000_000_000_u64 + seq * 1000,
+                    "files": {"meminfo.MemAvailable": {
+                        "value": 8_000_000_000_u64 - seq * 1000, "unknown": null
+                    }}
+                },
+                "scheduleLagMs": 0, "captureDurationUs": 100
+            })
+            .to_string()
+        })
+        .collect();
+    let stream = format!("{}\n", samples.join("\n"));
+    fs::write(capture.join("samples.jsonl"), &stream).unwrap();
+    let summary = serde_json::json!({
+        "schemaVersion": 1, "observationId": "obs-1", "target": target,
+        "reason": "deadline", "complete": true,
+        "coverage": {"validBaseline": true, "incompletePersistence": false},
+        "eventDeltas": {"oom": 0, "max": 1},
+        "collection": {"attemptedSamples": 2, "persistedSamples": 2,
+                       "storageDurable": true, "bytesWritten": stream.len()}
+    });
+    fs::write(capture.join("summary.json"), summary.to_string()).unwrap();
+    fs::write(capture.join("ready"), "").unwrap();
+    fs::write(capture.join("done"), "").unwrap();
+
+    let markdown = bounded({
+        let mut command = f.command("reject");
+        command.args(["report"]).arg(&capture);
+        command
+    });
+    assert!(
+        markdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    let text = String::from_utf8_lossy(&markdown.stdout);
+    assert!(text.contains("Target: test.service"), "{text}");
+    assert!(
+        text.contains("Collection: reason=deadline complete=True"),
+        "{text}"
+    );
+    assert!(text.contains("Samples: 2 reconciled=True"), "{text}");
+    assert!(text.contains("memory.current: 1.00 GiB"), "{text}");
+    assert!(text.contains("oom=0"), "{text}");
+    assert!(
+        text.contains("Host MemAvailable (sampled): first"),
+        "{text}"
+    );
+    assert!(text.contains("GiB"), "{text}");
+    assert!(!text.contains("memAvailableBytes: {'first'"), "{text}");
+
+    let json = bounded({
+        let mut command = f.command("reject");
+        command.args(["report"]).arg(&capture).arg("--json");
+        command
+    });
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["collection"]["complete"], true);
+    assert_eq!(
+        report["metrics"]["memAvailableBytes"]["min"],
+        7_999_999_000_u64
+    );
+    assert!(!f.0.join("queries").exists());
+
+    fs::write(capture.join("samples.jsonl"), "malformed\n").unwrap();
+    let rejected = bounded({
+        let mut command = f.command("reject");
+        command.args(["report"]).arg(&capture);
+        command
+    });
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!f.0.join("queries").exists());
+}

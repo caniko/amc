@@ -11,6 +11,33 @@ modular product direction, explicit user-selected priorities, and gaming plus
 background work as the first evaluation target. General-adoption and performance
 claims remain gated on that evaluation; observation does not enable a policy.
 
+## Install and first report
+
+Linux with systemd and cgroup v2 is the initial inspection/capture target.
+From a checkout, install the CLI with Nix (`nix profile install .#default`)
+or Rust (`cargo install --path . --locked`). `amc report` additionally needs
+Python 3.11 or newer on `PATH`; the Nix package includes it. Reporting is
+offline and needs neither systemd nor access to the observed machine.
+
+```sh
+# Identify the actual service/scope that owns your workload first.
+systemctl --user list-units --type=service,scope --state=running --no-pager
+systemctl --user show actual-workload.service --property=ControlGroup --property=InvocationID
+
+# Replace actual-workload.service with the unit you found. Capture is passive.
+amc inspect actual-workload.service
+amc watch actual-workload.service --production --seconds 60 --output ./amc-session-01
+amc report ./amc-session-01
+amc report ./amc-session-01 --json
+```
+
+Choose a new output directory for every capture. The report checks the
+capture's identity, stored sample counts, and completion evidence before
+deriving available metrics. `complete` describes collection, not proof that
+the entire workload lifetime was observed. Unknown/partial measurements stay
+visible. See [telemetry](docs/telemetry.md) for interpretation and
+[admission](docs/admission-contract.md) for cooperative workloads.
+
 **Real applications stay with their existing native lifecycle owner.** For
 OpenCode, the discovered shared backend is `opencode.service`; wrapping an
 activation client does not configure that backend. See
@@ -24,6 +51,7 @@ amc inspect some-system-unit.service --system --json
 amc watch some-unit.service --seconds 10 --output /tmp/amc-watch-out
 amc watch some-unit.service --production --output /tmp/amc-production-out
 amc diff /tmp/amc-watch-out/before.json /tmp/amc-watch-out/after.json
+amc report /tmp/amc-production-out --json
 ./scripts/prove-local.sh opencode.service
 ```
 

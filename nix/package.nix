@@ -1,18 +1,21 @@
 {
   lib,
+  makeWrapper,
+  python3,
   rustPlatform,
 }:
 rustPlatform.buildRustPackage {
   pname = "amc";
   version = "0.1.0";
 
-  # Only Cargo build inputs: harness-only edits (docs/, scripts/, most of
-  # nix/) must not rebuild the package or invalidate its cache entry. The one
-  # exception is nix/vm-test.py, embedded by src/systemd.rs via include_str!.
+  # Only Cargo build inputs: most docs/, scripts/, and nix/ edits do not
+  # rebuild the package. The two embedded exceptions are nix/vm-test.py
+  # (systemd fixture) and scripts/validate-capture.py (offline report).
   src = lib.cleanSourceWith {
     src = ../.;
-    filter = path: _type:
-      let rel = lib.removePrefix (toString ../. + "/") (toString path); in
+    filter = path: _type: let
+      rel = lib.removePrefix (toString ../. + "/") (toString path);
+    in
       builtins.elem (builtins.head (lib.splitString "/" rel)) [
         "Cargo.toml"
         "Cargo.lock"
@@ -21,16 +24,22 @@ rustPlatform.buildRustPackage {
         "tests"
       ]
       || rel == "nix"
-      || rel == "nix/vm-test.py";
+      || rel == "nix/vm-test.py"
+      || rel == "scripts"
+      || rel == "scripts/validate-capture.py";
   };
   cargoLock.lockFile = ../Cargo.lock;
   cargoBuildFlags = ["-p" "amc"];
   cargoTestFlags = ["-p" "amc"];
 
   strictDeps = true;
+  nativeBuildInputs = [makeWrapper python3];
+  postFixup = ''
+    wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3]}
+  '';
 
   meta = {
-    description = "Disposable memory-policy fixtures and diagnostics for Linux user services (RFC 0.4 harness)";
+    description = "Linux memory diagnostics, capture reporting, and disposable policy fixtures";
     license = with lib.licenses; [
       asl20
       mit

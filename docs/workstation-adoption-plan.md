@@ -12,6 +12,13 @@ we can test in production". The [telemetry prerequisite](#telemetry-prerequisite
 below records that narrower delivered slice. It does not close the gaming
 benchmark, policy, coordination, or broader-adoption gates.
 
+Diagnostic-preview update (2026-09-29): `amc report CAPTURE_DIR` now exposes the
+existing offline validator through the installed CLI, with a Markdown default,
+JSON option, and an [install-to-report walkthrough](../README.md#install-and-first-report).
+The Nix package supplies Python; Cargo installations need Python 3.11+ on
+`PATH`. A Nix package build and read-only report against the recorded Atlas
+capture passed. No non-NixOS platform or gaming benefit has been verified.
+
 ## Goal And Confirmed Decisions
 
 The user's goal is general adoption in prosumer/workstation situations and to
@@ -65,7 +72,7 @@ runtime validation:
 | Area | Existing foundation | Important limitation |
 |---|---|---|
 | Observation | [amc-telemetry](../crates/amc-telemetry/src/lib.rs) provides bounded readers, identity, comparisons, and explicit unknowns | It is independent of systemd transport, Tokio, subscribers, and exporters; preserve that boundary |
-| Diagnostics | `amc inspect`, finite `amc watch`, and offline `amc diff` | Collection completion is not complete lifetime accounting; missing terminal counters stay unavailable |
+| Diagnostics | `amc inspect`, finite `amc watch`, offline `amc diff`, and `amc report` | Collection completion is not complete lifetime accounting; missing terminal counters stay unavailable |
 | Admission | [amc-runner](../crates/amc-runner/src/lib.rs) has sync/async gates, providers, weighted admission, and diagnostics | Admission affects participating work; it cannot control every browser, game, broker, or already-running allocation |
 | Managed execution | [Runner](../crates/amc-runner/src/systemd/managed.rs) couples admission to owned systemd attempts and retains uncertain reservations | Native enforcement is verified separately; independent Runner instances do not share one global budget |
 | Coordination | [Coordinator](../crates/amc-runner/src/coordinator.rs) shares a byte budget in-process | Cross-process transport, authentication, and restart reconciliation are future work |
