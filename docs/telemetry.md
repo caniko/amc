@@ -100,6 +100,31 @@ held object: a supported prefix may remain while final coverage is unknown.
 Loaded JSON is checked for supported schema, bounded nonempty identities,
 measurement coherence and metric shape before comparison.
 
+The summary path is structural, not string-driven. The collection loop
+records a `LoopOutcome` at each exit site; the terminal verdict combines
+it with the independent endpoint comparability (`Intact`, `Restarted`,
+`Replaced`, `Disappeared`, `EndpointUnknown`) without consulting reason
+strings. Prefix deltas derive from the freshest map for intact,
+disappeared, or unconfirmed endpoints, and from the verified pre-change
+snapshot (last successful invocation poll) once a restart or replacement
+is known — post-change ticks still carry old labels until the next poll,
+so they never feed a delta. Each derived quantity carries its own start
+and end marks (elapsed time and sample sequence); `pressureStallCoverage`
+mirrors the counter coverage. A failed final query yields the additive
+`endpoint-query-failed` reason: collection finished, confirmation did
+not. `collection` tracks attempted samples separately from buffered
+(`persistedSamples`) and synced (`storageDurable`) ones; last-readable
+values keep their own per-field capture marks and never acquire the
+newer tick's timestamp. Final counters are available only with an
+intact terminal, a live endpoint, readable last-persisted counters,
+and durable persistence — a stale previously-persisted value after a
+failed final write stays unavailable. If the `done`
+marker itself fails, the summary is repaired to incomplete and the
+original error is returned; a missing `done` is incomplete evidence,
+never success. Contract change is additive only (`collection`,
+`pressureStallCoverage`, `endpoint-query-failed`); existing
+`summary.json` consumers ignore unknown fields.
+
 ## Admission diagnostics
 
 - State is assigned under the admission lock; formatting and subscriber
@@ -176,5 +201,13 @@ release-build or latency distribution. Treat them as such.
 - The Python `scripts/watch-cgroup.py` parser is deprecated and matches
   the Rust core byte-for-byte (digits-only u64, strict keys, finite
   PSI ranges) until deletion. VM OOM evidence now comes from
-  `amc watch`; the driver asserts `eventDeltas.oom_kill > 0`,
-  `maxObservedSwap == 0`, and `Result == oom-kill` as before.
+  `amc watch`; the driver asserts `eventDeltas.oom > 0`,
+  `maxObservedSwap == 0`, and `Result == oom-kill`. The `oom` event
+  delta is asserted rather than `oom_kill` because the observed kernel
+  reports the group OOM as an event without charging either kill
+  counter to the unit cgroup; asserting `oom_kill` would encode an
+  unverified kernel-accounting assumption.
+- A per-tick lookup that finds no directory is disappearance
+  (`disappeared-or-empty`), never suspected replacement: only a
+  different present inode describes a new object. Collected cgroups
+  therefore keep the disappearance verdict and their readable prefix.

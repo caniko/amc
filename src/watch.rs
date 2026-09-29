@@ -36,6 +36,12 @@ pub const MAX_INTERVAL_MS: u64 = 1000;
 pub const MAX_SAMPLES: usize = 5000;
 pub const MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Output budget predicate: one probe byte past the cap refuses the next
+/// sample before any allocation for it.
+fn budget_exceeded(bytes_written: u64, line_len: usize) -> bool {
+    bytes_written + line_len as u64 + 1 > MAX_OUTPUT_BYTES
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchArgs {
     pub unit: String,
@@ -81,7 +87,7 @@ struct TargetRef {
     invocation_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LastReadable {
     unix_ms: u128,
@@ -89,7 +95,28 @@ struct LastReadable {
     /// field keeps its own capture time: a stale counter must never be
     /// divided by (or differenced across) a newer tick's timestamp.
     elapsed_ms: u64,
+    /// Sample sequence number of the producing tick.
+    sequence: u64,
+    /// Directory inode observed on the producing tick. Prefix endpoints
+    /// are built from this, not from a later lookup, so a replacement
+    /// cannot retroactively validate earlier values.
+    inode: Option<u64>,
     value: serde_json::Value,
+}
+
+/// Verified readable prefix: the last-readable map as of the most recent
+/// successful invocation poll.
+///
+/// Polls verify the manager-reported invocation, so every value in here
+/// predates any restart the loop later detects: a change after the poll
+/// is caught by the next poll or tick check, never retroactively. When
+/// the terminal state is a restart or replacement, deltas derive from
+/// this snapshot — never from post-change ticks that still carry the old
+/// labels. Per-value timestamps and inodes come from the entries
+/// themselves (see [`LastReadable`]).
+#[derive(Debug, Clone, Default)]
+struct VerifiedPrefix {
+    values: BTreeMap<String, LastReadable>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +153,7 @@ struct Summary {
     complete: bool,
     target: TargetRef,
     coverage: CoverageOut,
+    collection: CollectionOut,
     event_deltas: Option<BTreeMap<String, serde_json::Value>>,
     /// Endpoint coverage of the derived counter interval, never lifetime accounting.
     event_delta_coverage: Option<serde_json::Value>,
@@ -139,6 +167,10 @@ struct Summary {
     pressure_stall: Option<BTreeMap<String, f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pressure_stall_reason: Option<String>,
+    /// Endpoint coverage of the derived PSI interval, same shape as the
+    /// counter coverage. Present only with `pressure_stall`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pressure_stall_coverage: Option<serde_json::Value>,
     max_observed_swap: Option<u64>,
     max_observed_current: Option<u64>,
     last_readable: BTreeMap<String, LastReadable>,
@@ -238,31 +270,339 @@ fn create_private_dir(output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Precedence between the loop's terminal reason and the endpoint
-/// comparability verdict.
-///
-/// Held file descriptions remain evidence about the original object after
-/// its pathname disappears, so disappearance alone preserves a verified
-/// readable prefix. But positive evidence of a different lifetime still
-/// wins: a restart in the final gap must not hide behind the
-/// disappearance and produce cross-lifetime deltas.
-fn final_comparability(
-    reason: &str,
-    endpoint: amc_telemetry::Comparability,
-    end_alive: bool,
-) -> amc_telemetry::Comparability {
-    use amc_telemetry::Comparability;
-    if reason == "invocation-changed" {
-        Comparability::RestartDetected
-    } else if !end_alive {
-        match endpoint {
-            Comparability::RestartDetected
-            | Comparability::ReplacementSuspected
-            | Comparability::ContextMismatch => endpoint,
-            _ => Comparability::Compatible,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionOut {
+    /// Ticks sampled, including ticks where files were unreadable.
+    attempted_samples: u64,
+    /// Sample lines accepted by the OS buffer without I/O error.
+    persisted_samples: u64,
+    /// The samples file was flushed and synced before the summary.
+    storage_durable: bool,
+}
+
+/// What the collection loop observed, recorded at each exit site.
+/// This is loop evidence only; the terminal verdict combines it with the
+/// independent final endpoint query in [`terminal_state`]. Reason strings
+/// are output, never decision input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopOutcome {
+    Deadline,
+    DisappearedOrEmpty,
+    ReplacementSuspected,
+    InvocationChanged,
+    Cancelled,
+    OutputBudgetExceeded,
+    OutputWriteFailed,
+    SampleBudgetExceeded,
+    ObserverNotReady,
+}
+
+impl LoopOutcome {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::DisappearedOrEmpty => "disappeared-or-empty",
+            Self::ReplacementSuspected => "replacement-suspected",
+            Self::InvocationChanged => "invocation-changed",
+            Self::Cancelled => "cancelled",
+            Self::OutputBudgetExceeded => "output-budget-exceeded",
+            Self::OutputWriteFailed => "output-write-failed",
+            Self::SampleBudgetExceeded => "sample-budget-exceeded",
+            Self::ObserverNotReady => "observer-not-ready",
         }
+    }
+}
+
+/// Final endpoint verdict: the loop outcome combined with the
+/// independent post-loop endpoint evidence. Retained independently of
+/// any readable prefix: a valid earlier prefix never erases disappearance,
+/// restart, replacement, or an unconfirmable endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalState {
+    Intact,
+    Restarted,
+    Replaced,
+    Disappeared,
+    EndpointUnknown,
+}
+
+impl TerminalState {
+    fn as_reason(self) -> &'static str {
+        match self {
+            // Intact has no failure to name; callers use the loop reason.
+            Self::Intact => "compatible",
+            Self::Restarted => "restart-detected",
+            Self::Replaced => "replacement-suspected",
+            Self::Disappeared => "disappeared",
+            Self::EndpointUnknown => "missing-identity",
+        }
+    }
+}
+
+fn terminal_state(
+    loop_outcome: LoopOutcome,
+    endpoint: amc_telemetry::Comparability,
+) -> TerminalState {
+    use amc_telemetry::Comparability;
+    match loop_outcome {
+        // Positive loop evidence of a different lifetime wins over any
+        // endpoint verdict, including a compatible-looking one.
+        LoopOutcome::InvocationChanged => TerminalState::Restarted,
+        LoopOutcome::ReplacementSuspected => TerminalState::Replaced,
+        LoopOutcome::DisappearedOrEmpty => TerminalState::Disappeared,
+        _ => match endpoint {
+            Comparability::Compatible => TerminalState::Intact,
+            Comparability::RestartDetected | Comparability::ContextMismatch => {
+                TerminalState::Restarted
+            }
+            Comparability::ReplacementSuspected | Comparability::PathMismatch => {
+                TerminalState::Replaced
+            }
+            Comparability::Disappeared => TerminalState::Disappeared,
+            Comparability::MissingIdentity => TerminalState::EndpointUnknown,
+        },
+    }
+}
+
+/// Prefix selection for a terminal verdict, pure for testing.
+///
+/// Restarts and replacements use the verified pre-change snapshot (empty
+/// means no pre-change evidence); intact, disappeared, and unconfirmed
+/// endpoints use the latest readable map. In particular a replacement
+/// followed by disappearance keeps the verified prefix — the later
+/// disappearance does not erase earlier evidence, and the terminal
+/// verdict stays replacement via [`terminal_state`].
+fn select_prefix<'a>(
+    terminal: TerminalState,
+    verified: Option<&'a BTreeMap<String, LastReadable>>,
+    latest: &'a BTreeMap<String, LastReadable>,
+) -> Option<&'a BTreeMap<String, LastReadable>> {
+    match terminal {
+        TerminalState::Restarted | TerminalState::Replaced => verified.filter(|v| !v.is_empty()),
+        TerminalState::Intact | TerminalState::Disappeared | TerminalState::EndpointUnknown => {
+            Some(latest)
+        }
+    }
+}
+
+/// One endpoint of a derived interval, with timestamp provenance.
+#[derive(Debug, Clone, Copy)]
+struct Mark {
+    elapsed_ms: u64,
+    sequence: u64,
+}
+
+/// Session identity constants for prefix endpoint construction.
+/// Invocation and boot come from attach-time verification; per-field
+/// inodes come from the producing ticks.
+struct SessionRef<'a> {
+    cgroup_path: &'a str,
+    unit: &'a str,
+    context: &'static str,
+    invocation: Option<&'a str>,
+    boot_id: Option<&'a str>,
+}
+
+impl SessionRef<'_> {
+    fn endpoint(&self, inode: Option<u64>) -> amc_telemetry::SourceIdentity {
+        amc_telemetry::SourceIdentity::new(
+            self.cgroup_path,
+            Some(self.unit),
+            Some(self.context),
+            None,
+            self.boot_id,
+            self.invocation,
+            inode,
+        )
+    }
+}
+
+/// Derived prefix evidence with per-interval endpoints. Every reported
+/// delta carries the baseline and prefix-end marks it was computed from;
+/// unsupported outcomes carry the explicit reason instead.
+struct IntervalSummary {
+    event_deltas: Option<BTreeMap<String, serde_json::Value>>,
+    delta_reason: Option<String>,
+    event_start: Option<Mark>,
+    event_end: Option<Mark>,
+    psi: Option<BTreeMap<String, f64>>,
+    psi_reason: Option<String>,
+    psi_start: Option<Mark>,
+    psi_end: Option<Mark>,
+}
+
+/// Pure interval summary over verified endpoints.
+///
+/// `prefix` already selects the right value set for the terminal state:
+/// the latest map for intact/disappeared/unconfirmed endpoints, the
+/// verified pre-change snapshot for restarts and replacements. Each
+/// derived quantity additionally requires its own endpoint
+/// comparability, so a missing or contradictory endpoint suppresses
+/// that quantity without touching the others or the terminal verdict.
+fn summarize_interval(
+    baseline: &Baseline,
+    prefix: Option<&BTreeMap<String, LastReadable>>,
+    terminal: TerminalState,
+    session: &SessionRef,
+) -> IntervalSummary {
+    use amc_telemetry::Comparability;
+    let terminal_reason = terminal.as_reason().to_string();
+    let mut out = IntervalSummary {
+        event_deltas: None,
+        delta_reason: Some(terminal_reason.clone()),
+        event_start: None,
+        event_end: None,
+        psi: None,
+        psi_reason: Some(terminal_reason),
+        psi_start: None,
+        psi_end: None,
+    };
+    // No verified values exist at all (change before the first poll):
+    // the terminal verdict is the whole story.
+    let Some(prefix) = prefix else {
+        let reason = terminal.as_reason().to_string();
+        out.delta_reason = Some(reason.clone());
+        out.psi_reason = Some(reason);
+        return out;
+    };
+    let prefix_comp = |entry: Option<&LastReadable>| -> (Comparability, Option<Mark>) {
+        match entry {
+            Some(last) => (
+                amc_telemetry::comparability(
+                    Some(&baseline.identity),
+                    Some(&session.endpoint(last.inode)),
+                    true,
+                    true,
+                ),
+                Some(Mark {
+                    elapsed_ms: last.elapsed_ms,
+                    sequence: last.sequence,
+                }),
+            ),
+            None => (Comparability::Disappeared, None),
+        }
+    };
+    // Event counters: missing or unreadable final values are partial
+    // evidence, never a zero delta — and a compatible lifetime with an
+    // unparsable value is partial, never a bare "compatible" with no
+    // delta to show for it.
+    let (events_comp, events_end) = prefix_comp(prefix.get("memory.events"));
+    let events = prefix
+        .get("memory.events")
+        .and_then(|m| m.value.as_object());
+    match (events_comp, events) {
+        (Comparability::Compatible, Some(obj)) => {
+            let end = events_end.expect("present entry always carries a mark");
+            let compared =
+                amc_telemetry::compare_event_maps(&baseline.events, obj, Comparability::Compatible);
+            let mut deltas = BTreeMap::new();
+            let mut first_unsupported = None;
+            for (key, field) in &compared {
+                if field.supported
+                    && let Some(value) = &field.delta
+                {
+                    deltas.insert(key.clone(), value.clone());
+                } else if first_unsupported.is_none() {
+                    first_unsupported = Some(field.reason.clone());
+                }
+            }
+            if let Some(reason) = first_unsupported {
+                out.delta_reason = Some(reason);
+            } else {
+                out.event_deltas = Some(deltas);
+                out.delta_reason = None;
+                out.event_start = Some(Mark {
+                    elapsed_ms: baseline.elapsed_ms,
+                    sequence: baseline.sequence,
+                });
+                out.event_end = Some(end);
+            }
+        }
+        (Comparability::Disappeared, _) | (Comparability::Compatible, None) => {
+            out.delta_reason = Some(amc_telemetry::compare::reason::PARTIAL.to_string());
+        }
+        (comp, _) => {
+            out.delta_reason = Some(comp.as_reason().to_string());
+        }
+    }
+    // PSI stall fractions over the pressure sample's own elapsed span,
+    // with the same lifetime requirement as counters. A missing or
+    // malformed pressure value is partial evidence however the lifetime
+    // compares.
+    let (psi_comp, psi_end) = prefix_comp(prefix.get("memory.pressure"));
+    let totals = prefix
+        .get("memory.pressure")
+        .and_then(|m| m.value.as_object())
+        .and_then(|o| {
+            let some = o.get("some")?.get("total")?.as_u64()?;
+            let full = o.get("full")?.get("total")?.as_u64()?;
+            Some((some, full))
+        });
+    let has_pressure_baseline = baseline.pressure_totals.is_some();
+    match (psi_comp, totals, has_pressure_baseline) {
+        (Comparability::Compatible, Some((last_some, last_full)), true) => {
+            let end = psi_end.expect("present entry always carries a mark");
+            let (base_some, base_full) = baseline.pressure_totals.expect("checked above");
+            let elapsed_us = end
+                .elapsed_ms
+                .checked_sub(baseline.elapsed_ms)
+                .and_then(|ms| ms.checked_mul(1000));
+            let some = amc_telemetry::psi_stall_fraction_strict(base_some, last_some, elapsed_us);
+            let full = amc_telemetry::psi_stall_fraction_strict(base_full, last_full, elapsed_us);
+            match (some, full) {
+                (Ok(some), Ok(full)) => {
+                    out.psi = Some(BTreeMap::from([
+                        ("some".to_string(), some),
+                        ("full".to_string(), full),
+                    ]));
+                    out.psi_reason = None;
+                    out.psi_start = Some(Mark {
+                        elapsed_ms: baseline.elapsed_ms,
+                        sequence: baseline.sequence,
+                    });
+                    out.psi_end = Some(end);
+                }
+                (Err(reason), _) | (_, Err(reason)) => {
+                    out.psi_reason = Some(reason.to_string());
+                }
+            }
+        }
+        (Comparability::Disappeared, _, _)
+        | (Comparability::Compatible, None, _)
+        | (_, _, false) => {
+            out.psi_reason = Some(amc_telemetry::compare::reason::PARTIAL.to_string());
+        }
+        (comp, _, _) => {
+            out.psi_reason = Some(comp.as_reason().to_string());
+        }
+    }
+    out
+}
+
+/// Full baseline tick: event map, pressure totals with their own
+/// capture mark, sample sequence, and the continuity evidence observed
+/// on that tick.
+struct Baseline {
+    events: serde_json::Map<String, serde_json::Value>,
+    pressure_totals: Option<(u64, u64)>,
+    elapsed_ms: u64,
+    sequence: u64,
+    identity: amc_telemetry::SourceIdentity,
+}
+
+/// Classify one per-tick continuity check against the pinned attach
+/// inode. A vanished path is disappearance — nothing here describes a
+/// new object — while a different present inode is a suspected
+/// replacement. Conflating the two would route a collected cgroup into
+/// the verified-prefix path and erase the disappearance verdict.
+fn tick_continuity(tick: Option<u64>, pinned: Option<u64>) -> Option<LoopOutcome> {
+    if tick.is_none() {
+        Some(LoopOutcome::DisappearedOrEmpty)
+    } else if tick != pinned {
+        Some(LoopOutcome::ReplacementSuspected)
     } else {
-        endpoint
+        None
     }
 }
 
@@ -288,6 +628,24 @@ fn final_counters_available(
         && last_attempt
             .and_then(|sample| sample.files.get("memory.events"))
             .is_some_and(|measurement| measurement.value.is_some())
+}
+
+/// Strict final availability: intact terminal, live endpoint, readable
+/// last persisted counters, and durable persistence. A stale
+/// previously-persisted value after a failed final write must not
+/// acquire availability, so any persistence failure forces unavailable.
+fn final_available(
+    terminal: TerminalState,
+    end_alive: bool,
+    incomplete_persistence: bool,
+    storage_durable: bool,
+    last_persisted: Option<&amc_telemetry::Snapshot>,
+) -> bool {
+    terminal == TerminalState::Intact
+        && end_alive
+        && !incomplete_persistence
+        && storage_durable
+        && final_counters_available(last_persisted, end_alive)
 }
 
 /// Observe one unit for a finite interval. Read-only toward the target.
@@ -340,11 +698,17 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                 final_counters_unavailable: true,
                 incomplete_persistence: false,
             },
+            collection: CollectionOut {
+                attempted_samples: 0,
+                persisted_samples: 0,
+                storage_durable: false,
+            },
             event_deltas: None,
             event_delta_coverage: None,
             delta_unsupported_reason: None,
             pressure_stall: None,
             pressure_stall_reason: None,
+            pressure_stall_coverage: None,
             max_observed_swap: None,
             max_observed_current: None,
             last_readable: BTreeMap::new(),
@@ -411,24 +775,24 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
 
     let interval = Duration::from_millis(args.interval_ms);
     let owner_boot_id = boot_id.clone();
+    let context: &'static str = if args.system { "system" } else { "user" };
     let mut sequence: u64 = 0;
-    /// Full baseline tick: event map, pressure totals with their own
-    /// capture mark, and the continuity evidence observed on that tick.
-    struct Baseline {
-        events: serde_json::Map<String, serde_json::Value>,
-        pressure_totals: Option<(u64, u64)>,
-        elapsed_ms: u64,
-        identity: amc_telemetry::SourceIdentity,
-    }
+    // Ticks attempted, including ticks whose samples never reached the
+    // stream. `sequence` only advances on successful writes, so it
+    // cannot serve as the attempt count.
+    let mut attempts: u64 = 0;
     let mut baseline: Option<Baseline> = None;
+    let mut verified: Option<VerifiedPrefix> = None;
     let mut last_readable: BTreeMap<String, LastReadable> = BTreeMap::new();
     let mut max_swap: Option<u64> = None;
     let mut max_current: Option<u64> = None;
-    let mut reason = "deadline".to_string();
+    let mut reason = LoopOutcome::Deadline.reason().to_string();
+    let mut outcome = LoopOutcome::Deadline;
     let mut baseline_ready = false;
     let mut first_tick_complete = false;
     let mut incomplete_persistence = false;
     let mut bytes_written: u64 = 0;
+    let mut persisted_samples: u64 = 0;
     let mut wrote_ready = false;
     // Pinned file descriptions for every sample: reads stay anchored to
     // the validated object even across a check-to-read race.
@@ -449,16 +813,18 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
 
     while Instant::now() < deadline && (sequence as usize) < MAX_SAMPLES {
         if signals.cancelled().is_some() {
-            reason = "cancelled".to_string();
+            outcome = LoopOutcome::Cancelled;
+            reason = outcome.reason().to_string();
             break;
         }
+        attempts += 1;
         let elapsed_ms = started_mono.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         // Continuity: the path may have been recycled for a new object
-        // between ticks. An inode change ends the interval rather than
-        // mixing two lifetimes into one baseline.
+        // between ticks (see `tick_continuity`).
         let tick_inode = amc_telemetry::SourceIdentity::inode_of(&cgroup_dir);
-        if tick_inode != pinned_inode {
-            reason = "replacement-suspected".to_string();
+        if let Some(end) = tick_continuity(tick_inode, pinned_inode) {
+            outcome = end;
+            reason = outcome.reason().to_string();
             break;
         }
         let mut snapshot = pinned_files.snapshot(&cgroup_path, Some(sequence), Some(elapsed_ms));
@@ -484,6 +850,8 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                     LastReadable {
                         unix_ms: sample_unix_ms,
                         elapsed_ms,
+                        sequence,
+                        inode: tick_inode,
                         value: v.clone(),
                     },
                 );
@@ -532,10 +900,11 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                 events: mem.clone(),
                 pressure_totals,
                 elapsed_ms,
+                sequence,
                 identity: amc_telemetry::SourceIdentity::new(
                     &cgroup_path,
                     Some(&args.unit),
-                    Some(if args.system { "system" } else { "user" }),
+                    Some(context),
                     None,
                     owner_boot_id.as_deref(),
                     invocation.as_deref(),
@@ -549,19 +918,22 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
             }
         }
         let line = serde_json::to_vec(&sample)?;
-        if bytes_written + line.len() as u64 + 1 > MAX_OUTPUT_BYTES {
-            reason = "output-budget-exceeded".to_string();
+        if budget_exceeded(bytes_written, line.len()) {
+            outcome = LoopOutcome::OutputBudgetExceeded;
+            reason = outcome.reason().to_string();
             incomplete_persistence = true;
             break;
         }
         // A failed sample write is incomplete persistence, not a silent
         // truncation: record it and stop instead of fabricating the rest.
         if samples.write_all(&line).is_err() || samples.write_all(b"\n").is_err() {
-            reason = "output-write-failed".to_string();
+            outcome = LoopOutcome::OutputWriteFailed;
+            reason = outcome.reason().to_string();
             incomplete_persistence = true;
             break;
         }
         bytes_written += line.len() as u64 + 1;
+        persisted_samples += 1;
         last_attempt = Some(sample.observation.clone());
         sequence += 1;
         if baseline_just_ready && !wrote_ready {
@@ -597,11 +969,13 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
             .and_then(|v| v.as_u64())
             == Some(0);
         if populated_gone {
-            reason = "disappeared-or-empty".to_string();
+            outcome = LoopOutcome::DisappearedOrEmpty;
+            reason = outcome.reason().to_string();
             break;
         }
         if amc_telemetry::SourceIdentity::inode_of(&cgroup_dir).is_none() {
-            reason = "disappeared-or-empty".to_string();
+            outcome = LoopOutcome::DisappearedOrEmpty;
+            reason = outcome.reason().to_string();
             break;
         }
         // Poll the manager at most once per second for invocation change,
@@ -611,6 +985,8 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         // appearing, disappearing, or changing under us all end the
         // interval. Two unknowns carry no information (the inode check
         // above remains the guard), so polling continues.
+        // A successful poll additionally snapshots the verified readable
+        // prefix: every value in it predates any restart detected later.
         if sequence.is_multiple_of(1000 / args.interval_ms.max(1)) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Ok(current) = super::systemd::leaf_status_with_timeout(
@@ -625,9 +1001,13 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                     .filter(|v| !v.is_empty() && !v.starts_with("unknown"))
                     .cloned();
                 if current_inv != invocation && (current_inv.is_some() || invocation.is_some()) {
-                    reason = "invocation-changed".to_string();
+                    outcome = LoopOutcome::InvocationChanged;
+                    reason = outcome.reason().to_string();
                     break;
                 }
+                verified = Some(VerifiedPrefix {
+                    values: last_readable.clone(),
+                });
             }
         }
         let next = started_mono + interval * (sequence as u32);
@@ -637,31 +1017,39 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         }
     }
     if (sequence as usize) >= MAX_SAMPLES
-        && matches!(reason.as_str(), "deadline")
+        && outcome == LoopOutcome::Deadline
         && Instant::now() < deadline
     {
         // The sample budget — not the clock — ended the interval. The
         // observed prefix stays usable, but it is truncated evidence.
-        reason = "sample-budget-exceeded".to_string();
+        outcome = LoopOutcome::SampleBudgetExceeded;
+        reason = outcome.reason().to_string();
     }
-    if samples.flush().is_err() {
+    // Durability: the samples file is flushed and synced before the
+    // summary may claim persistence. Unsynced acceptance is buffered,
+    // not durable.
+    let storage_durable = samples
+        .flush()
+        .and_then(|()| samples.get_ref().sync_all())
+        .is_ok();
+    if !storage_durable {
         incomplete_persistence = true;
-        if reason == "deadline" {
-            reason = "output-write-failed".to_string();
+        if outcome == LoopOutcome::Deadline {
+            outcome = LoopOutcome::OutputWriteFailed;
+            reason = outcome.reason().to_string();
         }
     }
     drop(samples);
 
     if !baseline_ready {
-        reason = "observer-not-ready".to_string();
+        outcome = LoopOutcome::ObserverNotReady;
+        reason = outcome.reason().to_string();
     }
-    // Final continuity state: the interval is comparable only when the
-    // cgroup is still the object we attached to. The endpoint identity
-    // comes from an independent final query — never from the attach-time
-    // values — so a restart in the final gap cannot silently reuse the
-    // original invocation ID and produce deltas across two lifetimes.
-    // The final query gets a fixed grace budget outside the sampling
-    // window; sampling itself was bounded by `deadline` above.
+    // Final continuity state from an independent post-loop query — never
+    // from attach-time values — so a restart in the final gap cannot
+    // silently reuse the original invocation ID and produce deltas across
+    // two lifetimes. The final query gets a fixed grace budget outside the
+    // sampling window; sampling itself was bounded by `deadline` above.
     let end_inode = amc_telemetry::SourceIdentity::inode_of(&cgroup_dir);
     let end_alive = end_inode.is_some();
     let final_leaf = super::systemd::leaf_status_with_timeout(
@@ -680,145 +1068,85 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
     let end_identity = amc_telemetry::SourceIdentity::new(
         &cgroup_path,
         Some(&args.unit),
-        Some(if args.system { "system" } else { "user" }),
+        Some(context),
         None,
         owner_boot_id.as_deref(),
         end_invocation.as_deref(),
         end_inode,
     );
-    // Re-query the leaf result at the end: the initial value describes
-    // attach time, not the interval outcome. Fall back to it only when the
-    // final query itself is unavailable.
+    let endpoint_identity = final_leaf.is_some().then_some(end_identity);
+    // The leaf result describes the interval outcome; the attach-time
+    // value is gone (no fallback): a failed final query stays unknown
+    // rather than borrowing an older answer.
     let final_manager_result = final_leaf
         .as_ref()
         .and_then(|m| m.get("Result").cloned())
         .filter(|v| !v.starts_with("unknown"));
-    // Deltas through the shared comparison engine with real continuity
-    // evidence. Anything but Compatible yields no delta and an explicit
-    // reason — never a last-readable number dressed as lifetime accounting.
-    // A lifetime change discovered only in the final gap rewrites a
-    // `deadline` reason: the interval did not end cleanly.
-    let mut event_deltas = None;
-    let mut delta_unsupported_reason = None;
-    let mut final_unavailable = !final_counters_available(last_attempt.as_ref(), end_alive);
-    let mut comparability = None;
-    if let Some(base) = &baseline {
-        let endpoint_comp = amc_telemetry::comparability(
-            Some(&base.identity),
-            Some(&end_identity),
-            true,
-            end_alive,
-        );
-        let comp = final_comparability(&reason, endpoint_comp, end_alive);
-        comparability = Some(comp);
-        if comp == amc_telemetry::Comparability::Compatible {
-            if let Some(last) = last_readable.get("memory.events")
-                && let Some(obj) = last.value.as_object()
-            {
-                let compared = amc_telemetry::compare_event_maps(&base.events, obj, comp);
-                let mut deltas = BTreeMap::new();
-                let mut first_unsupported = None;
-                for (key, field) in &compared {
-                    if field.supported
-                        && let Some(value) = &field.delta
-                    {
-                        deltas.insert(key.clone(), value.clone());
-                    } else if first_unsupported.is_none() {
-                        first_unsupported = Some(field.reason.clone());
-                    }
-                }
-                if first_unsupported.is_none() {
-                    event_deltas = Some(deltas);
-                } else {
-                    delta_unsupported_reason = first_unsupported;
-                    final_unavailable = true;
-                }
-            } else {
-                delta_unsupported_reason =
-                    Some(amc_telemetry::compare::reason::PARTIAL.to_string());
-                final_unavailable = true;
-            }
-        } else {
-            delta_unsupported_reason = Some(comp.as_reason().to_string());
-            final_unavailable = true;
+    // Terminal verdict from loop evidence plus the endpoint verdict —
+    // never from reason strings. A valid earlier prefix never erases the
+    // terminal state recorded here.
+    let endpoint_comp = match (&baseline, &endpoint_identity) {
+        (Some(base), Some(end)) => {
+            amc_telemetry::comparability(Some(&base.identity), Some(end), true, end_alive)
         }
-    } else {
-        final_unavailable = true;
-    }
-    // PSI interval stall fractions from the baseline `total` to the last
-    // pressure sample's own `total`, over that sample's own elapsed span.
-    // Strict: overshoot or invalid timing is a reason, never a clamped
-    // fraction. Like counters, stall fractions require a compatible
-    // lifetime: dividing stale totals by a newer tick's clock would
-    // understate the stall.
-    let mut pressure_stall = None;
-    let mut pressure_stall_reason = None;
-    let lifetime_ok = comparability == Some(amc_telemetry::Comparability::Compatible);
-    if let Some(base) = &baseline
-        && let Some((base_some, base_full)) = base.pressure_totals
-    {
-        let last_pressure = last_readable.get("memory.pressure");
-        let elapsed_us = last_pressure
-            .map(|l| l.elapsed_ms)
-            .and_then(|last_ms| last_ms.checked_sub(base.elapsed_ms))
-            .and_then(|ms| ms.checked_mul(1000));
-        let totals = last_pressure
-            .and_then(|l| l.value.as_object())
-            .and_then(|o| {
-                let some = o.get("some")?.get("total")?.as_u64()?;
-                let full = o.get("full")?.get("total")?.as_u64()?;
-                Some((some, full))
-            });
-        match (lifetime_ok, totals) {
-            (true, Some((last_some, last_full))) => {
-                let some =
-                    amc_telemetry::psi_stall_fraction_strict(base_some, last_some, elapsed_us);
-                let full =
-                    amc_telemetry::psi_stall_fraction_strict(base_full, last_full, elapsed_us);
-                match (some, full) {
-                    (Ok(some), Ok(full)) => {
-                        pressure_stall = Some(BTreeMap::from([
-                            ("some".to_string(), some),
-                            ("full".to_string(), full),
-                        ]));
-                    }
-                    (Err(reason), _) | (_, Err(reason)) => {
-                        pressure_stall_reason = Some(reason.to_string());
-                    }
-                }
-            }
-            (false, _) => {
-                pressure_stall_reason = Some(
-                    comparability
-                        .map(|c| c.as_reason().to_string())
-                        .unwrap_or_else(|| {
-                            amc_telemetry::compare::reason::MISSING_IDENTITY.to_string()
-                        }),
-                );
-            }
-            (true, None) => {
-                pressure_stall_reason = Some(amc_telemetry::compare::reason::PARTIAL.to_string());
-            }
-        }
-    } else if baseline_ready {
-        pressure_stall_reason = Some(amc_telemetry::compare::reason::PARTIAL.to_string());
-    }
+        _ => amc_telemetry::Comparability::MissingIdentity,
+    };
+    let terminal = terminal_state(outcome, endpoint_comp);
+    let session = SessionRef {
+        cgroup_path: &cgroup_path,
+        unit: &args.unit,
+        context,
+        invocation: invocation.as_deref(),
+        boot_id: owner_boot_id.as_deref(),
+    };
+    // No baseline means no interval at all; an empty verified snapshot
+    // means no pre-change evidence. Both report the terminal verdict.
+    // A non-empty verified snapshot is pre-change by poll ordering (see
+    // the poll site); post-change ticks still carry old labels.
+    let prefix = select_prefix(
+        terminal,
+        verified.as_ref().map(|v| &v.values),
+        &last_readable,
+    );
+    let interval = match &baseline {
+        Some(base) => summarize_interval(base, prefix, terminal, &session),
+        None => IntervalSummary {
+            event_deltas: None,
+            delta_reason: Some(terminal.as_reason().to_string()),
+            event_start: None,
+            event_end: None,
+            psi: None,
+            psi_reason: Some(terminal.as_reason().to_string()),
+            psi_start: None,
+            psi_end: None,
+        },
+    };
     // A lifetime change the loop never saw (restart in the final gap)
-    // rewrites a clean `deadline` reason: the interval is not intact.
-    if reason == "deadline" {
-        match comparability {
-            Some(amc_telemetry::Comparability::RestartDetected) => {
-                reason = "invocation-changed".to_string();
-            }
-            Some(amc_telemetry::Comparability::ReplacementSuspected) => {
-                reason = "replacement-suspected".to_string();
-            }
-            Some(amc_telemetry::Comparability::Disappeared) => {
-                reason = "disappeared-or-empty".to_string();
-            }
-            _ => {}
-        }
+    // rewrites a clean `deadline` reason: the interval is not intact. An
+    // unconfirmable endpoint gets its own reason instead of borrowing
+    // `deadline`: collection finished, confirmation did not.
+    if outcome == LoopOutcome::Deadline {
+        reason = match terminal {
+            TerminalState::Intact => LoopOutcome::Deadline.reason().to_string(),
+            TerminalState::Restarted => LoopOutcome::InvocationChanged.reason().to_string(),
+            TerminalState::Replaced => LoopOutcome::ReplacementSuspected.reason().to_string(),
+            TerminalState::Disappeared => LoopOutcome::DisappearedOrEmpty.reason().to_string(),
+            TerminalState::EndpointUnknown => "endpoint-query-failed".to_string(),
+        };
     }
+    // Final counters are available only on the strict path: an intact
+    // terminal, a live endpoint, counters readable on the last persisted
+    // attempt, and durable persistence. Anything else — disappearance,
+    // restart, unconfirmed endpoint, unreadable final, or any persistence
+    // failure (a stale previously-persisted value must not acquire final
+    // availability) — is unavailable, even next to a valid readable prefix.
+    let final_unavailable = !final_available(
+        terminal,
+        end_alive,
+        incomplete_persistence,
+        storage_durable,
+        last_attempt.as_ref(),
+    );
     // Completion is earned, not defaulted. A clean terminal state with a
     // valid baseline and persisted summary is complete; everything else —
     // missing baseline, lifetime change, budget exhaustion, cancellation,
@@ -826,31 +1154,26 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
     let complete = baseline_ready
         && !incomplete_persistence
         && matches!(reason.as_str(), "deadline" | "disappeared-or-empty");
-    if matches!(
-        reason.as_str(),
-        "output-budget-exceeded"
-            | "output-write-failed"
-            | "sample-budget-exceeded"
-            | "invocation-changed"
-            | "replacement-suspected"
-            | "cancelled"
-    ) {
-        final_unavailable = true;
-    }
+    let mark = |mark: Option<Mark>| {
+        mark.map(|m| {
+            serde_json::json!({
+                "elapsedMs": m.elapsed_ms,
+                "sequence": m.sequence,
+            })
+        })
+    };
 
-    let summary = Summary {
+    let mut summary = Summary {
         schema_version: 1,
         observation_id: observation,
         reason,
         complete,
         target,
         coverage: CoverageOut {
-            // Baseline after the first tick means the observer may have
-            // missed earlier counters in this lifetime. Note: interval
-            // deltas always cover baseline-to-end, never the full
-            // workload lifetime; `attachedLate` marks a truncated
-            // interval start, not a claim about the workload's age.
-            // Passive attachment cannot certify counters from workload start.
+            // Passive attachment cannot certify counters from workload
+            // start. Note: interval deltas always cover baseline-to-end,
+            // never the full workload lifetime; `attachedLate` marks that,
+            // while `baselineDelayed` marks a truncated interval start.
             attached_late: true,
             baseline_delayed: !first_tick_complete,
             valid_baseline: baseline_ready,
@@ -863,34 +1186,70 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
             final_counters_unavailable: final_unavailable,
             incomplete_persistence,
         },
-        event_delta_coverage: event_deltas.as_ref().map(|_| {
+        collection: CollectionOut {
+            attempted_samples: attempts,
+            persisted_samples,
+            storage_durable,
+        },
+        event_delta_coverage: interval.event_deltas.as_ref().map(|_| {
             serde_json::json!({
                 "kind": "baseline-to-last-readable",
-                "startElapsedMs": baseline.as_ref().map(|base| base.elapsed_ms),
-                "endElapsedMs": last_readable.get("memory.events").map(|last| last.elapsed_ms),
+                "start": mark(interval.event_start),
+                "end": mark(interval.event_end),
+                "startElapsedMs": interval.event_start.map(|m| m.elapsed_ms),
+                "endElapsedMs": interval.event_end.map(|m| m.elapsed_ms),
+                "startSequence": interval.event_start.map(|m| m.sequence),
+                "endSequence": interval.event_end.map(|m| m.sequence),
                 "finalCountersAvailable": !final_unavailable,
                 "lifetimeComplete": false
             })
         }),
-        event_deltas,
-        delta_unsupported_reason,
-        pressure_stall,
-        pressure_stall_reason,
+        event_deltas: interval.event_deltas,
+        delta_unsupported_reason: interval.delta_reason,
+        pressure_stall: interval.psi.clone(),
+        pressure_stall_reason: interval.psi_reason,
+        pressure_stall_coverage: interval.psi.as_ref().map(|_| {
+            serde_json::json!({
+                "kind": "baseline-to-last-readable",
+                "start": mark(interval.psi_start),
+                "end": mark(interval.psi_end),
+                "startElapsedMs": interval.psi_start.map(|m| m.elapsed_ms),
+                "endElapsedMs": interval.psi_end.map(|m| m.elapsed_ms),
+                "startSequence": interval.psi_start.map(|m| m.sequence),
+                "endSequence": interval.psi_end.map(|m| m.sequence),
+                "finalCountersAvailable": !final_unavailable,
+                "lifetimeComplete": false
+            })
+        }),
         max_observed_swap: max_swap,
         max_observed_current: max_current,
         last_readable,
         manager_result: final_manager_result,
     };
+    // Primary error preserved: if the summary itself cannot persist,
+    // nothing is claimed.
     atomic_write(
         &args.output.join("summary.json"),
         &serde_json::to_vec_pretty(&summary)?,
     )?;
-    OpenOptions::new()
+    // The completion marker must not imply persistence that failed: on a
+    // `done` write failure the summary is repaired to incomplete and the
+    // original error is returned.
+    if let Err(error) = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(args.output.join("done"))?
-        .sync_all()?;
+        .open(args.output.join("done"))
+        .and_then(|file| file.sync_all())
+    {
+        summary.coverage.incomplete_persistence = true;
+        summary.complete = false;
+        let _ = atomic_write(
+            &args.output.join("summary.json"),
+            &serde_json::to_vec_pretty(&summary)?,
+        );
+        return Err(error).with_context(|| format!("cannot write {}", args.output.display()));
+    }
     Ok(0)
 }
 
@@ -1126,50 +1485,416 @@ mod tests {
     }
 
     #[test]
-    fn disappearance_preserves_prefix_but_never_masks_restart() {
-        use amc_telemetry::Comparability;
-        // Clean disappearance with no contrary evidence: prefix preserved.
+    fn vanished_path_is_disappearance_not_replacement() {
+        // The VM OOM case: systemd collects the failed unit's cgroup, so
+        // the tick lookup returns nothing. That must end the interval as
+        // disappearance (preserving the OOM prefix), never as a suspected
+        // replacement (which would demand verified pre-change evidence
+        // for counters that postdate the last poll).
         assert_eq!(
-            final_comparability(
-                "disappeared-or-empty",
-                Comparability::MissingIdentity,
-                false
-            ),
-            Comparability::Compatible
+            tick_continuity(None, Some(5533)),
+            Some(LoopOutcome::DisappearedOrEmpty)
         );
         assert_eq!(
-            final_comparability("deadline", Comparability::Disappeared, false),
-            Comparability::Compatible
+            tick_continuity(Some(9999), Some(5533)),
+            Some(LoopOutcome::ReplacementSuspected)
         );
-        // Restart in the final gap: positive lifetime evidence wins over
-        // both disappearance and the loop reason.
+        assert_eq!(tick_continuity(Some(5533), Some(5533)), None);
+    }
+
+    #[test]
+    fn terminal_state_combines_loop_evidence_with_endpoint_verdict() {
+        use amc_telemetry::Comparability::*;
+        // Loop lifetime evidence wins over any endpoint verdict.
         assert_eq!(
-            final_comparability("deadline", Comparability::RestartDetected, false),
-            Comparability::RestartDetected
-        );
-        assert_eq!(
-            final_comparability("deadline", Comparability::ReplacementSuspected, false),
-            Comparability::ReplacementSuspected
-        );
-        assert_eq!(
-            final_comparability("deadline", Comparability::ContextMismatch, false),
-            Comparability::ContextMismatch
-        );
-        // Loop-observed restart stands even when the endpoint still looks
-        // compatible.
-        assert_eq!(
-            final_comparability("invocation-changed", Comparability::Compatible, true),
-            Comparability::RestartDetected
-        );
-        // Alive endpoint passes through untouched.
-        assert_eq!(
-            final_comparability("deadline", Comparability::Compatible, true),
-            Comparability::Compatible
+            terminal_state(LoopOutcome::InvocationChanged, Compatible),
+            TerminalState::Restarted
         );
         assert_eq!(
-            final_comparability("deadline", Comparability::MissingIdentity, true),
-            Comparability::MissingIdentity
+            terminal_state(LoopOutcome::ReplacementSuspected, Compatible),
+            TerminalState::Replaced
         );
+        assert_eq!(
+            terminal_state(LoopOutcome::DisappearedOrEmpty, Compatible),
+            TerminalState::Disappeared
+        );
+        // Clean loop defers to the endpoint verdict, including final-gap
+        // lifetime changes and unconfirmable endpoints.
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, Compatible),
+            TerminalState::Intact
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, RestartDetected),
+            TerminalState::Restarted
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, ReplacementSuspected),
+            TerminalState::Replaced
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, PathMismatch),
+            TerminalState::Replaced
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, ContextMismatch),
+            TerminalState::Restarted
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, Disappeared),
+            TerminalState::Disappeared
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, MissingIdentity),
+            TerminalState::EndpointUnknown
+        );
+        // Non-lifetime loop exits still combine with the endpoint: a
+        // restart in the final gap is not erased by a clean-looking loop.
+        assert_eq!(
+            terminal_state(LoopOutcome::Cancelled, RestartDetected),
+            TerminalState::Restarted
+        );
+        assert_eq!(
+            terminal_state(LoopOutcome::Cancelled, Compatible),
+            TerminalState::Intact
+        );
+    }
+
+    struct SummaryEnv {
+        unit: String,
+        path: String,
+        invocation: String,
+        boot: String,
+    }
+
+    impl SummaryEnv {
+        fn new() -> Self {
+            Self {
+                unit: "a.service".to_string(),
+                path: "/sys/fs/cgroup/a.service".to_string(),
+                invocation: "inv-1".to_string(),
+                boot: "boot-1".to_string(),
+            }
+        }
+
+        fn session(&self) -> SessionRef<'_> {
+            SessionRef {
+                cgroup_path: &self.path,
+                unit: &self.unit,
+                context: "user",
+                invocation: Some(&self.invocation)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| &**s),
+                boot_id: Some(&self.boot),
+            }
+        }
+
+        fn baseline(
+            &self,
+            events: serde_json::Value,
+            pressure: Option<(u64, u64)>,
+            elapsed: u64,
+            sequence: u64,
+            inode: u64,
+        ) -> Baseline {
+            Baseline {
+                events: events.as_object().unwrap().clone(),
+                pressure_totals: pressure,
+                elapsed_ms: elapsed,
+                sequence,
+                identity: amc_telemetry::SourceIdentity::new(
+                    &self.path,
+                    Some(&self.unit),
+                    Some("user"),
+                    None,
+                    Some(&self.boot),
+                    Some(&self.invocation)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| &**s),
+                    Some(inode),
+                ),
+            }
+        }
+
+        fn readable(
+            &self,
+            value: serde_json::Value,
+            elapsed: u64,
+            sequence: u64,
+            inode: u64,
+        ) -> LastReadable {
+            LastReadable {
+                unix_ms: 1,
+                elapsed_ms: elapsed,
+                sequence,
+                inode: Some(inode),
+                value,
+            }
+        }
+
+        fn values(
+            &self,
+            events: serde_json::Value,
+            pressure: Option<serde_json::Value>,
+            elapsed: u64,
+            sequence: u64,
+            inode: u64,
+        ) -> BTreeMap<String, LastReadable> {
+            let mut map = BTreeMap::new();
+            map.insert(
+                "memory.events".to_string(),
+                self.readable(events, elapsed, sequence, inode),
+            );
+            if let Some(pressure) = pressure {
+                map.insert(
+                    "memory.pressure".to_string(),
+                    self.readable(pressure, elapsed, sequence, inode),
+                );
+            }
+            map
+        }
+
+        fn pressure_totals(some: u64, full: u64) -> serde_json::Value {
+            serde_json::json!({
+                "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": some},
+                "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": full},
+            })
+        }
+    }
+
+    #[test]
+    fn intact_prefix_reports_deltas_with_endpoint_marks() {
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 1, "max": 4}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        let values = env.values(
+            serde_json::json!({"oom_kill": 3, "max": 4}),
+            Some(SummaryEnv::pressure_totals(1100, 2050)),
+            900,
+            45,
+            42,
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(
+            out.event_deltas,
+            Some(BTreeMap::from([
+                ("oom_kill".to_string(), serde_json::json!(2)),
+                ("max".to_string(), serde_json::json!(0))
+            ]))
+        );
+        assert_eq!(out.delta_reason, None);
+        assert!(matches!(
+            out.event_start,
+            Some(Mark {
+                elapsed_ms: 100,
+                sequence: 5
+            })
+        ));
+        assert!(matches!(
+            out.event_end,
+            Some(Mark {
+                elapsed_ms: 900,
+                sequence: 45
+            })
+        ));
+        let psi = out.psi.expect("stall fractions");
+        assert!((psi["some"] - 0.000125).abs() < 1e-12);
+        assert!((psi["full"] - 0.0000625).abs() < 1e-12);
+        assert_eq!(out.psi_reason, None);
+    }
+
+    #[test]
+    fn disappearance_preserves_prefix_without_claiming_final() {
+        // OOM prefix survives a vanished endpoint; the terminal verdict
+        // stays disappearance and final availability is decided outside.
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 1}), None, 100, 5, 42);
+        let values = env.values(serde_json::json!({"oom_kill": 4}), None, 900, 45, 42);
+        let out = summarize_interval(
+            &base,
+            Some(&values),
+            TerminalState::Disappeared,
+            &env.session(),
+        );
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(3));
+        assert_eq!(out.delta_reason, None);
+    }
+
+    #[test]
+    fn unconfirmed_endpoint_keeps_verified_prefix() {
+        // The final manager query failed, but baseline and prefix
+        // endpoints carry full identity: the prefix stands on its own.
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 1}), None, 100, 5, 42);
+        let values = env.values(serde_json::json!({"oom_kill": 2}), None, 900, 45, 42);
+        let out = summarize_interval(
+            &base,
+            Some(&values),
+            TerminalState::EndpointUnknown,
+            &env.session(),
+        );
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn restart_uses_verified_prefix_never_post_change_ticks() {
+        // Post-change ticks still carry old labels until the next poll:
+        // latest claims oom_kill 8 (delta 3 would bridge lifetimes) while
+        // the verified pre-change snapshot claims 6 (delta 1, honest).
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let polluted = env.values(serde_json::json!({"oom_kill": 8}), None, 950, 47, 42);
+        let verified = env.values(serde_json::json!({"oom_kill": 6}), None, 800, 40, 42);
+        let out = summarize_interval(
+            &base,
+            Some(&verified),
+            TerminalState::Restarted,
+            &env.session(),
+        );
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(1));
+        // The polluted map must never be handed to summarize with a
+        // restart terminal; assert the guard directly on its own terms:
+        // same inputs through the latest path would fabricate delta 3.
+        let bad = summarize_interval(
+            &base,
+            Some(&polluted),
+            TerminalState::Intact,
+            &env.session(),
+        );
+        assert_eq!(bad.event_deltas.unwrap()["oom_kill"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn restart_without_verified_prefix_reports_no_delta() {
+        // Change detected before the first successful poll: no verified
+        // values exist, so nothing feeds the delta and the terminal
+        // reason is retained.
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let out = summarize_interval(&base, None, TerminalState::Restarted, &env.session());
+        assert_eq!(out.event_deltas, None);
+        assert_eq!(out.delta_reason.as_deref(), Some("restart-detected"));
+        assert_eq!(out.psi, None);
+        assert_eq!(out.psi_reason.as_deref(), Some("restart-detected"));
+    }
+
+    #[test]
+    fn replacement_without_verified_prefix_reports_no_delta() {
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let out = summarize_interval(&base, None, TerminalState::Replaced, &env.session());
+        assert_eq!(out.event_deltas, None);
+        assert_eq!(out.delta_reason.as_deref(), Some("replacement-suspected"));
+    }
+
+    #[test]
+    fn prefix_endpoints_must_carry_identity() {
+        // Verified values from a session without invocation evidence must
+        // not produce deltas, even with a matching terminal.
+        let mut env = SummaryEnv::new();
+        env.invocation.clear();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let values = env.values(serde_json::json!({"oom_kill": 9}), None, 900, 45, 42);
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.event_deltas, None);
+        assert_eq!(out.delta_reason.as_deref(), Some("missing-identity"));
+    }
+
+    #[test]
+    fn readable_prefix_to_unreadable_final_is_partial_not_zero() {
+        // Counters readable at baseline but unknown at the prefix end.
+        // Unknown measurements are never inserted into the readable map,
+        // so the end is absent: partial evidence, never a zero delta.
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let values: BTreeMap<String, LastReadable> = BTreeMap::new();
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.event_deltas, None);
+        assert_eq!(out.delta_reason.as_deref(), Some("partial-observation"));
+    }
+
+    #[test]
+    fn counter_decrease_and_missing_keys_stay_explicit() {
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 5, "max": 9}),
+            None,
+            100,
+            5,
+            42,
+        );
+        // Decrease on one key, missing key on the other.
+        let values = env.values(serde_json::json!({"oom_kill": 3}), None, 900, 45, 42);
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.event_deltas, None);
+        assert!(matches!(
+            out.delta_reason.as_deref(),
+            Some("counter-decrease") | Some("missing-key")
+        ));
+    }
+
+    #[test]
+    fn psi_rejects_overshoot_and_inverted_clocks() {
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 0}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        // Stall delta larger than the elapsed span: incompatible clocks,
+        // never a clamped fraction.
+        let values = env.values(
+            serde_json::json!({"oom_kill": 0}),
+            Some(SummaryEnv::pressure_totals(1000 + 900_000, 2000)),
+            900,
+            45,
+            42,
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.psi, None);
+        assert_eq!(out.psi_reason.as_deref(), Some("incompatible-clocks"));
+        // Inverted clock (end elapsed before baseline): same verdict.
+        let mut backwards = values;
+        backwards.get_mut("memory.pressure").unwrap().elapsed_ms = 50;
+        let out = summarize_interval(
+            &base,
+            Some(&backwards),
+            TerminalState::Intact,
+            &env.session(),
+        );
+        assert_eq!(out.psi, None);
+        assert_eq!(out.psi_reason.as_deref(), Some("incompatible-clocks"));
+    }
+
+    #[test]
+    fn psi_without_lifetime_is_a_reason_not_a_fraction() {
+        // Same values as the intact case but a contradictory prefix-end
+        // inode suppresses PSI (and the counters sharing that endpoint).
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 0}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        let values = env.values(
+            serde_json::json!({"oom_kill": 0}),
+            Some(SummaryEnv::pressure_totals(1100, 2050)),
+            900,
+            45,
+            99,
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.psi, None);
+        assert_eq!(out.event_deltas, None);
     }
 
     #[test]
@@ -1315,5 +2040,210 @@ mod tests {
         let out = amc_telemetry::compare_snapshots(&b, &a, None, None, true, true);
         assert!(!out["memory.events"]["oom_kill"].supported);
         assert_eq!(out["memory.events"]["oom_kill"].reason, "missing-identity");
+    }
+
+    #[test]
+    fn replacement_followed_by_disappearance_keeps_verified_prefix() {
+        // Loop saw a same-path replacement; the endpoint later vanished.
+        // Loop evidence wins (replacement), and the verified pre-change
+        // prefix still feeds the delta — the later disappearance neither
+        // erases earlier evidence nor rewrites the verdict.
+        use amc_telemetry::Comparability::*;
+        assert_eq!(
+            terminal_state(LoopOutcome::ReplacementSuspected, Disappeared),
+            TerminalState::Replaced
+        );
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        let verified = env.values(serde_json::json!({"oom_kill": 6}), None, 800, 40, 42);
+        let latest: BTreeMap<String, LastReadable> = BTreeMap::new();
+        let prefix = select_prefix(TerminalState::Replaced, Some(&verified), &latest);
+        let out = summarize_interval(&base, prefix, TerminalState::Replaced, &env.session());
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(1));
+        assert_eq!(out.delta_reason, None);
+    }
+
+    #[test]
+    fn final_gap_restart_with_increasing_counters_is_no_bridge() {
+        // Clean loop (`deadline`) but the independent final query sees a
+        // restart; counters increased (8 > 5) so monotonicity cannot catch
+        // it. Only lifetime evidence suppresses the delta.
+        use amc_telemetry::Comparability::*;
+        assert_eq!(
+            terminal_state(LoopOutcome::Deadline, RestartDetected),
+            TerminalState::Restarted
+        );
+        let env = SummaryEnv::new();
+        let base = env.baseline(serde_json::json!({"oom_kill": 5}), None, 100, 5, 42);
+        // Verified pre-change prefix claims 6 (honest delta 1); the latest
+        // post-change tick claims 8 (bridged delta 3 must never surface).
+        let verified = env.values(serde_json::json!({"oom_kill": 6}), None, 800, 40, 42);
+        let latest = env.values(serde_json::json!({"oom_kill": 8}), None, 950, 47, 42);
+        let prefix = select_prefix(TerminalState::Restarted, Some(&verified), &latest);
+        let out = summarize_interval(&base, prefix, TerminalState::Restarted, &env.session());
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(1));
+        // No verified prefix at all: increasing latest counters still yield
+        // no delta, only the terminal reason.
+        let out = summarize_interval(
+            &base,
+            select_prefix(TerminalState::Restarted, None, &BTreeMap::new()),
+            TerminalState::Restarted,
+            &env.session(),
+        );
+        assert_eq!(out.event_deltas, None);
+        assert_eq!(out.delta_reason.as_deref(), Some("restart-detected"));
+    }
+
+    #[test]
+    fn event_and_psi_endpoints_are_independent() {
+        // Pressure unreadable on the last tick: events keep their newer
+        // endpoint while PSI keeps its older one. Neither acquires the
+        // other's timestamp.
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 0}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        let mut values = BTreeMap::new();
+        values.insert(
+            "memory.events".to_string(),
+            env.readable(serde_json::json!({"oom_kill": 2}), 900, 45, 42),
+        );
+        values.insert(
+            "memory.pressure".to_string(),
+            env.readable(SummaryEnv::pressure_totals(1100, 2050), 700, 35, 42),
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(2));
+        assert!(out.psi.is_some());
+        assert_eq!(out.event_end.map(|m| m.elapsed_ms), Some(900));
+        assert_eq!(out.event_end.map(|m| m.sequence), Some(45));
+        assert_eq!(out.psi_end.map(|m| m.elapsed_ms), Some(700));
+        assert_eq!(out.psi_end.map(|m| m.sequence), Some(35));
+    }
+
+    #[test]
+    fn partial_pressure_keeps_event_delta() {
+        // Missing pressure value suppresses only PSI; the counter delta
+        // stands on its own endpoint.
+        let env = SummaryEnv::new();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 1}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        let mut values = BTreeMap::new();
+        values.insert(
+            "memory.events".to_string(),
+            env.readable(serde_json::json!({"oom_kill": 3}), 900, 45, 42),
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.event_deltas.unwrap()["oom_kill"], serde_json::json!(2));
+        assert_eq!(out.psi, None);
+        assert_eq!(out.psi_reason.as_deref(), Some("partial-observation"));
+    }
+
+    #[test]
+    fn psi_without_identity_is_a_reason_not_a_fraction() {
+        // Same pressure values but no invocation evidence: PSI suppressed
+        // alongside the counters, never a fraction without lifetime.
+        let mut env = SummaryEnv::new();
+        env.invocation.clear();
+        let base = env.baseline(
+            serde_json::json!({"oom_kill": 0}),
+            Some((1000, 2000)),
+            100,
+            5,
+            42,
+        );
+        let values = env.values(
+            serde_json::json!({"oom_kill": 0}),
+            Some(SummaryEnv::pressure_totals(1100, 2050)),
+            900,
+            45,
+            42,
+        );
+        let out = summarize_interval(&base, Some(&values), TerminalState::Intact, &env.session());
+        assert_eq!(out.psi, None);
+        assert_eq!(out.psi_reason.as_deref(), Some("missing-identity"));
+        assert_eq!(out.event_deltas, None);
+    }
+
+    #[test]
+    fn final_availability_requires_durable_persistence() {
+        // Readable last-persisted counters with intact terminal and live
+        // endpoint are available only when persistence itself succeeded.
+        // A stale previously-persisted value after a failed final write
+        // must not acquire availability.
+        let snapshot: amc_telemetry::Snapshot = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "path": "/sys/fs/cgroup/a.service", "observedUnixMs": 1,
+            "files": {
+                "memory.events": {"value": {"oom_kill": 3}, "unknown": null},
+                "memory.events.local": {"value": {}, "unknown": "not-collected"},
+                "cgroup.events": {"value": {"populated": 1, "frozen": 0}, "unknown": null},
+                "memory.current": {"value": 100, "unknown": null},
+                "memory.peak": {"value": 200, "unknown": null},
+                "memory.pressure": {"value": null, "unknown": "not-collected"},
+                "memory.swap.current": {"value": null, "unknown": "not-collected"},
+                "memory.swap.peak": {"value": null, "unknown": "not-collected"},
+                "memory.min": {"value": null, "unknown": "not-collected"},
+                "memory.low": {"value": null, "unknown": "not-collected"},
+                "memory.high": {"value": null, "unknown": "not-collected"},
+                "memory.max": {"value": null, "unknown": "not-collected"},
+                "memory.swap.max": {"value": null, "unknown": "not-collected"},
+                "memory.oom.group": {"value": null, "unknown": "not-collected"}
+            }
+        }))
+        .unwrap();
+        assert!(final_available(
+            TerminalState::Intact,
+            true,
+            false,
+            true,
+            Some(&snapshot)
+        ));
+        // Any persistence failure forces unavailable, even with readable
+        // counters and an intact terminal.
+        assert!(!final_available(
+            TerminalState::Intact,
+            true,
+            true,
+            true,
+            Some(&snapshot)
+        ));
+        assert!(!final_available(
+            TerminalState::Intact,
+            true,
+            false,
+            false,
+            Some(&snapshot)
+        ));
+        assert!(!final_available(
+            TerminalState::Restarted,
+            true,
+            false,
+            true,
+            Some(&snapshot)
+        ));
+        assert!(!final_available(
+            TerminalState::Intact,
+            true,
+            false,
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn output_budget_is_one_probe_byte_past_the_cap() {
+        assert!(!budget_exceeded(0, 10));
+        assert!(!budget_exceeded(MAX_OUTPUT_BYTES - 11, 10));
+        assert!(budget_exceeded(MAX_OUTPUT_BYTES - 10, 10));
+        assert!(budget_exceeded(MAX_OUTPUT_BYTES, 0));
     }
 }

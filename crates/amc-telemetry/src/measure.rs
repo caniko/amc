@@ -566,4 +566,44 @@ mod tests {
         assert_eq!(m.unknown.as_deref(), Some(reason::BYTE_LIMIT));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn missing_files_stay_missing_until_they_appear() {
+        // A file absent at open is retried via path on each tick: missing
+        // stays explicit unknown, and a later appearance becomes readable
+        // without reopening the reader. Deletion after appearance keeps
+        // serving the held description only while the handle lives; a
+        // never-opened file reports missing, never zero.
+        let dir = std::env::temp_dir().join(format!(
+            "amc-telemetry-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), "10\n").unwrap();
+        let mut reader = PinnedReader::open(&dir).unwrap();
+        let first = reader.snapshot("/x.service", Some(0), Some(0));
+        assert_eq!(
+            first.files["memory.events"].unknown.as_deref(),
+            Some(reason::MISSING)
+        );
+        assert!(first.files["memory.events"].value.is_none());
+        std::fs::write(dir.join("memory.events"), "oom_kill 2\n").unwrap();
+        let second = reader.snapshot("/x.service", Some(1), Some(20));
+        assert_eq!(
+            second.files["memory.events"].value,
+            Some(json!({"oom_kill": 2}))
+        );
+        std::fs::remove_file(dir.join("memory.events")).unwrap();
+        // The held handle still serves the original object after unlink.
+        let third = reader.snapshot("/x.service", Some(2), Some(40));
+        assert_eq!(
+            third.files["memory.events"].value,
+            Some(json!({"oom_kill": 2}))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

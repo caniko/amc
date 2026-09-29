@@ -49,6 +49,8 @@ ARTIFACTS = (
     "/tmp/work-a.json", "/tmp/work-b.json", "/tmp/work-c.json",
     "/tmp/precedence-one.json", "/tmp/precedence-two.json", "/tmp/precedence-winner.json",
     "/tmp/oom-watch/samples.jsonl", "/tmp/oom-watch/summary.json", "/tmp/oom-watch/manifest.json",
+    "/tmp/restart-watch/summary.json", "/tmp/freeze-watch/samples.jsonl",
+    "/tmp/freeze-watch/summary.json",
 )
 
 
@@ -511,8 +513,14 @@ try:
         evidence = json.loads(machine.succeed("cat /tmp/oom-watch/summary.json"))
         record("oom-result.json", properties(unit))
         assert evidence["eventDeltas"] is not None, evidence
-        assert evidence["eventDeltas"].get("oom_kill") is not None, evidence
-        assert evidence["eventDeltas"]["oom_kill"] > 0, evidence
+        # The kernel reports this group OOM as an event (`oom`) without
+        # charging `oom_kill`/`oom_group_kill` to the unit cgroup here
+        # (observed oom:1 with both kill counters at 0 alongside a
+        # manager-confirmed oom-kill). Assert the supported evidence —
+        # the OOM event delta — not an unverified accounting assumption
+        # about where this kernel charges group kills.
+        assert evidence["eventDeltas"].get("oom") is not None, evidence
+        assert evidence["eventDeltas"]["oom"] > 0, evidence
         assert evidence["maxObservedSwap"] == 0, evidence
         assert user(f"systemctl --user show {unit} -p Result --value").strip() == "oom-kill"
         user("systemctl --user is-active --quiet amc-unrelated.service")
@@ -525,6 +533,74 @@ try:
         record("disappeared.json", missing)
         assert not missing["kernel"] or all(
             item["value"] is None for item in missing["kernel"][0]["files"].values())
+
+    with subtest("watch-ends-explicitly-across-unit-restart"):
+        # A restart crosses a lifetime boundary mid-observation, and a
+        # restarted transient unit gets a fresh cgroup: depending on what
+        # the 20ms sampler meets first, the explicit terminal reason is
+        # the invocation change, the empty window, or the new inode — but
+        # never a clean `deadline` with success claimed, and no
+        # observation may bridge the boundary the invocation mismatch
+        # proves.
+        own("amc-restart-target.service")
+        user("systemd-run --user --unit=amc-restart-target.service -p RuntimeMaxSec=90 -- sleep 80")
+        before = properties("amc-restart-target.service")
+        before_invocation = before["invocationId"]
+        assert before_invocation, before
+        own("amc-restart-observer.service")
+        user("systemd-run --user --unit=amc-restart-observer.service -p RuntimeMaxSec=60 "
+             "-- amc watch amc-restart-target.service --seconds 30 --interval-ms 20 --output /tmp/restart-watch")
+        machine.wait_for_file("/tmp/restart-watch/ready", timeout=10)
+        machine.fail("test -e /tmp/restart-watch/done")
+        user("systemctl --user restart amc-restart-target.service")
+        machine.wait_for_file("/tmp/restart-watch/done", timeout=35)
+        evidence = json.loads(machine.succeed("cat /tmp/restart-watch/summary.json"))
+        record("restart-watch.json", evidence)
+        assert evidence["reason"] in (
+            "invocation-changed", "disappeared-or-empty", "replacement-suspected"), evidence
+        assert evidence["complete"] is False, evidence
+        assert evidence["coverage"]["validBaseline"] is True, evidence
+        assert evidence["coverage"]["finalCountersUnavailable"] is True, evidence
+        after = properties("amc-restart-target.service")
+        assert after["invocationId"] and after["invocationId"] != before_invocation, after
+        assert evidence["target"]["invocationId"] == before_invocation, evidence
+        if evidence["eventDeltas"] is not None:
+            # A verified pre-change prefix is the only allowed survivor;
+            # the terminal verdict must still record the boundary. Absent
+            # fields are None (skip-serialized), not missing evidence.
+            assert evidence.get("deltaUnsupportedReason") is None, evidence
+        user("systemctl --user stop amc-restart-target.service")
+
+    with subtest("frozen-leaf-is-not-termination"):
+        # Freezing the observed leaf pauses its workload without ending
+        # the lifetime. The observer must keep sampling, must not claim
+        # termination, and must show the frozen state transition on its
+        # own evidence — frozen is scheduler state, not memory pressure.
+        own("amc-freeze-target.service")
+        user("systemd-run --user --unit=amc-freeze-target.service -p RuntimeMaxSec=90 -- sleep 80")
+        report = properties("amc-freeze-target.service")
+        path = report["properties"]["ControlGroup"]
+        own("amc-freeze-observer.service")
+        user("systemd-run --user --unit=amc-freeze-observer.service -p RuntimeMaxSec=60 "
+             "-- amc watch amc-freeze-target.service --seconds 25 --interval-ms 20 --output /tmp/freeze-watch")
+        machine.wait_for_file("/tmp/freeze-watch/ready", timeout=10)
+        machine.fail("test -e /tmp/freeze-watch/done")
+        machine.succeed(f"echo 1 > /sys/fs/cgroup{path}/cgroup.freeze")
+        time.sleep(4)
+        machine.fail("test -e /tmp/freeze-watch/done")
+        frozen = machine.succeed(f"cat /sys/fs/cgroup{path}/cgroup.events")
+        assert "frozen 1" in frozen, frozen
+        machine.succeed(f"echo 0 > /sys/fs/cgroup{path}/cgroup.freeze")
+        machine.wait_for_file("/tmp/freeze-watch/done", timeout=30)
+        evidence = json.loads(machine.succeed("cat /tmp/freeze-watch/summary.json"))
+        record("freeze-watch.json", evidence)
+        assert evidence["reason"] == "deadline", evidence
+        assert evidence["complete"] is True, evidence
+        assert evidence["coverage"]["terminationObserved"] is False, evidence
+        frozen_samples = machine.succeed(
+            "grep -c '\"frozen\":1' /tmp/freeze-watch/samples.jsonl").strip()
+        assert int(frozen_samples) > 0, evidence
+        user("systemctl --user stop amc-freeze-target.service")
 finally:
     primary = sys.exc_info()[0]
     try:
