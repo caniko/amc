@@ -1,9 +1,15 @@
 # AMC
 
-AMC is a local fixture/compatibility launcher and diagnostic tool for systemd
-memory policy. RFC 0.4 in `docs/rfc-v0.4/` is authoritative. It is not a policy
-standard, resident daemon, sandbox, or transparent replacement for normal
-application launching.
+AMC provides embeddable memory admission (`amc-runner`) and passive workstation
+telemetry (`amc-telemetry` and the CLI). The CLI also contains local
+fixture/compatibility launch tools for systemd memory policy. RFC 0.4 in
+`docs/rfc-v0.4/` governs native integration. AMC is not a policy standard,
+resident policy daemon, sandbox, or transparent replacement for normal launching.
+
+The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
+modular product direction, explicit user-selected priorities, and gaming plus
+background work as the first evaluation target. General-adoption and performance
+claims remain gated on that evaluation; observation does not enable a policy.
 
 **Real applications stay with their existing native lifecycle owner.** For
 OpenCode, the discovered shared backend is `opencode.service`; wrapping an
@@ -16,6 +22,7 @@ activation client does not configure that backend. See
 amc inspect opencode.service --json
 amc inspect some-system-unit.service --system --json
 amc watch some-unit.service --seconds 10 --output /tmp/amc-watch-out
+amc watch some-unit.service --production --output /tmp/amc-production-out
 amc diff /tmp/amc-watch-out/before.json /tmp/amc-watch-out/after.json
 ./scripts/prove-local.sh opencode.service
 ```
@@ -35,6 +42,18 @@ counter deltas require verified lifetime continuity, never matching paths
 alone. `amc diff` compares two observation files offline with per-field
 reasons for unsupported comparisons. See [telemetry](docs/telemetry.md) for
 the observation model, identity rules, and remaining limits.
+
+`--production` selects passive, lower-frequency capture: 30 minutes at 1 Hz by
+default, with host memory/swap and CPU/IO/memory pressure context. It permits up
+to 24 hours with 1-60 second sampling, capped at 86,400 samples and 256 MiB of
+sample data per observer. Missing data and early stops remain explicit; the
+flag is a collection mode, not a production-readiness claim. No service is
+started, stopped, moved, or reconfigured. See the [production capture guide](docs/telemetry.md#production-capture).
+
+For observer CPU, peak-memory, and block-IO accounting, use the optional
+[accounted capture runner](docs/telemetry.md#accounted-observation). It starts its
+own transient user observer, exports retained final counters, then stops that
+observer only; target settings remain unchanged.
 
 Default text/JSON diagnostics omit application journal messages, `ExecStart`,
 `Environment`, and arbitrary subprocess error streams. This is omission, not
