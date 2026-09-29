@@ -416,6 +416,14 @@ selected or verified yet, so the scene, playback determinism, and a
 representative memory-pressure level remain calibration gates, not established
 facts. Do not use a public network match as the measurement scene.
 
+The selected objective for this first experiment is **gaming-first**: compare
+the p99 frame time and frequency of long stalls for C versus B, subject to a
+minimum of completed, useful background work. Arm A provides context for the
+user's starting point. Choose the stall threshold, the useful-work floor, the
+practical improvement margin, and the number of independent runs from separate
+calibration attempts before collecting comparison results. Report both the
+responsiveness and throughput outcomes even if the primary objective fails.
+
 MangoHud 0.8.4 is present in the Nix store but not on `PATH`. Its
 [upstream configuration](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/data/MangoHud.conf)
 supports `output_folder`, `autostart_log`, `log_duration`, and `log_interval`.
