@@ -66,6 +66,8 @@ Work is scoped to this AMC repository. Do not change Canix GameMode policy,
 production service placement, launchers, restoration behavior, pins/gitlinks,
 the headroom observer, or the freeze/thaw controller as part of this plan.
 Cross-repository integration needs a separate scope and authorization.
+The later request to proceed authorized the narrow, read-only Atlas binding
+pilot recorded below; it did not authorize changing active service policy.
 
 Do not install a new policy language, global process-name classifier, desktop
 launch broker, plugin loader, or competing OOM manager merely to make the design
@@ -406,11 +408,11 @@ background work, frame-time logging, and a scheduled 30-minute session.
 
 ### First comparison candidate (2026-09-30)
 
-The user delegated selection from the installed games. **Counter-Strike 2**
-(Steam app 730) is installed on Atlas. An offline, locally recorded demo is the
-candidate scene: record a fixed 60–90 second route on the same training map,
-archive the demo and its hash, and replay the same file for each arm. No demo
-was present at selection time, so the scene, playback determinism, and a
+**Counter-Strike 2** (Steam app 730) is installed on Atlas and is the first
+comparison candidate. An offline, locally recorded demo is the proposed scene:
+record a fixed 60–90 second route on the same training map, archive the demo
+and its hash, and replay the same file for each arm. No replay has been
+selected or verified yet, so the scene, playback determinism, and a
 representative memory-pressure level remain calibration gates, not established
 facts. Do not use a public network match as the measurement scene.
 
@@ -433,6 +435,47 @@ runner, while B uses calibrated fixed concurrency. The installed `amc run`
 fixture command is not a weighted-admission runner. Tune the work estimate and
 comparison margins on separate calibration runs; do not infer benefit from
 the prior passive capture or count frames as independent replicates.
+
+### Consumer-owned Fleetix binding pilot (2026-09-30)
+
+Canix now exposes a read-only Atlas binding in
+`root/hosts/atlas/features/amc_binding.nix`: Fleetix supplies the declared
+`atlas` host and `can` account, while Canix names `opencode.service`, its
+`app-amc.slice` owner, and the `agent-tools.slice` domain. Memory limits come
+from `canix.amcContracts`, not new Fleetix workload fields. The binding adds
+no resource-policy activation or memory-budget decision to AMC.
+
+Guarded evaluation of `nixosConfigurations.atlas.config.canix.amcBinding` and
+the Atlas toplevel derivation passed. Read-only live inspection found the
+backend in `app-amc.slice` at 32 GiB/2 GiB max/swap, the tool slice at
+24 GiB/8 GiB aggregate, and one active tool service in that slice at
+16 GiB/4 GiB. These are identity/boundary checks on the currently running
+generation, not proof that a weighted runner is coordinating those jobs or
+that the new Nix binding has been activated.
+
+Repeat the acceptance check from the Canix checkout on Atlas after the Canix
+configuration changes (`canix` and `amc` must both be on `PATH`):
+
+```sh
+canix repo eval --output json .#nixosConfigurations.atlas.config.canix.amcBinding
+amc inspect opencode.service --json
+systemctl --user show agent-tools.slice \
+  --property=Id,LoadState,ActiveState,ControlGroup,MemoryMax,MemorySwapMax
+# While a tool job is active, replace UNIT with its discovered service name:
+systemctl --user list-units 'amc-opencode-tool-*.service' --state=running
+amc inspect UNIT --json
+```
+
+Require an active `opencode.service` whose `Slice`, leaf cgroup, and effective
+`MemoryMax`/`MemorySwapMax` match the declaration (32 GiB/2 GiB). Require an
+active `agent-tools.slice` with a cgroup ending in that slice and matching
+aggregate limits (24 GiB/8 GiB). For a live tool service, require its `Slice`
+and cgroup to place it beneath `agent-tools.slice`, with the Canix per-job
+contract (16 GiB/4 GiB). Check AMC's cgroup `memory.max` and `memory.swap.max`
+cells as well as manager properties; fail rather than treating an unknown cell
+as a match. Re-discover transient unit names on each run. A backend match alone
+does not attest to the tool domain, and native placement does not establish
+gaming responsiveness or coordinated admission.
 
 ### Atlas Endurance Run (started 2026-09-20 ~21:19 local)
 
