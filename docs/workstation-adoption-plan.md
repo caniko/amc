@@ -17,7 +17,14 @@ existing offline validator through the installed CLI, with a Markdown default,
 JSON option, and an [install-to-report walkthrough](../README.md#install-and-first-report).
 The Nix package supplies Python; Cargo installations need Python 3.11+ on
 `PATH`. A Nix package build and read-only report against the recorded Atlas
-capture passed. No non-NixOS platform or gaming benefit has been verified.
+capture passed. An Ubuntu 24.04.5 LTS rootless Podman container (amd64 image
+digest `sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4`,
+4 GiB memory and 2 CPU limit) compiled the checkout with Rust 1.97.1,
+`cargo install --path /src --locked`, and Python 3.12.3. Validator regressions
+passed, and the installed CLI reported the recorded 1,800-sample Atlas capture
+in Markdown and JSON. This verifies source installation and offline reporting
+on that Ubuntu image; live `inspect`/`watch` still needs a booted Ubuntu
+systemd/cgroup v2 host. No gaming benefit has been verified.
 
 ## Goal And Confirmed Decisions
 
