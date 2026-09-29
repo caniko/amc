@@ -186,6 +186,143 @@ fn wait_exit(mut child: Child, timeout: Duration) -> std::process::Output {
 }
 
 #[test]
+fn production_watch_is_passive_and_clamps_sleep_to_deadline() {
+    for unit in ["test.service", "test.scope"] {
+        let f = ObserveFixture::new();
+        let out = f.root.join("production");
+        let Some(group) = readable_own_cgroup() else {
+            eprintln!("SKIP: no readable cgroup telemetry in this environment");
+            return;
+        };
+        let mut command = f.command();
+        command
+            .env("FAKE_CGROUP", group)
+            .args([
+                "watch",
+                unit,
+                "--seconds",
+                "1",
+                "--interval-ms",
+                "60000",
+                "--production",
+                "--output",
+            ])
+            .arg(&out);
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_exit(child, Duration::from_secs(10));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["production"], true);
+        assert_eq!(manifest["target"]["unit"], unit);
+        assert_eq!(manifest["maxOutputBytes"], 256 * 1024 * 1024);
+        assert_eq!(manifest["maxSamples"], 86_400);
+        let text = fs::read_to_string(out.join("samples.jsonl")).unwrap();
+        let sample: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert!(sample["host"]["files"]["meminfo.MemAvailable"].is_object());
+        assert!(sample["host"]["files"]["pressure.memory"].is_object());
+        assert!(sample["host"]["files"]["pressure.cpu"].is_object());
+        assert!(sample["host"]["files"]["pressure.io"].is_object());
+        assert!(sample["captureDurationUs"].is_u64());
+        let summary = f.summary(&out);
+        assert_eq!(summary["reason"], "deadline");
+        assert_eq!(summary["collection"]["bytesWritten"], text.len() as u64);
+        assert_eq!(summary["collection"]["persistedSamples"], 1);
+        assert_eq!(summary["collection"]["storageDurable"], true);
+        let calls = fs::read_to_string(f.root.join("calls")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .all(|line| line == "--user --version --no-pager"
+                    || line.starts_with("--user show ")),
+            "unexpected manager operation: {calls}"
+        );
+    }
+}
+
+#[test]
+fn production_defaults_are_slow_finite_and_cancellable() {
+    let Some(group) = readable_own_cgroup() else {
+        eprintln!("SKIP: no readable cgroup telemetry in this environment");
+        return;
+    };
+    let f = ObserveFixture::new();
+    let out = f.root.join("production-defaults");
+    let child = f
+        .command()
+        .env("FAKE_CGROUP", group)
+        .args(["watch", "test.service", "--production", "--output"])
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lines(&out.join("samples.jsonl"), 1, Duration::from_secs(10));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["seconds"], 1800);
+    assert_eq!(manifest["intervalMs"], 1000);
+    assert!(
+        Command::new("sh")
+            .args(["-c", &format!("kill -TERM {}", child.id())])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(wait_exit(child, Duration::from_secs(10)).status.success());
+    assert_eq!(f.summary(&out)["reason"], "cancelled");
+}
+
+#[test]
+fn production_watch_cancellation_interrupts_long_sleep() {
+    let f = ObserveFixture::new();
+    let out = f.root.join("production-cancel");
+    let Some(mut command) = f.watch_own_cgroup(3600, 60_000, &out) else {
+        return;
+    };
+    command.arg("--production");
+    let child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lines(&out.join("samples.jsonl"), 1, Duration::from_secs(10));
+    assert!(
+        Command::new("sh")
+            .args(["-c", &format!("kill -TERM {}", child.id())])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = wait_exit(child, Duration::from_secs(10));
+    assert!(output.status.success());
+    assert_eq!(f.summary(&out)["reason"], "cancelled");
+    assert_eq!(f.summary(&out)["complete"], false);
+}
+
+#[test]
+fn production_watch_rejects_high_frequency_before_creating_output() {
+    let f = ObserveFixture::new();
+    let out = f.root.join("invalid-production");
+    let output = f
+        .watch(3600, 20, &out)
+        .arg("--production")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("1000..=60000"));
+    assert!(!out.exists());
+}
+
+#[test]
 fn missing_unit_reports_observer_not_ready() {
     let f = ObserveFixture::new();
     let out = f.root.join("out");

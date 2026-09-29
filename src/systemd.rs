@@ -1007,12 +1007,12 @@ pub fn validate_unit_public(unit: &str) -> Result<()> {
 fn validate_unit(unit: &str) -> Result<()> {
     if unit.is_empty()
         || unit.len() > 255
-        || !unit.ends_with(".service")
+        || !(unit.ends_with(".service") || unit.ends_with(".scope"))
         || !unit.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b':')
         })
     {
-        bail!("UNIT must be a safe .service unit name");
+        bail!("UNIT must be a safe .service or .scope unit name");
     }
     Ok(())
 }
@@ -1020,6 +1020,24 @@ fn validate_unit(unit: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_units_accept_scopes_without_accepting_paths_or_arguments() {
+        for unit in ["app-game.scope", "background-worker.service"] {
+            assert!(validate_unit(unit).is_ok());
+        }
+        for unit in [
+            "",
+            "app.slice",
+            "../app.scope",
+            "a/b.service",
+            "a.scope --system",
+            "a.scope\n",
+            "a.scope\0",
+        ] {
+            assert!(validate_unit(unit).is_err());
+        }
+    }
 
     #[test]
     fn diagnostic_properties_omit_free_form_text() {

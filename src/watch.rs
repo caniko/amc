@@ -35,17 +35,19 @@ pub const MIN_INTERVAL_MS: u64 = 10;
 pub const MAX_INTERVAL_MS: u64 = 1000;
 pub const MAX_SAMPLES: usize = 5000;
 pub const MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+const PRODUCTION_MAX_SAMPLES: usize = 86_400;
+const PRODUCTION_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Output budget predicate: one probe byte past the cap refuses the next
-/// sample before any allocation for it.
-fn budget_exceeded(bytes_written: u64, line_len: usize) -> bool {
-    bytes_written + line_len as u64 + 1 > MAX_OUTPUT_BYTES
+/// Refuse a sample when its serialized bytes and newline exceed the stream cap.
+fn budget_exceeded(bytes_written: u64, line_len: usize, limit: u64) -> bool {
+    line_len as u64 >= limit.saturating_sub(bytes_written)
 }
 
 #[derive(Debug, Clone)]
 pub struct WatchArgs {
     pub unit: String,
     pub system: bool,
+    pub production: bool,
     pub seconds: u64,
     pub interval_ms: u64,
     pub output: PathBuf,
@@ -53,11 +55,17 @@ pub struct WatchArgs {
 
 impl WatchArgs {
     pub fn validate(&self) -> Result<()> {
-        if !(1..=MAX_SECONDS).contains(&self.seconds) {
-            bail!("--seconds must be 1..={MAX_SECONDS}");
+        let max_seconds = if self.production { 86_400 } else { MAX_SECONDS };
+        let (min_interval, max_interval) = if self.production {
+            (1000, 60_000)
+        } else {
+            (MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+        };
+        if !(1..=max_seconds).contains(&self.seconds) {
+            bail!("--seconds must be 1..={max_seconds}");
         }
-        if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&self.interval_ms) {
-            bail!("--interval-ms must be {MIN_INTERVAL_MS}..={MAX_INTERVAL_MS}");
+        if !(min_interval..=max_interval).contains(&self.interval_ms) {
+            bail!("--interval-ms must be {min_interval}..={max_interval}");
         }
         if self.output.as_os_str().is_empty() {
             bail!("--output must not be empty");
@@ -77,6 +85,10 @@ struct Sample {
     observation_id: String,
     clock_domain: &'static str,
     target: TargetRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<amc_telemetry::host::HostSnapshot>,
+    capture_duration_us: u64,
+    schedule_lag_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +145,10 @@ struct Manifest {
     seconds: u64,
     interval_ms: u64,
     started_unix_ms: Option<u128>,
+    production: bool,
+    max_samples: usize,
+    max_output_bytes: u64,
+    host_scope: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +295,20 @@ struct CollectionOut {
     persisted_samples: u64,
     /// The samples file was flushed and synced before the summary.
     storage_durable: bool,
+    bytes_written: u64,
+    missed_intervals: u64,
+    max_capture_duration_us: u64,
+}
+
+/// Skip missed ticks rather than issuing a catch-up burst after stalled I/O.
+fn next_sample_deadline(previous: Instant, now: Instant, interval: Duration) -> (Instant, u64) {
+    let next = previous + interval;
+    if next > now {
+        return (next, 0);
+    }
+    // Bounded sessions and a minimum 10ms interval keep this below u32::MAX.
+    let skipped = (now.duration_since(next).as_nanos() / interval.as_nanos() + 1) as u32;
+    (next + interval * skipped, u64::from(skipped))
 }
 
 /// What the collection loop observed, recorded at each exit site.
@@ -651,6 +681,11 @@ fn final_available(
 /// Observe one unit for a finite interval. Read-only toward the target.
 pub fn watch(args: &WatchArgs) -> Result<i32> {
     args.validate()?;
+    let (max_samples, max_output_bytes) = if args.production {
+        (PRODUCTION_MAX_SAMPLES, PRODUCTION_MAX_OUTPUT_BYTES)
+    } else {
+        (MAX_SAMPLES, MAX_OUTPUT_BYTES)
+    };
     super::systemd::validate_unit_public(&args.unit)?;
     create_private_dir(&args.output)?;
 
@@ -702,6 +737,9 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                 attempted_samples: 0,
                 persisted_samples: 0,
                 storage_durable: false,
+                bytes_written: 0,
+                missed_intervals: 0,
+                max_capture_duration_us: 0,
             },
             event_deltas: None,
             event_delta_coverage: None,
@@ -758,6 +796,14 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         seconds: args.seconds,
         interval_ms: args.interval_ms,
         started_unix_ms: started_unix,
+        production: args.production,
+        max_samples,
+        max_output_bytes,
+        host_scope: if args.production {
+            "observer-procfs-view; aggregate context, not target attribution"
+        } else {
+            "not-collected"
+        },
     };
     atomic_write(
         &args.output.join("manifest.json"),
@@ -810,14 +856,22 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         bail!("target identity changed or unavailable during attachment");
     }
     let mut last_attempt: Option<amc_telemetry::Snapshot> = None;
+    let mut next_sample = Instant::now();
+    let mut last_manager_poll = next_sample;
+    let mut missed_intervals = 0;
+    let mut max_capture_duration_us = 0;
 
-    while Instant::now() < deadline && (sequence as usize) < MAX_SAMPLES {
+    while Instant::now() < deadline && (sequence as usize) < max_samples {
         if signals.cancelled().is_some() {
             outcome = LoopOutcome::Cancelled;
             reason = outcome.reason().to_string();
             break;
         }
         attempts += 1;
+        let capture_started = Instant::now();
+        let schedule_lag_ms = capture_started
+            .saturating_duration_since(next_sample)
+            .as_millis() as u64;
         let elapsed_ms = started_mono.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         // Continuity: the path may have been recycled for a new object
         // between ticks (see `tick_continuity`).
@@ -832,11 +886,25 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         snapshot.boot_id = owner_boot_id.clone();
         snapshot.inode = tick_inode;
         let sample_unix_ms = snapshot.observed_unix_ms.unwrap_or(0);
+        let host = args.production.then(|| {
+            amc_telemetry::host::snapshot(
+                Path::new("/proc"),
+                Some(started_mono.elapsed().as_millis() as u64),
+            )
+        });
+        let capture_duration_us = capture_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        max_capture_duration_us = max_capture_duration_us.max(capture_duration_us);
         let sample = Sample {
             observation: snapshot,
             observation_id: observation.clone(),
             clock_domain: amc_telemetry::CLOCK_DOMAIN,
             target: target.clone(),
+            host,
+            capture_duration_us,
+            schedule_lag_ms,
         };
         // Track last readable per file and running maxima from known values.
         // These are sampled maxima, distinct from kernel-reported peaks.
@@ -918,7 +986,7 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
             }
         }
         let line = serde_json::to_vec(&sample)?;
-        if budget_exceeded(bytes_written, line.len()) {
+        if budget_exceeded(bytes_written, line.len(), max_output_bytes) {
             outcome = LoopOutcome::OutputBudgetExceeded;
             reason = outcome.reason().to_string();
             incomplete_persistence = true;
@@ -926,7 +994,10 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         }
         // A failed sample write is incomplete persistence, not a silent
         // truncation: record it and stop instead of fabricating the rest.
-        if samples.write_all(&line).is_err() || samples.write_all(b"\n").is_err() {
+        if samples.write_all(&line).is_err()
+            || samples.write_all(b"\n").is_err()
+            || (args.production && samples.flush().is_err())
+        {
             outcome = LoopOutcome::OutputWriteFailed;
             reason = outcome.reason().to_string();
             incomplete_persistence = true;
@@ -987,7 +1058,7 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
         // above remains the guard), so polling continues.
         // A successful poll additionally snapshots the verified readable
         // prefix: every value in it predates any restart detected later.
-        if sequence.is_multiple_of(1000 / args.interval_ms.max(1)) {
+        if last_manager_poll.elapsed() >= Duration::from_secs(1) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Ok(current) = super::systemd::leaf_status_with_timeout(
                 &systemctl,
@@ -1009,14 +1080,24 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
                     values: last_readable.clone(),
                 });
             }
+            last_manager_poll = Instant::now();
         }
-        let next = started_mono + interval * (sequence as u32);
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
+        // Count only scheduled slots inside the requested window, even if
+        // the last read/query stalled past its end.
+        let scheduling_end = Instant::now().min(deadline - Duration::from_nanos(1));
+        let (next, skipped) = next_sample_deadline(next_sample, scheduling_end, interval);
+        next_sample = next;
+        missed_intervals += skipped;
+        let wake = next_sample.min(deadline);
+        while signals.cancelled().is_none() {
+            let remaining = wake.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(100)));
         }
     }
-    if (sequence as usize) >= MAX_SAMPLES
+    if (sequence as usize) >= max_samples
         && outcome == LoopOutcome::Deadline
         && Instant::now() < deadline
     {
@@ -1190,6 +1271,9 @@ pub fn watch(args: &WatchArgs) -> Result<i32> {
             attempted_samples: attempts,
             persisted_samples,
             storage_durable,
+            bytes_written,
+            missed_intervals,
+            max_capture_duration_us,
         },
         event_delta_coverage: interval.event_deltas.as_ref().map(|_| {
             serde_json::json!({
@@ -1340,6 +1424,7 @@ mod tests {
         let ok = WatchArgs {
             unit: "app-amc-test@1.service".into(),
             system: false,
+            production: false,
             seconds: 5,
             interval_ms: 20,
             output: PathBuf::from("/tmp/amc-watch-test"),
@@ -1359,6 +1444,50 @@ mod tests {
             };
             assert!(args.validate().is_err());
         }
+        let production = WatchArgs {
+            production: true,
+            seconds: 86_400,
+            interval_ms: 1000,
+            ..ok
+        };
+        assert!(production.validate().is_ok());
+        for (seconds, interval_ms) in [(0, 1000), (86_401, 1000), (3600, 999), (3600, 60_001)] {
+            assert!(
+                WatchArgs {
+                    seconds,
+                    interval_ms,
+                    ..production.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            WatchArgs {
+                interval_ms: 60_000,
+                ..production
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stalled_collection_skips_slots_instead_of_catching_up() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(1);
+        assert_eq!(
+            next_sample_deadline(start, start, interval),
+            (start + interval, 0)
+        );
+        assert_eq!(
+            next_sample_deadline(start, start + interval, interval),
+            (start + interval * 2, 1)
+        );
+        assert_eq!(
+            next_sample_deadline(start, start + Duration::from_millis(3500), interval),
+            (start + interval * 4, 3)
+        );
     }
 
     #[test]
@@ -1970,6 +2099,9 @@ mod tests {
                 cgroup_path: "/a.service".to_string(),
                 invocation_id: Some("inv-1".to_string()),
             },
+            host: None,
+            capture_duration_us: 0,
+            schedule_lag_ms: 0,
         };
         let text = serde_json::to_string(&sample).unwrap();
         let loaded = load_observation(&text).unwrap();
@@ -2241,9 +2373,12 @@ mod tests {
 
     #[test]
     fn output_budget_is_one_probe_byte_past_the_cap() {
-        assert!(!budget_exceeded(0, 10));
-        assert!(!budget_exceeded(MAX_OUTPUT_BYTES - 11, 10));
-        assert!(budget_exceeded(MAX_OUTPUT_BYTES - 10, 10));
-        assert!(budget_exceeded(MAX_OUTPUT_BYTES, 0));
+        for limit in [MAX_OUTPUT_BYTES, PRODUCTION_MAX_OUTPUT_BYTES] {
+            assert!(!budget_exceeded(0, 10, limit));
+            assert!(!budget_exceeded(limit - 11, 10, limit));
+            assert!(budget_exceeded(limit - 10, 10, limit));
+            assert!(budget_exceeded(limit, 0, limit));
+            assert!(budget_exceeded(u64::MAX, 1, limit));
+        }
     }
 }

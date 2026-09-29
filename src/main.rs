@@ -51,7 +51,7 @@ enum Command {
     Run(ManagedCommand),
     /// Launch a detached transient service and return after startup.
     Launch(ManagedCommand),
-    /// Inspect a retained or running AMC service.
+    /// Passively inspect a native service or scope.
     Inspect {
         unit: String,
         /// Query a system unit rather than a unit in the current user manager.
@@ -66,12 +66,15 @@ enum Command {
         /// Query a system unit rather than a unit in the current user manager.
         #[arg(long)]
         system: bool,
-        /// Observation length in seconds (1..=60).
-        #[arg(long, default_value_t = crate::watch::DEFAULT_SECONDS)]
-        seconds: u64,
-        /// Sampling interval in milliseconds (10..=1000).
-        #[arg(long, default_value_t = crate::watch::DEFAULT_INTERVAL_MS)]
-        interval_ms: u64,
+        /// Passive long capture with host context (default 1800s, 1000ms; no policy changes).
+        #[arg(long)]
+        production: bool,
+        /// Observation length: 1..=60 (default 40), or 1..=86400 with --production.
+        #[arg(long)]
+        seconds: Option<u64>,
+        /// Sampling interval: 10..=1000 (default 20), or 1000..=60000 with --production.
+        #[arg(long)]
+        interval_ms: Option<u64>,
         /// Output directory (must not exist; created 0700).
         #[arg(long)]
         output: PathBuf,
@@ -290,14 +293,24 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Watch {
             unit,
             system,
+            production,
             seconds,
             interval_ms,
             output,
         } => crate::watch::watch(&crate::watch::WatchArgs {
             unit,
             system,
-            seconds,
-            interval_ms,
+            production,
+            seconds: seconds.unwrap_or(if production {
+                1800
+            } else {
+                crate::watch::DEFAULT_SECONDS
+            }),
+            interval_ms: interval_ms.unwrap_or(if production {
+                1000
+            } else {
+                crate::watch::DEFAULT_INTERVAL_MS
+            }),
             output,
         }),
         Command::Diff { before, after } => crate::watch::diff(&before, &after),

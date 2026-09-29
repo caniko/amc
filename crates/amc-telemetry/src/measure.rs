@@ -209,8 +209,8 @@ pub fn parse(name: &str, text: &str) -> Option<Value> {
     if name.ends_with("events") || name == "memory.events.local" {
         return parse_events(text);
     }
-    if name == "memory.pressure" {
-        return parse_pressure(text);
+    if matches!(name, "memory.pressure" | "cpu.pressure" | "io.pressure") {
+        return parse_pressure(text, name != "cpu.pressure");
     }
     if text == "max" && matches!(name, "memory.max" | "memory.high" | "memory.swap.max") {
         return Some(json!("max"));
@@ -256,7 +256,7 @@ fn parse_events(text: &str) -> Option<Value> {
     (!result.is_empty()).then_some(Value::Object(result))
 }
 
-fn parse_pressure(text: &str) -> Option<Value> {
+fn parse_pressure(text: &str, full_required: bool) -> Option<Value> {
     let mut result = serde_json::Map::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
@@ -286,7 +286,9 @@ fn parse_pressure(text: &str) -> Option<Value> {
             return None;
         }
     }
-    (result.len() == 2).then_some(Value::Object(result))
+    // Older kernels expose only `some` for CPU PSI. Never invent a full row.
+    (result.contains_key("some") && (!full_required || result.contains_key("full")))
+        .then_some(Value::Object(result))
 }
 
 /// Snapshot of one cgroup directory. `schema_version` is additive: legacy

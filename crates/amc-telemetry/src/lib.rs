@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compare;
+pub mod host;
 pub mod identity;
 pub mod measure;
 
