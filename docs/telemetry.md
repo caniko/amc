@@ -28,6 +28,171 @@ Tokio runtime, subscribers, or exporters in the core. No `unsafe`.
   installs a subscriber; see
   `crates/amc-runner/examples/admission-diagnostics.rs`.
 
+## Production capture
+
+Production observation is opt-in and passive. It uses the same identity-aware
+collector and never starts, stops, freezes, moves, or changes the target.
+Select the actual native service/scope that owns the work, not an activation
+client or an assumed universal Steam unit. The output directory must be new,
+its parent must exist, and symlink parents are rejected.
+
+```sh
+# Run alongside normal work; this command does not start the workload.
+amc watch actual-workload.service --production --output /tmp/amc-session-01
+
+# One hour, sampling every two seconds. Use --system for a system-manager unit.
+amc watch actual-workload.service --production --seconds 3600 --interval-ms 2000 \
+  --output /tmp/amc-session-02
+
+# Inspect an existing capture without querying or modifying the workload.
+jq '{reason, complete, coverage, collection}' /tmp/amc-session-02/summary.json
+jq -c '{time: .host.observedUnixMs, available: .host.files["meminfo.MemAvailable"], memoryPressure: .host.files["pressure.memory"]}' \
+  /tmp/amc-session-02/samples.jsonl
+```
+
+Replace the illustrative unit with the discovered owner. Choose the actual
+output location deliberately; local logs still contain unit/cgroup identifiers,
+timestamps, boot identity, and aggregate resource activity. Nothing is uploaded.
+No special privileges are granted; inaccessible measurements remain unknown.
+
+| Mode | Default | Allowed duration / interval | Sample storage ceiling |
+|---|---|---|---|
+| Ordinary `watch` | 40 seconds / 20 ms | 1-60 seconds / 10-1000 ms | 5000 samples, 8 MiB |
+| `watch --production` | 1800 seconds / 1000 ms | 1-86400 seconds / 1000-60000 ms | 86,400 samples, 256 MiB |
+
+Duration, sample count, and bytes are independent limits. Reaching a storage
+limit ends collection with an explicit incomplete reason; there is no rotation,
+automatic deletion, or silent overwrite. The byte ceiling covers `samples.jsonl`;
+bounded manifest/summary/marker files add a small amount. It is not a disk-space
+reservation. Longer duration does not guarantee that the byte cap will suffice.
+
+Ctrl-C or SIGTERM stops the observer only, persists the readable prefix when
+possible, and records `cancelled`/`complete:false`. Sleeps check cancellation at
+most every 100 ms and never sleep past the sampling deadline. Manager queries
+still have their existing timeout/grace bounds; arbitrary blocked kernel I/O
+cannot be given a hard cancellation deadline. SIGKILL can leave no summary.
+No policy rollback is needed because observation changes no policy.
+
+Production samples are flushed to the OS on each tick for live readers. `ready`
+still requires a synced valid target baseline; sample durability is claimed only
+after the final flush/sync succeeds. A flush is not a crash-durability guarantee.
+The process exits when this target disappears or changes lifetime; it does not
+follow restarts or collect an unbounded series of sessions. Missing `done` or
+summary is incomplete evidence. Exit zero alone is not a completeness check.
+
+### Host context
+
+Production sample lines add `host`, with its own wall-clock and observer-relative
+monotonic capture-start timestamps and a map of `{value, unknown}` measurements:
+
+- `meminfo.MemTotal`, `MemAvailable`, `SwapTotal`, `SwapFree`, `Buffers`, `Cached`,
+  `Dirty`, and `Writeback` (each key has the `meminfo.` prefix): **bytes**, converted
+  from procfs `kB` with checked multiplication by 1024.
+- `vmstat.pswpin` and `vmstat.pswpout`: cumulative **pages**, not bytes.
+  `vmstat.pgmajfault`: cumulative major-fault count. These are not per-interval
+  deltas and must not be attributed to the target unit.
+- `pressure.memory`, `pressure.cpu`, and `pressure.io`: PSI averages in percent
+  and cumulative `total` in microseconds. Older CPU PSI may omit `full`; an absent
+  row stays absent, never zero. System-level CPU `full` is not an application
+  responsiveness metric.
+
+The module allowlists fields, rejects duplicate keys and invalid units/numbers,
+bounds meminfo/vmstat input to 64 KiB each and pressure files to 4 KiB each, and
+never emits malformed input or unrelated fields. Missing fields are individually
+unknown. Existing strict memory/IO PSI parsing is not relaxed for older CPU PSI.
+There are no process listings, argv, environment, device identifiers, or journal
+messages in this host context.
+
+`host` means the observer's `/proc` view, which may be restricted or virtualized.
+It is not a promise of full machine visibility and is not the target's cgroup
+budget. Measurements are sequential, not atomic. `complete` continues to describe
+target collection; it does not certify every host metric as present. Inspect
+each measurement's unknown reason. `amc diff` still compares the target snapshot,
+not these aggregate host values.
+
+### Timing and interpretation
+
+Every sample adds `captureDurationUs` (wall time for target/optional host reads,
+not total observer CPU time) and `scheduleLagMs`. Summary `collection` adds
+`bytesWritten`, `missedIntervals`, and `maxCaptureDurationUs`. Missed scheduling
+slots are skipped rather than collected in bursts. Manager identity checks run
+at most once per second and only at sample ticks; a 60-second sample interval
+can therefore also delay restart detection. The pinned-reader and final-query
+guards still prevent claiming continuity from a matching pathname alone.
+
+Manifest fields `production`, `maxSamples`, `maxOutputBytes`, and `hostScope`
+record the selected collection contract. Existing defaults and field meanings
+are retained; additions do not select a memory priority profile. Multiple unit
+observers are separate captures with separate budgets/host reads. Do not equate
+their relative monotonic timestamps: each starts at zero independently. Retain
+wall-clock timestamps and boot IDs, and account for clock adjustments and sample
+duration when correlating captures.
+
+For gaming, record frame times separately using an existing tool such as
+MangoHud and retain its clock/logging configuration. AMC does not measure frame
+times, VRAM, background useful-work completion, or causality. Capture game,
+driver, kernel, swap/zram, effective ancestry, and binary/source identity with
+the experiment record. Low PSI is not proof of good frame times; a frame stall
+is not proof that memory caused it. This mode enables observation, not a validated
+A/B/C experiment or a claim of low overhead on every workstation.
+
+### Accounted observation
+
+`scripts/capture-accounted.py` is a stdlib-only Python 3.11+ pilot runner. It
+starts only an observer in a uniquely named transient **user** service. The
+target must already exist; its placement, limits, swap, and OOM policy are not
+changed. Use a validated release build before capturing normal work:
+
+```sh
+python3 scripts/capture-accounted.py actual-workload.scope \
+  --amc target/release/amc --seconds 1800 --output /tmp/amc-accounted-01
+python3 scripts/validate-capture.py /tmp/amc-accounted-01/capture --markdown
+```
+
+`--system` selects a system-manager **target**, not a privileged observer.
+The output parent must exist, the session directory must be new, and its
+filesystem must permit executing the binary copy. The runner makes a private
+0700 directory, copies/checksums the binary, and writes 0600 JSON records:
+
+- `session.json`: observer name, target manager/unit, requested sampling,
+  binary SHA-256, and accounting scope.
+- `capture/`: the unchanged manifest/samples/summary/markers produced by `watch`.
+- `accounting.json`: final systemd counters, units, unknowns, invocation,
+  process start/exit timestamps, and manager result.
+- `cleanup.json`: successful stop of the observer after durable accounting export.
+
+The observer uses native CPU/memory/IO accounting and `RemainAfterExit=yes`.
+The runner does **not** use immediate `--collect`: it reads the retained final
+counters, flushes and syncs the export, then stops its own unit. An invocation
+change observed during polling aborts control. Do not independently restart or
+replace the observer unit while a capture is running.
+
+CPU time is nanoseconds, peak memory is bytes, and IO fields are block-IO bytes
+or operation counts. A missing field, unsupported counter, or systemd's
+`UINT64_MAX` sentinel becomes `value:null` with `unknown:unavailable`; zero stays
+known. IO byte counts are not JSON file lengths. Start/exit timestamps use
+systemd's monotonic microsecond clock, not the capture's relative millisecond
+clock. Final counters can remain available after `ControlGroup` becomes empty.
+
+The accounting boundary includes the observer and its child query processes.
+It excludes the outer Python launcher, the service manager, and other services
+performing work on their behalf. It is not a measurement of total host overhead
+caused by observation, nor proof of no frame-time impact. The copied executable
+and session metadata remain local; review them before sharing an artifact bundle.
+
+Ctrl-C/SIGTERM asks only the observer's main process to finish via SIGINT, then
+exports its retained counters before cleanup. A manager runtime limit bounds
+the running observer to the requested duration plus 60 seconds, with a 10-second
+stop timeout. Each manager command has a 20-second timeout. Ambiguous submission,
+identity, timeout, or export failures do not trigger resubmission or blind
+cleanup. Inspect `session.json` and the named unit; a failed export may leave a
+partial JSON file and a retained unit that needs manual recovery. Do not assume
+an accounting export is present merely because the observer has exited.
+
+The runner's successful exit means its process/accounting lifecycle completed;
+check the capture's own completeness separately with the validator. Long-session
+overhead and broad distribution/version compatibility remain unvalidated.
+
 ## Classification and comparison
 
 - `memory.events*`: counters with scope; deltas require compatible
@@ -121,9 +286,13 @@ and durable persistence — a stale previously-persisted value after a
 failed final write stays unavailable. If the `done`
 marker itself fails, the summary is repaired to incomplete and the
 original error is returned; a missing `done` is incomplete evidence,
-never success. Contract change is additive only (`collection`,
+never success. New fields are additive (`collection`,
 `pressureStallCoverage`, `endpoint-query-failed`); existing
-`summary.json` consumers ignore unknown fields.
+`summary.json` consumers ignore unknown fields. One semantic
+tightening on an existing field: `finalCountersAvailable` now
+requires durable persistence, so it can flip `true`→`false` in
+persistence-failure cases where a stale previously-persisted value
+was previously reported available.
 
 ## Admission diagnostics
 
@@ -184,6 +353,7 @@ directory-handle fixes):
 These are order-of-magnitude smoke numbers, not production profiles:
 no peak-RSS measurement, no diagnostics-enabled-vs-disabled split, no
 release-build or latency distribution. Treat them as such.
+They also predate production host-context capture and do not estimate its cost.
 - Sampling is sequential, not atomic. No implementation can guarantee
   readable counters after cgroup destruction, recover unwritten evidence
   after SIGKILL, or impose a hard deadline on arbitrary blocking

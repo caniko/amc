@@ -7,6 +7,7 @@ import io
 import re
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -211,4 +212,12 @@ def boom(*args, **kwargs):
     raise BrokenPipeError("SENSITIVE_PIPE")
 emit_scope["print"] = boom
 emit_scope["emit"]("should not raise")
+# Offline validation and observer lifecycle tests never contact a real manager.
+for test in ("test-validate-capture.py", "test-capture-accounted.py"):
+    result = subprocess.run([sys.executable, "-B", str(root / "scripts" / test)],
+                            capture_output=True, text=True, timeout=60)
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        print(result.stderr, end="")
+        raise AssertionError(f"{test} regressions failed")
 print("fixture regressions passed: property scope, explicit reports, unknown telemetry, failure export/cleanup, host deadline, export-budget cleanup, time-budget cleanup, transport fail-closed, and emit swallow")
