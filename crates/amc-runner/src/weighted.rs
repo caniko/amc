@@ -1234,6 +1234,109 @@ mod tests {
         assert_eq!(gate.active_permits(), 0);
     }
 
+    #[cfg(feature = "sync")]
+    #[test]
+    fn release_during_probe_invalidates_the_in_flight_observation() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        // The second provider call blocks so the test can release a live
+        // permit mid-probe. The woken probe returns admittable stats from
+        // a stale generation and must not admit on them.
+        struct BlockingProvider {
+            calls: AtomicUsize,
+            entered: Barrier,
+            resume: Barrier,
+        }
+        impl crate::provider::MemoryProvider for BlockingProvider {
+            fn used_fraction(&self) -> Result<f64, ProviderError> {
+                Ok(0.1)
+            }
+            fn stats(&self) -> Result<MemoryStats, ProviderError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.entered.wait();
+                    self.resume.wait();
+                }
+                MemoryStats::new(1000, 900, 0)
+            }
+        }
+        let provider = Arc::new(BlockingProvider {
+            calls: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        let gate = SyncWeightedAdmissionGate::new(
+            WeightedConfig {
+                safety_reserve_bytes: 0,
+                max_single_weight_bytes: u64::MAX,
+                stats_max_age: Duration::from_millis(1),
+                max_page_cache_fraction: 1.0,
+                ..WeightedConfig::default()
+            },
+            provider.clone(),
+        );
+        // Prime the cache and hold a permit; the sleep expires the
+        // millisecond probe cache so the next attempt really probes.
+        let holder = gate.acquire_timeout(100, Duration::from_secs(5)).unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(10));
+        let slow_gate = gate.clone();
+        let slow = std::thread::spawn(move || slow_gate.inner.try_admit(100).0);
+        provider.entered.wait();
+        drop(holder);
+        provider.resume.wait();
+        assert!(matches!(slow.join().unwrap(), AttemptOutcome::Wait { .. }));
+        assert_eq!(gate.committed_bytes(), 0);
+        assert_eq!(gate.active_permits(), 0);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn release_forces_a_fresh_probe_before_the_next_decision() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting {
+            calls: Arc<AtomicUsize>,
+            stats: MemoryStats,
+        }
+        impl crate::provider::MemoryProvider for Counting {
+            fn used_fraction(&self) -> Result<f64, ProviderError> {
+                Ok(self.stats.used_fraction())
+            }
+            fn stats(&self) -> Result<MemoryStats, ProviderError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.stats.clone())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: SharedMemoryProvider = Arc::new(Counting {
+            calls: Arc::clone(&calls),
+            stats: MemoryStats::new(1000, 900, 0).unwrap(),
+        });
+        let gate = SyncWeightedAdmissionGate::new(
+            WeightedConfig {
+                safety_reserve_bytes: 0,
+                max_single_weight_bytes: u64::MAX,
+                // A minute-long cache: without release invalidation the
+                // second attempt would reuse the first observation.
+                stats_max_age: Duration::from_secs(60),
+                max_page_cache_fraction: 1.0,
+                ..WeightedConfig::default()
+            },
+            provider,
+        );
+        let holder = gate.acquire_timeout(100, Duration::from_secs(5)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(holder);
+        let (outcome, _) = gate.inner.try_admit(100);
+        assert!(matches!(outcome, AttemptOutcome::Admitted));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "invalidated cache must be re-probed, not reused"
+        );
+    }
+
     #[cfg(feature = "async")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
