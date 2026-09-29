@@ -401,8 +401,38 @@ Session protocol when the game is running (passive only, user-run):
 5. Stop only the observers if they interfere. Do not change limits, restart
    apps, touch swap, disable OOM handling, or follow replacement workloads.
 
-Still open: chosen game and launcher path, background work under test,
-frame-time logging method, and the user's go-ahead for the 30-minute session.
+Still open: a repeatable game scene and its actual runtime owner, calibrated
+background work, frame-time logging, and a scheduled 30-minute session.
+
+### First comparison candidate (2026-09-30)
+
+The user delegated selection from the installed games. **Counter-Strike 2**
+(Steam app 730) is installed on Atlas. An offline, locally recorded demo is the
+candidate scene: record a fixed 60–90 second route on the same training map,
+archive the demo and its hash, and replay the same file for each arm. No demo
+was present at selection time, so the scene, playback determinism, and a
+representative memory-pressure level remain calibration gates, not established
+facts. Do not use a public network match as the measurement scene.
+
+MangoHud 0.8.4 is present in the Nix store but not on `PATH`. Its
+[upstream configuration](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/data/MangoHud.conf)
+supports `output_folder`, `autostart_log`, `log_duration`, and `log_interval`.
+First verify that it logs per-frame data for this game and quantify its
+instrumentation overhead using otherwise identical launches; retain the same
+logging configuration in every comparison arm. A frame-time CSV must be
+aligned by run window with each AMC capture; an on-screen FPS value is not a
+substitute.
+
+Candidate useful background work is a fixed, clean AMC Cargo workspace build
+or test batch with pinned source/lock/toolchain and a fresh, isolated target
+directory per run. Predeclare the finite batch, verify it actually competes
+for memory on Atlas, and record completion, elapsed time, failures, and
+admission waits. For arms B/C, use identical native per-job and aggregate
+limits and the same offered batch; C enrolls it under **one shared** weighted
+runner, while B uses calibrated fixed concurrency. The installed `amc run`
+fixture command is not a weighted-admission runner. Tune the work estimate and
+comparison margins on separate calibration runs; do not infer benefit from
+the prior passive capture or count frames as independent replicates.
 
 ### Atlas Endurance Run (started 2026-09-20 ~21:19 local)
 
