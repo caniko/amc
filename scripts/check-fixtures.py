@@ -213,7 +213,7 @@ def boom(*args, **kwargs):
 emit_scope["print"] = boom
 emit_scope["emit"]("should not raise")
 # Offline validation and observer lifecycle tests never contact a real manager.
-for test in ("test-validate-capture.py", "test-capture-accounted.py"):
+for test in ("test-validate-capture.py", "test-capture-accounted.py", "test-frame-report.py"):
     result = subprocess.run([sys.executable, "-B", str(root / "scripts" / test)],
                             capture_output=True, text=True, timeout=60)
     print(result.stdout, end="")
