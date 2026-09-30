@@ -83,8 +83,9 @@ Only a durably recorded entry acknowledgment permits the actual command to run.
   including surviving descendants. Client exit, timeout, or socket loss cannot
   release them. Cancellation requests a stop of only the verified invocation.
 - After restart, entered identities and weights are restored before admission.
-  A verified new machine boot retires old-boot reservations. Within one boot,
-  a failed manager query or a replaced identity stays accounted for.
+  A verified new machine boot retires old-boot reservations. Both current and
+  stored boot IDs must be canonical kernel UUIDs; malformed IDs block startup.
+  Within one boot, a failed manager query or a replaced identity stays accounted for.
 - A workload is retired only after its recorded cgroup is empty/collected and
   the manager confirms inactivity or unit collection. No submission is replayed.
 - Persistence failure stops the server before it acknowledges the change. Its

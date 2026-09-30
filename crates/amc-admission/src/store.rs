@@ -10,6 +10,21 @@ use std::{
 
 pub const MAX_STATE_BYTES: u64 = 1_048_576;
 
+fn validate_boot_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() == 36
+            && id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                }
+            }),
+        "invalid kernel boot identity; refusing to forget reservations"
+    );
+    Ok(())
+}
+
 pub fn fresh_id() -> Result<String> {
     let id = fs::read_to_string("/proc/sys/kernel/random/uuid")?
         .trim()
@@ -43,6 +58,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(directory: &Path, boot_id: &str) -> Result<(Self, Ledger)> {
+        validate_boot_id(boot_id)?;
         private_directory(directory)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -74,6 +90,7 @@ impl Store {
                 let ledger: Ledger = serde_json::from_slice(&data)
                     .context("invalid admission ledger; refusing to forget reservations")?;
                 ledger.validate()?;
+                validate_boot_id(&ledger.boot_id)?;
                 if ledger.boot_id == boot_id {
                     ledger
                 } else {
@@ -100,6 +117,7 @@ impl Store {
 
     pub fn save(&self, ledger: &Ledger) -> Result<()> {
         ledger.validate()?;
+        validate_boot_id(&ledger.boot_id)?;
         let data = serde_json::to_vec(ledger)?;
         ensure!(
             data.len() as u64 <= MAX_STATE_BYTES,
