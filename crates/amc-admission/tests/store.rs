@@ -19,6 +19,14 @@ fn durable_state_has_a_single_owner_and_survives_reopen() {
     drop(store);
     std::fs::write(root.join("ledger.json"), b"truncated").unwrap();
     assert!(Store::open(&root, "boot").is_err());
+    std::fs::remove_file(root.join("ledger.json")).unwrap();
+    assert!(Store::open(&root, "boot").is_err());
+    nix::unistd::mkfifo(
+        &root.join("ledger.json"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    assert!(Store::open(&root, "boot").is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -64,6 +64,8 @@ A malformed or missing initialized ledger blocks startup instead of forgetting
 reservations. The socket also has its own exclusive lock. Only same-UID peers
 may use it. Clients carry contract names and server-generated tickets, never
 arbitrary release instructions or foreign unit names.
+Cancellation is bound to the submitting peer PID and its kernel start time;
+another process cannot cancel a ticket by copying its public diagnostic ID.
 
 `exec` preserves argv, cwd, streams, and the caller's environment except native
 manager-owned variables. It submits once through the existing systemd backend,

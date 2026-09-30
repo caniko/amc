@@ -57,10 +57,14 @@ impl Store {
         let path = directory.join("ledger.json");
         let ledger = match OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
             .open(path)
         {
             Ok(file) => {
+                ensure!(
+                    file.metadata()?.is_file(),
+                    "admission ledger is not a regular file"
+                );
                 let mut data = Vec::new();
                 file.take(MAX_STATE_BYTES + 1).read_to_end(&mut data)?;
                 ensure!(

@@ -1,7 +1,7 @@
 //! Single-writer coordinator. A native pre-exec handshake closes the late
 //! submission race: an expired reservation can never execute heavy work.
 use crate::{
-    ledger::{Decision, Ledger, Phase, Policy},
+    ledger::{ClientIdentity, Decision, Ledger, Phase, Policy},
     native::Native,
     protocol::{Message, Request, Response, Status, read_frame, write_frame},
     store::{Store, fresh_id, private_directory},
@@ -103,8 +103,13 @@ pub fn serve(
                 }
                 cursor = cursor.wrapping_add(1);
             }
+            let mut capacity = std::collections::BTreeMap::new();
             waiting = ledger.advance(now_ms()?, &policy, |contract| {
-                native.headroom(contract, policy.reserve_bytes).ok()
+                // At most one bounded native observation per slice/marker per
+                // tick. Queued siblings cannot multiply manager requests.
+                *capacity
+                    .entry((contract.slice.clone(), contract.pause_file.clone()))
+                    .or_insert_with(|| native.headroom(contract, policy.reserve_bytes).ok())
             });
             if before != serde_json::to_vec(&ledger)? {
                 store.save(&ledger)?;
@@ -181,12 +186,14 @@ fn handle(
                 "admission wait must be 1ms..1h"
             );
             let id = fresh_id()?;
+            let client = client_identity(pid)?;
             ledger.enqueue(
                 id.clone(),
                 &contract,
                 policy,
                 now_ms()?.saturating_add(wait_ms).saturating_add(30_000),
             )?;
+            ledger.set_client(&id, client)?;
             response.entry = ledger.get(&id).cloned();
         }
         Message::Poll { id } => {
@@ -216,6 +223,12 @@ fn handle(
             response.entry = ledger.get(&id).cloned();
         }
         Message::Cancel { id } => {
+            if let Some(entry) = ledger.get(&id) {
+                ensure!(
+                    entry.client.as_ref() == Some(&client_identity(pid)?),
+                    "only the submitting client may cancel this ticket"
+                );
+            }
             if !ledger.cancel_pending(&id)
                 && let Some(entry) = ledger.get(&id)
             {
@@ -236,4 +249,18 @@ fn handle(
         }
     }
     Ok(response)
+}
+
+fn client_identity(pid: i32) -> Result<ClientIdentity> {
+    ensure!(pid > 0, "invalid submitting PID");
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| anyhow::anyhow!("client identity unavailable"))?;
+    let start_ticks = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow::anyhow!("client start time unavailable"))?
+        .parse()?;
+    Ok(ClientIdentity { pid, start_ticks })
 }
