@@ -272,6 +272,16 @@ held object: a supported prefix may remain while final coverage is unknown.
 Loaded JSON is checked for supported schema, bounded nonempty identities,
 measurement coherence and metric shape before comparison.
 
+`amc report` preserves these distinctions in both output formats. JSON exposes
+`metrics.targetCoverage` (`knownPoints`/`totalPoints`) alongside
+`targetSampledMax`: a maximum uses known readings only, and an absent maximum
+is unavailable rather than zero. Markdown shows the sample counts and flags
+partial coverage. Collection flags, missed intervals, durability, and the
+summary-reported event interval and delta limitation are also visible. Event
+endpoints are normalized from the producer's flat or nested representation;
+conflicting endpoints are rejected. Valid Unicode stays readable; escaped lone
+surrogates are rendered as literal escapes so a report remains valid UTF-8.
+
 The summary path is structural, not string-driven. The collection loop
 records a `LoopOutcome` at each exit site; the terminal verdict combines
 it with the independent endpoint comparability (`Intact`, `Restarted`,
