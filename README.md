@@ -12,6 +12,9 @@ The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
 modular product direction, explicit user-selected priorities, and gaming plus
 background work as the first evaluation target. General-adoption and performance
 claims remain gated on that evaluation; observation does not enable a policy.
+The [CS2 comparison guide](docs/gaming-comparison.md) covers recording an offline
+demo, per-present frame logging, calibration, and the bounded B/C background-work
+driver. Its native smoke is mechanism evidence; a real-game result is pending.
 
 ## Install and first report
 
@@ -131,8 +134,11 @@ disposable fixture a separate manager-enforced runtime bound. Detached launches
 remain running after successful acknowledgment.
 
 SIGINT/SIGTERM during submission triggers bounded cleanup of only that attempt.
-An absent/collected unit or unavailable manager leaves an explicit UNKNOWN
-outcome. There is no retry, unrestricted fallback, or promise of cleanup after
+An unavailable manager or an unobserved collected unit leaves an explicit UNKNOWN
+outcome. A waited unit observed at startup can complete after native collection
+only when a successful final manager query and its pinned workload-domain evidence
+establish termination beneath the original visible parent. There is no retry,
+unrestricted fallback, or promise of cleanup after
 SIGKILL or manager unavailability. Inspect the recorded identity before any
 manual retry; work may already have happened.
 

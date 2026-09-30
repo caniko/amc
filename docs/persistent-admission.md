@@ -52,6 +52,55 @@ amc admission status --json
 amc admission exec --contract example --timeout 120 -- command argument
 ```
 
+## Installation and removal
+
+The service is optional. The embeddable gates, `inspect`, `watch` and offline
+reports do not require it. Consumers own enrollment and the native aggregate
+slices: install the CLI first, declare a finite slice, then supply the JSON
+policy above. For a manually managed test session, start `admission serve` in a
+separate terminal and use `admission status` before enrolling a finite command.
+The server's default paths require the user's runtime and state directories.
+
+The flake exports `homeManagerModules.default`. With that module imported, set
+`services.amc.admission.enable = true`, `package` to the chosen pinned AMC
+package, and `policy` to the consumer's JSON-shaped attribute set. The module
+creates `amc-admission.service` with dependencies on its declared slices and
+writes `amc/admission.json` under the XDG config directory. It does not define
+the workload slices or choose their budgets. The coordinator has its own 128 MiB
+native memory limit and no swap, separate from workload limits.
+
+For an upgrade or policy change, preserve the ledger and restart the coordinator
+through its native manager. Check `amc admission status --json` afterward:
+entered work retains its previous contract/weight until termination; unentered
+requests are invalidated. An unsuccessful restart is not permission to delete
+state, replay commands, or run unrestricted substitutes. Restore manager access
+or the last known-working package/policy and let the persisted identities
+reconcile. Keep malformed state for diagnosis.
+
+To disable enrollment, remove the consumer's admission wrapper/configuration
+and explicitly decide how future work should run. Wait for entered work to
+finish, or stop an exact owned native invocation after verifying its identity.
+Confirm zero commitments and no unreconciled entries in status before stopping
+the coordinator. For Home Manager, set `services.amc.admission.enable = false`
+and apply that user's configuration through the consumer's normal deployment
+workflow. For a manual coordinator, terminate only that server. Stopping it
+refuses new managed starts; existing jobs retain their systemd limits.
+
+Removal additionally uninstalls the CLI/module through its original package
+manager and removes consumer-owned bindings that are no longer needed. Preserve
+the private ledger until all recorded workloads are verified terminated. Native
+slices and their limits belong to the consumer and require that owner's explicit
+removal decision. No install, restart, disable or uninstall action should delete
+the ledger as a way to release capacity.
+
+The native admission fixture and explicit two-user NixOS VM are the service's
+mechanism gates. The [Ubuntu record](ubuntu-diagnostics-20260930.md) verifies
+diagnostics, not this daemon or its Home Manager installation/removal path.
+Distribution-specific service setup and consumer rollout need their own
+acceptance evidence; passing the fixture is not a gaming-performance claim.
+
+## State and execution
+
 Status includes byte commitments, queued/reserved/running entries, typed wait
 reasons, observed slice hard/swap ceilings for capacity-blocked requests, and
 unreconciled identities. An unknown native state never frees capacity.

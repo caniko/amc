@@ -28,6 +28,15 @@ passed source installation, live inspection, completed and interrupted
 captures, unavailable measurements, and both report formats on Ubuntu 24.04.5
 with systemd 255 and kernel 6.8. No gaming benefit has been verified.
 
+Harness update (2026-09-30): the [CS2 comparison guide](gaming-comparison.md)
+now gives operator-run recording, playback and per-present logging steps. The
+release `workstation-batch` example implements matched native B/C finite batches
+with one shared weighted runner for C, output verification and retained failures.
+A live small-hash smoke passed byte-budget serialization, literal argv, useful
+output checks, negative verification, native-limit mismatch and termination.
+The offline frame reporter is covered by fixture regressions. These mechanisms
+do not close replay, instrumentation-overhead, calibration or performance gates.
+
 ## Goal And Confirmed Decisions
 
 The user's goal is general adoption in prosumer/workstation situations and to
@@ -512,11 +521,12 @@ A guarded evaluation of the pure module regression also passed, checking that
 matching resolved settings satisfy the assertions while missing/mismatched
 service and slice settings fail them. This regression is wired into Canix's
 existing `amc-tool-domains` check.
-Current full-configuration verification is blocked by concurrent Canix work:
-the Git-backed evaluation cannot see the newly referenced, untracked
-`home/modules/development/amc.nix`. The runtime checker consequently has no
-fresh evaluated declaration from this tree; the earlier manual live result
-remains the last complete Atlas acceptance evidence.
+The Home Manager module is now tracked, resolving the earlier Git-backed source
+blocker. A later guarded full-configuration evaluation failed on unrelated
+concurrent Canix work: the pinned toolbelt does not export the newly referenced
+`gatus-instances` module. The runtime checker consequently still has no fresh
+evaluated declaration from this tree; the earlier manual live result remains
+the last complete Atlas acceptance evidence.
 
 ### Atlas Endurance Run (started 2026-09-20 ~21:19 local)
 
