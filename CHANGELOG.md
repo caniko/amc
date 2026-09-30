@@ -10,6 +10,8 @@
   exports its own CPU, memory, and IO accounting.
 - Persistent per-user admission with private IPC, durable hard-memory
   reservations, verified native entry, and an optional Home Manager service.
+- Installed `amc report` with Markdown/JSON output and a booted-Linux diagnostic
+  smoke test, verified on Ubuntu 24.04.5.
 
 ### Changed
 
@@ -27,3 +29,9 @@
 - Refuse malformed boot identities and damaged or missing initialized admission
   ledgers instead of forgetting workload reservations.
 - Preserve literal workload arguments when submitting transient services.
+- Stop manager-option validation at the workload argv separator and reject
+  caller properties that override managed execution's run-once lifecycle.
+- Show target measurement coverage, collection flags, and event intervals in
+  capture reports; safely render JSON-escaped lone Unicode surrogates.
+- Keep the executable wrapper out of marker-only Nix check outputs and handle
+  unavailable host cgroup trees explicitly in sandboxed runner tests.

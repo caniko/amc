@@ -4,12 +4,12 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 
 def main():
@@ -61,10 +61,37 @@ def main():
             # Stream/cwd/environment/argv preservation, including shell metacharacters.
             env = dict(os.environ, AMC_TEST_VALUE="$literal\nsecond line")
             result = subprocess.run(command + ["python3", "-c", "import os,sys,json; print(json.dumps([os.getcwd(),os.environ['AMC_TEST_VALUE'],sys.argv[1],sys.stdin.read()]))", "$argument"],
-                                    cwd=root, env=env, input="input payload", text=True, capture_output=True, timeout=20)
+                                    cwd=root, env=env, input="input payload", text=True, capture_output=True, timeout=20, check=False)
             assert result.returncode == 0, (result.returncode, result.stderr)
             assert json.loads(result.stdout) == [str(root), env["AMC_TEST_VALUE"], "$argument", "input payload"]
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
+
+            # The native execution deadline survives loss of the submitting
+            # client and coordinator, and stops descendants before releasing RAM.
+            deadline_started = root / "deadline-started"
+            deadline_output = root / "deadline-must-not-complete"
+            deadline_script = (
+                "import pathlib,subprocess,sys,time; "
+                "subprocess.Popen([sys.executable,'-c',"
+                "'import pathlib,sys,time; time.sleep(8); pathlib.Path(sys.argv[1]).touch()',sys.argv[2]]); "
+                "pathlib.Path(sys.argv[1]).touch(); time.sleep(60)"
+            )
+            bounded_job = subprocess.Popen(command[:-1] + ["--runtime-max-sec", "2", "--", "python3", "-c", deadline_script,
+                                                          str(deadline_started), str(deadline_output)],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            clients.append(bounded_job)
+            wait(deadline_started.exists)
+            bounded_job.kill()
+            bounded_job.wait(timeout=5)
+            assert rpc("status")["status"]["committed_bytes"] == 64 << 20
+            server.kill()
+            server.wait(timeout=5)
+            server = subprocess.Popen(server_command)
+            wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
+            assert not deadline_output.exists()
+            after_deadline = subprocess.run(command + ["python3", "-c", "print('after-deadline')"], capture_output=True, timeout=20, check=False)
+            assert after_deadline.returncode == 0 and after_deadline.stdout.strip() == b"after-deadline", after_deadline.stderr
+            wait(lambda: not rpc("status")["status"]["entries"])
 
             release = root / "release"
             started = root / "started"
@@ -119,23 +146,23 @@ def main():
             assert cancelled.wait(timeout=20) == 143
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
 
-            failed = subprocess.run(command + ["python3", "-c", "raise SystemExit(42)"], capture_output=True, timeout=20)
+            failed = subprocess.run(command + ["python3", "-c", "raise SystemExit(42)"], capture_output=True, timeout=20, check=False)
             assert failed.returncode == 42, (failed.returncode, failed.stderr)
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
 
             ticket = rpc("enqueue", contract="test", wait_ms=5000)["entry"]["id"]
             wait(lambda: rpc("poll", id=ticket)["entry"]["phase"] == "reserved")
-            foreign = subprocess.run([amc, "admission", "enter", "--socket", str(endpoint), "--ticket", ticket, "--", "echo", "MUST-NOT-EXECUTE"], capture_output=True, timeout=10)
+            foreign = subprocess.run([amc, "admission", "enter", "--socket", str(endpoint), "--ticket", ticket, "--", "echo", "MUST-NOT-EXECUTE"], capture_output=True, timeout=10, check=False)
             assert foreign.returncode != 0 and b"MUST-NOT-EXECUTE" not in foreign.stdout
             rpc("cancel", id=ticket)
 
-            oom = subprocess.run(command + ["python3", "-c", "x=bytearray(256 << 20)"], capture_output=True, timeout=20)
+            oom = subprocess.run(command + ["python3", "-c", "x=bytearray(256 << 20)"], capture_output=True, timeout=20, check=False)
             assert oom.returncode != 0
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
-            after = subprocess.run(command + ["python3", "-c", "print('recovered')"], capture_output=True, timeout=20)
+            after = subprocess.run(command + ["python3", "-c", "print('recovered')"], capture_output=True, timeout=20, check=False)
             assert after.returncode == 0 and after.stdout.strip() == b"recovered", after.stderr
             wait(lambda: not rpc("status")["status"]["entries"])
-            print("PASS: native limits, streams, exit status, shared admission, SIGKILL recovery, manager unavailability, client death, cancellation ownership, entry ownership, and post-OOM progress")
+            print("PASS: native limits, streams, exit status, runtime deadline after client/coordinator loss, shared admission, SIGKILL recovery, manager unavailability, client death, cancellation ownership, entry ownership, and post-OOM progress")
         finally:
             release_path = root / "release"
             release_path.touch()

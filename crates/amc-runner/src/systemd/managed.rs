@@ -43,8 +43,9 @@ pub struct LaunchRequest<'a> {
 
 /// Build the submission command for a validated request. The unit identity,
 /// wait mode, and run-once lifecycle are imposed here: transient units are
-/// always retained (never `--collect`, so post-exit state stays observable)
-/// and never restarted, so a released reservation cannot cover a replay.
+/// never explicitly collected with `--collect` (failed units remain visible).
+/// Successful units may be collected by systemd; the backend needs pinned
+/// startup/termination evidence for those. Jobs never restart automatically.
 fn build_command(request: &LaunchRequest<'_>) -> Result<Command, RunError> {
     if !valid_unit(request.unit) || request.weight == 0 || request.argv.is_empty() {
         return Err(RunError::InvalidJob);
@@ -274,8 +275,8 @@ impl Runner {
             record: &record,
             finished: false,
         };
-        // Retain is forced: transient units stay observable for post-exit
-        // state, and nothing is ever automatically restarted or replayed.
+        // Avoid explicitly collecting failed units, which retain useful
+        // post-exit state. Successful units may still auto-collect natively.
         let outcome = execute(
             &mut command,
             &self.manager,

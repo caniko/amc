@@ -8,10 +8,13 @@ sandbox or transparent replacement for normal launching. An optional
 [persistent per-user admission service](docs/persistent-admission.md) coordinates
 native managed jobs across independent processes with durable recovery.
 
-The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
-modular product direction, explicit user-selected priorities, and gaming plus
-background work as the first evaluation target. General-adoption and performance
-claims remain gated on that evaluation; observation does not enable a policy.
+The [workstation guide](docs/workstation-policy.md) provides a standalone native
+setup for a stable, usable foreground gaming session with bounded useful
+background progress, including enrollment, deadlines and recovery. Consumers own
+the selected policy; observation alone does not enable it. The
+[adoption record](docs/workstation-adoption-plan.md) tracks implementation and
+rollout. The optional [CS2 guide](docs/gaming-comparison.md) retains demo recording,
+per-present logging and matched background-work diagnostics.
 
 ## Install and first report
 
@@ -20,9 +23,11 @@ From a checkout, install the CLI with Nix (`nix profile install .#default`)
 or Rust (`cargo install --path . --locked`). `amc report` additionally needs
 Python 3.11 or newer on `PATH`; the Nix package includes it. Reporting is
 offline and needs neither systemd nor access to the observed machine.
-Source installation and offline reporting have also been checked in an Ubuntu
-24.04 container; live `inspect`/`watch` on Ubuntu still needs a booted systemd
-and cgroup v2 validation host.
+Source installation and the live inspect → capture → report workflow have also
+passed in a booted Ubuntu 24.04.5 guest with systemd 255 and cgroup v2, including
+cancelled captures and unavailable measurements. See the
+[Ubuntu validation record](docs/ubuntu-diagnostics-20260930.md) for the exact
+environment, reproduction command, and artifacts.
 
 ```sh
 # Identify the actual service/scope that owns your workload first.
@@ -129,8 +134,11 @@ disposable fixture a separate manager-enforced runtime bound. Detached launches
 remain running after successful acknowledgment.
 
 SIGINT/SIGTERM during submission triggers bounded cleanup of only that attempt.
-An absent/collected unit or unavailable manager leaves an explicit UNKNOWN
-outcome. There is no retry, unrestricted fallback, or promise of cleanup after
+An unavailable manager or an unobserved collected unit leaves an explicit UNKNOWN
+outcome. A waited unit observed at startup can complete after native collection
+only when a successful final manager query and its pinned workload-domain evidence
+establish termination beneath the original visible parent. There is no retry,
+unrestricted fallback, or promise of cleanup after
 SIGKILL or manager unavailability. Inspect the recorded identity before any
 manual retry; work may already have happened.
 

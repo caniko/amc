@@ -45,8 +45,12 @@ pub enum AdmissionCommand {
         socket: Option<PathBuf>,
         #[arg(long)]
         contract: String,
+        /// Maximum admission wait; does not bound workload execution.
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
+        /// Optional systemd execution deadline for a disposable job, in seconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        runtime_max_sec: Option<u64>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -144,8 +148,15 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             socket,
             contract,
             timeout,
+            runtime_max_sec,
             command,
-        } => run(&socket_path(socket)?, &contract, timeout, &command),
+        } => run(
+            &socket_path(socket)?,
+            &contract,
+            timeout,
+            runtime_max_sec,
+            &command,
+        ),
         AdmissionCommand::Enter {
             socket,
             ticket,
@@ -159,7 +170,13 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
     }
 }
 
-fn run(socket: &Path, contract: &str, timeout: u64, argv: &[OsString]) -> Result<i32> {
+fn run(
+    socket: &Path,
+    contract: &str,
+    timeout: u64,
+    runtime_max_sec: Option<u64>,
+    argv: &[OsString],
+) -> Result<i32> {
     use amc_runner::systemd::{Outcome, execute};
     let signals = crate::control::Signals::install()?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -214,6 +231,9 @@ fn run(socket: &Path, contract: &str, timeout: u64, argv: &[OsString]) -> Result
         "TimeoutStopSec=15s".into(),
     ] {
         client.arg(format!("--property={property}"));
+    }
+    if let Some(seconds) = runtime_max_sec {
+        client.arg(format!("--property=RuntimeMaxSec={seconds}s"));
     }
     for (name, _) in std::env::vars_os() {
         let Some(name) = name.to_str() else {

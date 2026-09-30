@@ -12,9 +12,13 @@ pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
 
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     io::ErrorKind,
-    os::unix::process::ExitStatusExt,
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawFd,
+        process::ExitStatusExt,
+    },
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -123,6 +127,8 @@ fn startup_wait_required(detached: bool, started: bool) -> bool {
 /// Manager-observed unit state. `None` (from [`state`]) means the unit is
 /// absent, collected, or unobservable — never evidence of termination.
 pub(crate) struct UnitState {
+    loaded: bool,
+    invocation: Option<String>,
     started: bool,
     stopped: bool,
     control_group: Option<String>,
@@ -132,11 +138,15 @@ pub(crate) struct UnitState {
 }
 
 fn state(manager: &Path, unit: &str) -> Option<UnitState> {
+    query_state(manager, unit).filter(|state| state.loaded)
+}
+
+fn query_state(manager: &Path, unit: &str) -> Option<UnitState> {
     let text = capture(Command::new(manager).args([
         "--user",
         "show",
         "--no-pager",
-        "--property=LoadState,ActiveState,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
+        "--property=LoadState,ActiveState,InvocationID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
         "--",
         unit,
     ]))
@@ -149,9 +159,11 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
     let started = field("ExecMainStartTimestampMonotonic")
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|n| n > 0);
-    if field("LoadState") != Some("loaded") {
-        return None;
-    }
+    let loaded = match field("LoadState") {
+        Some("loaded") => true,
+        Some("not-found") => false,
+        _ => return None,
+    };
     let stopped = match field("ActiveState") {
         Some("inactive" | "failed") => true,
         Some("active" | "activating" | "deactivating" | "reloading") => false,
@@ -178,6 +190,10 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
         _ => None,
     };
     Some(UnitState {
+        loaded,
+        invocation: field("InvocationID")
+            .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned),
         started,
         stopped,
         control_group: field("ControlGroup").map(str::to_owned),
@@ -185,11 +201,94 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
     })
 }
 
+/// Pin both directories while a native workload is observable. An absent leaf
+/// proves collection only while its original parent remains visible. Reads via
+/// the held directory descriptor cannot accidentally inspect a replacement.
+struct ObservedDomain {
+    path: PathBuf,
+    directory: File,
+    parent: File,
+}
+
+impl ObservedDomain {
+    fn capture(path: &Path) -> Option<Self> {
+        let open = |path| {
+            OpenOptions::new()
+                .read(true)
+                // Linux O_DIRECTORY | O_NOFOLLOW (same ABI on supported targets).
+                .custom_flags(0x10000 | 0x20000)
+                .open(path)
+                .ok()
+        };
+        let parent = open(path.parent()?)?;
+        let directory = open(
+            &PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(path.file_name()?),
+        )?;
+        let result = Self {
+            path: path.into(),
+            directory,
+            parent,
+        };
+        (result.parent_visible()
+            && fs::symlink_metadata(path)
+                .is_ok_and(|metadata| Self::same(&result.directory, &metadata)))
+        .then_some(result)
+    }
+
+    fn same(file: &File, metadata: &fs::Metadata) -> bool {
+        file.metadata().is_ok_and(|held| {
+            metadata.is_dir() && held.dev() == metadata.dev() && held.ino() == metadata.ino()
+        })
+    }
+
+    fn parent_visible(&self) -> bool {
+        self.path
+            .parent()
+            .and_then(|parent| fs::symlink_metadata(parent).ok())
+            .is_some_and(|metadata| Self::same(&self.parent, &metadata))
+    }
+
+    fn empty(&self) -> Option<bool> {
+        if !self.parent_visible() {
+            return None;
+        }
+        let empty = match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Some(true),
+            Ok(metadata) if Self::same(&self.directory, &metadata) => domain_empty(&PathBuf::from(
+                format!("/proc/self/fd/{}", self.directory.as_raw_fd()),
+            )),
+            _ => None,
+        };
+        self.parent_visible().then_some(empty).flatten()
+    }
+
+    fn matches(&self, group: Option<&str>) -> bool {
+        group.is_some_and(|group| {
+            group.is_empty() || safe_cgroup_path(group).as_ref() == Some(&self.path)
+        })
+    }
+}
+
+fn confirmed_exit(state: &UnitState, observed: Option<&(String, ObservedDomain)>) -> bool {
+    if !state.stopped {
+        return false;
+    }
+    if let Some((invocation, domain)) = observed {
+        (!state.loaded
+            || (state.started
+                && state.invocation.as_ref() == Some(invocation)
+                && domain.matches(state.control_group.as_deref())))
+            && domain.empty() == Some(true)
+    } else {
+        state.loaded && state.started && terminated(state.control_group.as_deref()) == Some(true)
+    }
+}
+
 /// Resolve a manager-reported cgroup path under the v2 hierarchy, mirroring
 /// the CLI convention. Rejects anything that is not an absolute path of
 /// normal components.
 fn safe_cgroup_path(control_group: &str) -> Option<PathBuf> {
-    if !control_group.starts_with('/') {
+    if !control_group.starts_with('/') || control_group == "/" || control_group.len() > 4096 {
         return None;
     }
     let relative = Path::new(control_group.trim_start_matches('/'));
@@ -376,7 +475,8 @@ fn poll_cancelled(
 
 /// Execute a prepared systemd-run command using application-owned cancellation.
 ///
-/// The command must target `unit` (via `--unit=`), use `--wait` unless
+/// The caller must supply a fresh identity. The command must target `unit`
+/// (via `--unit=`), use `--wait` unless
 /// `detached`, stay local (no machine/host/scope escape), and disable
 /// automatic restarts. Its resource properties remain the caller's
 /// responsibility. Manager queries are bounded. Cancellation is polled
@@ -386,6 +486,10 @@ fn poll_cancelled(
 /// `record` tracks client spawn and settlement, so panic recovery can
 /// distinguish a never-submitted identity (safe to forget) from an uncertain
 /// submission (retained, and blocked while the client is unsettled).
+/// A waited unit collected after an observed start can complete only with a
+/// successful final manager query and its pinned workload domain proven empty
+/// beneath the original visible parent. Without that identity, collection is
+/// unknown. The waited client's status is used when final manager status is gone.
 pub fn execute(
     command: &mut Command,
     manager: &Path,
@@ -414,6 +518,7 @@ pub fn execute(
     record.mark_submitted();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut started = false;
+    let mut observed: Option<(String, ObservedDomain)> = None;
     let mut next_query = Instant::now();
     loop {
         let cancellation = poll_cancelled(&mut child, manager, unit, &cancelled, record);
@@ -439,18 +544,15 @@ pub fn execute(
                 if client_code == 0 && detached {
                     return Outcome::Acknowledged;
                 }
-                // Every release path needs the same evidence: a started,
-                // stopped unit with an empty workload domain. A waited client
+                // Every release path needs native termination evidence: a
+                // stopped unit or collection after a pinned startup identity.
+                // A waited client
                 // reporting success while descendants survive (or while the
                 // domain cannot be observed) is Unknown, not Completed.
                 // Workload status comes from the manager; the client code is
                 // only a fallback when the manager is silent.
-                match state(manager, unit) {
-                    Some(state)
-                        if state.started
-                            && state.stopped
-                            && terminated(state.control_group.as_deref()) == Some(true) =>
-                    {
+                match query_state(manager, unit) {
+                    Some(state) if confirmed_exit(&state, observed.as_ref()) => {
                         if !retain {
                             let _ = cleanup(manager, unit);
                         }
@@ -463,7 +565,13 @@ pub fn execute(
                     _ => {
                         return Outcome::Unknown {
                             exit_code: client_code,
-                            cleanup: cleanup(manager, unit),
+                            // A pinned invocation mismatch or failed final query
+                            // must not be bypassed by stopping a replacement.
+                            cleanup: if observed.is_some() {
+                                Cleanup::Unknown
+                            } else {
+                                cleanup(manager, unit)
+                            },
                         };
                     }
                 }
@@ -478,7 +586,22 @@ pub fn execute(
             }
         }
         if !started && Instant::now() >= next_query {
-            started = state(manager, unit).is_some_and(|state| state.started);
+            if let Some(state) = state(manager, unit) {
+                started = state.started;
+                if started {
+                    observed = state.invocation.zip(state.control_group).and_then(
+                        |(invocation, group)| {
+                            if !group.ends_with(&format!("/{unit}")) {
+                                return None;
+                            }
+                            Some((
+                                invocation,
+                                ObservedDomain::capture(&safe_cgroup_path(&group)?)?,
+                            ))
+                        },
+                    );
+                }
+            }
             next_query = Instant::now() + Duration::from_millis(100);
         }
         thread::sleep(Duration::from_millis(10));
@@ -752,5 +875,78 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         assert_eq!(terminated(Some("/amc-test-collected")), Some(true));
         assert_eq!(terminated(Some("relative/path")), None);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn collected_domain_requires_its_original_visible_parent() {
+        let root = crate::test_support::scratch_dir("amc-collected-domain");
+        let parent = root.join("slice");
+        let group = parent.join("job.service");
+        fs::create_dir_all(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        let observed = ObservedDomain::capture(&group).unwrap();
+        assert_eq!(observed.empty(), Some(false));
+        fs::write(group.join("cgroup.events"), "populated 0\n").unwrap();
+        assert_eq!(observed.empty(), Some(true));
+        fs::remove_dir_all(&group).unwrap();
+        assert_eq!(observed.empty(), Some(true));
+        fs::rename(&parent, root.join("hidden-slice")).unwrap();
+        assert_eq!(observed.empty(), None);
+        fs::create_dir(&parent).unwrap();
+        assert_eq!(observed.empty(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replaced_domain_or_unknown_population_is_not_termination() {
+        let root = crate::test_support::scratch_dir("amc-replaced-domain");
+        let group = root.join("job.service");
+        fs::create_dir(&group).unwrap();
+        let observed = ObservedDomain::capture(&group).unwrap();
+        assert_eq!(observed.empty(), None);
+        fs::write(group.join("cgroup.events"), "populated invalid\n").unwrap();
+        assert_eq!(observed.empty(), None);
+        fs::rename(&group, root.join("original.service")).unwrap();
+        fs::create_dir(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 0\n").unwrap();
+        assert_eq!(observed.empty(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collected_exit_needs_startup_identity_and_no_native_contradiction() {
+        let root = crate::test_support::scratch_dir("amc-collected-exit");
+        let group = root.join("job.service");
+        fs::create_dir(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        let observed = (
+            "0123456789abcdef0123456789abcdef".into(),
+            ObservedDomain::capture(&group).unwrap(),
+        );
+        let mut state = UnitState {
+            loaded: false,
+            invocation: None,
+            started: false,
+            stopped: true,
+            control_group: Some(String::new()),
+            workload_code: None,
+        };
+        assert!(!confirmed_exit(&state, None));
+        assert!(!confirmed_exit(&state, Some(&observed)));
+        fs::remove_dir_all(&group).unwrap();
+        assert!(confirmed_exit(&state, Some(&observed)));
+        state.stopped = false;
+        assert!(!confirmed_exit(&state, Some(&observed)));
+        state.stopped = true;
+        state.loaded = true;
+        state.started = true;
+        state.invocation = Some(observed.0.clone());
+        assert!(confirmed_exit(&state, Some(&observed)));
+        state.invocation = Some("fedcba9876543210fedcba9876543210".into());
+        assert!(!confirmed_exit(&state, Some(&observed)));
+        state.invocation = Some(observed.0.clone());
+        state.control_group = Some("/other/job.service".into());
+        assert!(!confirmed_exit(&state, Some(&observed)));
+        fs::remove_dir_all(root).unwrap();
     }
 }

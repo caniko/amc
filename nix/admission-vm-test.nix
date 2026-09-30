@@ -62,6 +62,7 @@ in
           machine.wait_for_unit("user@" + str(uid) + ".service")
           machine.wait_until_succeeds(user(name, uid, "amc admission status --json"))
           machine.succeed(user(name, uid, "python3 ${../tests/admission-systemd.py} --amc ${amcPackage}/bin/amc --slice agent-test.slice"))
+          machine.succeed(user(name, uid, "python3 ${../tests/admission-install-systemd.py} --amc ${amcPackage}/bin/amc --examples ${amcPackage}/share/amc/examples --output /tmp/amc-install-" + name))
       machine.fail(user("bob", 1001, "amc admission status --socket /run/user/1000/amc/admission.sock --json"))
       machine.succeed(user("alice", 1000, "amc admission status --json"))
       machine.succeed(user("bob", 1001, "amc admission status --json"))
