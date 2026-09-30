@@ -1,9 +1,12 @@
 # CS2 recording and matched background-work comparison
 
-AMC's first comparison asks whether weighted admission improves **gaming tail
-frame times while completing a calibrated minimum of useful background work**.
-The real-game result is pending. The native smoke verifies the harness mechanism;
-its small hash jobs are not a representative performance workload.
+The workstation objective is a **stable, usable foreground gaming session while
+bounded background tasks make useful progress under shared resource pressure**.
+The [operational guide](workstation-policy.md) covers delivering that behavior.
+This optional comparison guide retains CS2 recording and scenario-specific
+frame-time diagnostics; an A/B/C result is not a delivery requirement. The native
+smoke verifies the harness mechanism; its small hash jobs are not a representative
+performance workload.
 See the [dated verification record](workstation-harness-20260930.md) for exact
 source commits, native results, retained failed attempts and remaining gates.
 
@@ -229,9 +232,10 @@ It checks shared byte-budget serialization, literal arguments, useful-output
 verification, failure retention, aggregate-limit mismatch and termination.
 Its small hash jobs do not establish memory competition or gaming benefit.
 
-## Calibrate, freeze, then compare
+## Optional comparison: calibrate, freeze, then compare
 
-Before comparison, archive separate calibration attempts that establish:
+If conducting a comparative experiment, archive separate calibration attempts
+that establish:
 
 - Replay repeatability, a warm-up/reset/cache procedure, the measured window and
   timing alignment, logger and observer overhead, and source/config hashes.

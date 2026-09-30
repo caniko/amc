@@ -66,4 +66,5 @@ were unavailable (provider/tool errors); they supply no additional review eviden
 
 No CS2 replay, logger injection/overhead, representative useful-work mix,
 calibration-derived numerical protocol or A/B/C gaming schedule has been verified.
-Those prerequisites are required before comparing gaming results.
+Those prerequisites apply to an optional comparative experiment, not delivery
+of the [operational workstation profile](workstation-policy.md).

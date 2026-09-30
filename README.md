@@ -8,13 +8,13 @@ sandbox or transparent replacement for normal launching. An optional
 [persistent per-user admission service](docs/persistent-admission.md) coordinates
 native managed jobs across independent processes with durable recovery.
 
-The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
-modular product direction, explicit user-selected priorities, and gaming plus
-background work as the first evaluation target. General-adoption and performance
-claims remain gated on that evaluation; observation does not enable a policy.
-The [CS2 comparison guide](docs/gaming-comparison.md) covers recording an offline
-demo, per-present frame logging, calibration, and the bounded B/C background-work
-driver. Its native smoke is mechanism evidence; a real-game result is pending.
+The [workstation guide](docs/workstation-policy.md) provides a standalone native
+setup for a stable, usable foreground gaming session with bounded useful
+background progress, including enrollment, deadlines and recovery. Consumers own
+the selected policy; observation alone does not enable it. The
+[adoption record](docs/workstation-adoption-plan.md) tracks implementation and
+rollout. The optional [CS2 guide](docs/gaming-comparison.md) retains demo recording,
+per-present logging and matched background-work diagnostics.
 
 ## Install and first report
 

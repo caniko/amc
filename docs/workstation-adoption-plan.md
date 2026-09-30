@@ -2,15 +2,16 @@
 
 Recorded: 2026-09-20.
 
-Status: planning record, not an implemented feature set or release-readiness claim.
-The user requested that this discussion be preserved. That authorizes this
+Status: implementation and rollout record. Historical comparison proposals below
+are optional diagnostics, not delivery dependencies.
+At plan creation the user requested that this discussion be preserved. That authorized this
 document, not deployment, stress testing, or every proposed architectural choice.
 The user is the decision owner; implementation owners and dates are unassigned.
 
 Implementation update: the user subsequently requested "implement telemetry so
 we can test in production". The [telemetry prerequisite](#telemetry-prerequisite-2026-09-20)
-below records that narrower delivered slice. It does not close the gaming
-benchmark, policy, coordination, or broader-adoption gates.
+below records that narrower delivered slice. It does not by itself deliver
+consumer policy or broader adoption.
 
 Diagnostic-preview update (2026-09-29): `amc report CAPTURE_DIR` now exposes the
 existing offline validator through the installed CLI, with a Markdown default,
@@ -35,7 +36,21 @@ with one shared weighted runner for C, output verification and retained failures
 A live small-hash smoke passed byte-budget serialization, literal argv, useful
 output checks, negative verification, native-limit mismatch and termination.
 The offline frame reporter is covered by fixture regressions. These mechanisms
-do not close replay, instrumentation-overhead, calibration or performance gates.
+do not establish comparative performance results.
+
+Stability-first update (2026-09-30): the selected objective is **maintain a stable,
+usable foreground gaming session while bounded background tasks make useful
+progress under shared resource pressure**. Delivery uses operational acceptance:
+native limits/placement, visible admission, useful outputs, overload, recovery and
+installation lifecycle. A calibrated A/B/C benchmark is optional. The
+[workstation guide](workstation-policy.md) now supplies standalone units/policy,
+enrollment and removal. Disposable jobs can request a native execution deadline;
+the native fixture covers client/coordinator loss, and a separate fixture checks
+installation, restart with entered work, useful progress, disable and removal.
+Canix's consumer profile keeps useful jobs running at lower priority, separately
+defers maintenance, increases Atlas admission headroom, and bounds system
+background work and daemon builds. Fresh package/consumer rollout checks remain
+distinct from source implementation and from active host policy.
 
 ## Goal And Confirmed Decisions
 
@@ -46,11 +61,11 @@ make AMC "the best memory manager". The following choices were explicit:
   automatic, opt-in, or diagnostic product.
 - No universal default priority between responsiveness, preserving running
   work, and maximizing useful throughput.
-- Gaming plus background work is the first end-to-end acceptance scenario.
+- Gaming plus background work is the first end-to-end operational scenario.
 
-Proposed product goal: a composable memory-management toolkit that lets users
-select their tradeoff, then demonstrates that it delivers that tradeoff better
-than appropriate alternatives. It complements native memory management rather
+Product goal: a composable memory-management toolkit that lets users select
+their tradeoff and operate bounded workloads with understandable overload and
+recovery. It complements native memory management rather
 than replacing the kernel allocator or the application's lifecycle owner.
 
 "Best" is not maximum feature count, minimum reported RAM usage, or killing an
@@ -73,12 +88,13 @@ backend, because that is the existing implementation. Other platforms and
 backends require demonstrated demand and capability-specific tests. Standalone
 admission must not acquire a mandatory systemd or daemon dependency.
 
-Work is scoped to this AMC repository. Do not change Canix GameMode policy,
-production service placement, launchers, restoration behavior, pins/gitlinks,
-the headroom observer, or the freeze/thaw controller as part of this plan.
+Initial work was scoped to this AMC repository; Canix policy, launchers,
+restoration and pins were outside that initial scope.
 Cross-repository integration needs a separate scope and authorization.
 The later request to proceed authorized the narrow, read-only Atlas binding
 pilot recorded below; it did not authorize changing active service policy.
+The later request to implement the stability-first review authorizes consumer
+source policy/integration work. Deployment remains the consumer's native workflow.
 
 Do not install a new policy language, global process-name classifier, desktop
 launch broker, plugin loader, or competing OOM manager merely to make the design
@@ -181,7 +197,7 @@ gain, feasibility, reversibility, overhead, and implementation cost.
 | ID | Idea and assumption | Predicted observation | Evidence against advancing |
 |---|---|---|---|
 | G1 | Make native policy easy to configure and inspect; assumes integration friction is a major barrier | Users obtain useful gaming/background tradeoffs without another controller | Native settings cannot express or reliably deliver the selected behavior |
-| G2 | Prevent background overcommit through weighted admission; assumes useful memory-demand estimates | Better frame-time stability or useful background work than native limits with sensible fixed concurrency | Adequately precise matched comparisons establish no worthwhile benefit, or estimates cause excessive queuing/starvation |
+| G2 | Prevent background overcommit through weighted admission; assumes useful memory-demand estimates | Capacity-bounded starts, visible waits and useful background progress | Estimates cause excessive queuing/starvation or declared native boundaries do not contain execution |
 | G3 | Adapt cooperating workloads to pressure; assumes safe concurrency/cache reductions exist | Better results than static admission under changing demand | Oscillation, delayed response, cache rebuilding, or overhead outweighs the benefit |
 
 Strongest simpler alternative: native controls plus useful configuration,
@@ -198,10 +214,11 @@ enrolled background jobs through one runner while leaving game launch unchanged.
 This avoids assuming a cross-process coordinator or game integration is needed
 to establish the first benefit.
 
-## First Experiment: Gaming And Background Work
+## Optional Comparison: Gaming And Background Work
 
-Focal question: can AMC improve an explicitly selected gaming/background
-tradeoff beyond well-configured native controls?
+For users choosing a comparative experiment, the question is whether AMC changes
+an explicitly selected gaming/background tradeoff beyond native controls. This
+section is not a prerequisite for the operational workstation profile.
 
 Keep the game on its ordinary launch path. Discover its actual execution domain
 on the chosen setup; do not assume a universal Steam unit name, infer containment
@@ -325,9 +342,9 @@ named-game/frame-time work, and comparative policy evaluation remain pending.
 
 ## Ordered Implementation Slices
 
-The telemetry prerequisite below is implemented. The larger roadmap items remain
-pending. Check them off only with attributable verification, not because an
-interface or test exists.
+The roadmap below distinguishes source implementation from consumer rollout.
+Completed source items do not attest to active deployment. Runtime/install
+results apply to their recorded environment and revision.
 
 ### Telemetry Prerequisite (2026-09-20)
 
@@ -369,11 +386,10 @@ This is collection-path evidence only, not gaming, stress, long-session enduranc
 or release-build overhead evidence. No services or policies were changed and no
 new VM run was performed for this slice. Existing staged work was preserved.
 
-Still needed: the actual gaming target and frame-time capture, representative
-background useful-work measurements, calibrated thresholds, comparative A/B/C
-results, and long-session/overhead validation. No production deployment,
-cross-process coordinator, automatic priority policy, or frame-time/VRAM collector
-was added. Ordinary `watch` defaults remain unchanged.
+Optional comparative work: game-specific frame-time capture, calibrated
+thresholds and A/B/C results. The subsequent shared-admission implementation and
+operational guide are recorded separately. Ordinary `watch` defaults remain
+unchanged.
 
 ### Atlas Pilot Readiness (2026-09-20)
 
@@ -427,13 +443,11 @@ selected or verified yet, so the scene, playback determinism, and a
 representative memory-pressure level remain calibration gates, not established
 facts. Do not use a public network match as the measurement scene.
 
-The selected objective for this first experiment is **gaming-first**: compare
-the p99 frame time and frequency of long stalls for C versus B, subject to a
-minimum of completed, useful background work. Arm A provides context for the
-user's starting point. Choose the stall threshold, the useful-work floor, the
-practical improvement margin, and the number of independent runs from separate
-calibration attempts before collecting comparison results. Report both the
-responsiveness and throughput outcomes even if the primary objective fails.
+The selected operational objective is **gaming-first stability with bounded
+useful background progress**. If conducting a comparison, frame times and stall
+counts are scenario-specific supporting observations. Choose its thresholds and
+run count separately and report useful work, failures and recovery alongside
+those observations. This optional protocol does not gate usable setup.
 
 MangoHud 0.8.4 is present in the Nix store but not on `PATH`. Its
 [upstream configuration](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/data/MangoHud.conf)
@@ -559,41 +573,45 @@ be presented as game-specific evidence.
 
 ### 1. Product Contract
 
-- [ ] Reconcile broader product positioning with the current fixture-only scope.
-- [ ] Specify independent capabilities, enrollment, authority, permitted actions,
+- [x] Reconcile product positioning around independent admission/diagnostics and
+  consumer-owned gaming-first policy.
+- [x] Specify independent capabilities, enrollment, authority, permitted actions,
   failure behavior, and disable/uninstall behavior without a universal priority.
-- [ ] Confirm the initial platform, first pilot machine/game/workload, and owners.
+- [x] Use Linux/systemd/cgroup v2, Atlas and ordinary game launching for the
+  first operational profile; consumers own workload/budget selection.
 
 Acceptance: users can tell what AMC controls, what it cannot control, how policy
 is selected, and how to stop using it. No speculative framework is required.
-Dependencies: user review of unresolved scope choices. Likely area: project docs.
+Dependencies: explicit consumer policy selection and documented native ownership.
 
-### 2. Gaming Baseline
+### 2. Native Workstation Policy
 
-- [ ] Reuse the observer/harness foundations and add only missing repeatable
-  workload and frame-time collection pieces.
-- [ ] Run calibration, then fix the A/B/C protocol and practical acceptance margins.
-- [ ] Produce matched, attributable, reproducible A/B/C results with uncertainty.
+- [x] Keep enrolled useful work running at reduced parent/leaf CPU/I/O weights,
+  with finite memory/swap ceilings and bounded concurrency.
+- [x] Give daemon builders their own native ceiling within an aggregate system
+  background parent; retain independent maintenance deferral and recovery.
+- [ ] Complete exact-package, resolved consumer and live-limit rollout checks
+  for the selected integrated revision.
 
-Acceptance: the data distinguishes native enforcement benefit from admission
-benefit and includes useful background work, failures, coverage, and overhead.
-Dependencies: slice 1 and explicit hardware-test authorization. Likely areas:
-test scripts/fixtures and evidence records; observer changes only if required.
+Acceptance: selected jobs run within effective native boundaries, excess work
+queues or fails visibly, useful outputs are verified, and foreground exit or
+interrupted hooks restore the intended state. Dependencies: slice 1 and the
+consumer deployment workflow. Frame-time comparisons are optional.
 
 ### 3. Opt-In Gaming/Background Slice
 
-- [ ] Provide one complete, explicitly selected policy/enrollment path using
+- [x] Provide a standalone policy/enrollment path using
   existing admission and native enforcement where possible.
-- [ ] Test reserve/cache heuristics, queued-work behavior, cancellation,
-  starvation, and background recovery after the gaming phase.
-- [ ] Retain only justified behavior; document supported outcomes and limitations.
+- [x] Test queued-work behavior, cancellation, restart, native deadlines after
+  client/coordinator loss and subsequent progress with bounded native fixtures.
+- [x] Document supported outcomes, overload, lifecycle and scope.
+- [ ] Complete the consumer's foreground-hook/live policy exercise.
 
-Acceptance: improvement in the selected objective within predeclared guardrails,
-or a recorded result supporting the simpler native-only direction. An integration
-or usability improvement must be labeled separately from a performance gain.
-Dependencies: slice 2. Do not require Steam/GameMode changes for this slice.
+Acceptance: effective containment, visible waits/failures, useful outputs and
+recovery. Dependencies: native capability availability and consumer policy;
+there is no comparative-performance prerequisite or mandatory game wrapper.
 
-### 4. Shared Coordination, Conditional
+### 4. Optional Shared Coordination
 
 An optional implementation landed in `56bae9f` during this work. Its ten native
 ledger/socket/store tests passed in the combined workspace run. The independent
@@ -601,11 +619,11 @@ Ubuntu and Nix review-fix snapshot predates that implementation; it does not
 verify the service. Use [the service's contract](persistent-admission.md) for
 its interface and recovery rules; retain the acceptance gates below.
 
-- [ ] Confirm that independently running clients actually need one shared budget;
-  one runner serving several jobs is not evidence that IPC is required.
-- [ ] Define authenticated ownership, bounded requests, reservation lifecycle,
+- [x] Supply optional coordination for independently launched tools and servers;
+  a single in-process runner remains independently usable.
+- [x] Define authenticated ownership, bounded requests, reservation lifecycle,
   persistence/reconciliation, versioning, and unavailable-coordinator behavior.
-- [ ] Test concurrent clients, disconnects, crashes/restarts, detached work,
+- [x] Test concurrent clients, disconnects, crashes/restarts, detached work,
   unknown identities, and unauthorized attempts to control or release work.
 
 Acceptance: no premature capacity release, duplicate grants, unauthorized
@@ -619,7 +637,7 @@ need and the existing admission/managed-execution contracts; not a pilot blocker
   diagnostics on declared supported environments, including non-NixOS users.
 - [ ] Expand to additional machines, kernel/systemd versions, RAM/storage/GPU
   configurations, and workloads without extrapolating from one gaming run.
-- [ ] Publish module-specific support, compatibility, benchmark results,
+- [ ] Publish module-specific support, compatibility, operational acceptance,
   failure/rollback procedures, and known limitations.
 
 Acceptance: reproducible user-facing setup and recovery, explicit support bounds,
@@ -640,7 +658,7 @@ enabled and resource limits selected for the actual host. A cached output is not
 proof of fresh execution. Capture command, source/dirty-tree identity, versions,
 configuration, artifact locations, and verification outcomes for each claim.
 
-Release gates apply regardless of selected performance objective:
+Release gates apply to the selected operational objective:
 
 - No unauthorized targets or second writer against manager-owned cgroups.
 - No silent unrestricted fallback when managed operation was requested.
@@ -663,20 +681,17 @@ scope prerequisites are implemented. Ubuntu 24.04.5 has passed the booted
 diagnostic walkthrough. The fixed Cargo batch remains a provisional background
 workload pending memory-demand profiling.
 
-Still unresolved: a verified replay, the actual game execution domain,
-per-frame logging and its overhead, representative background work, numerical
-margins and useful-work floor, and the scheduled comparison session. A source
-installation smoke does not establish general distro support or gaming benefit.
-Explicit profile selection and implementation ownership remain open.
+Operational work remaining: integrate the chosen AMC revision, finish exact
+package/consumer checks, verify effective host limits, and exercise foreground
+entry/exit with intended useful work. Replay, per-frame logging, numerical margins
+and a comparison schedule belong to optional diagnostics. A source installation
+smoke does not establish support for every module on every distribution.
 No launch date, universal threshold, public IPC API, or daemon mandate was agreed.
 
-Next action: verify the CS2 replay and per-frame logger, profile the proposed
-background workload, then freeze the calibration-derived A/B/C protocol.
-The concurrent optional admission-service implementation is a separate
-capability with its own recovery/ownership acceptance gates; its presence does
-not close the single-runner comparison or establish benefit. Revisit G2/G3 after
-measured results.
-A native-only result remains an acceptable outcome.
+Next action: complete the selected revision's packaging, consumer integration and
+operational lifecycle checks. Keep source implementation, tested modules and
+active deployment attributable to their own revisions. Optional comparisons may
+be performed later without changing the delivery contract.
 
 ## Sources And Provenance
 
