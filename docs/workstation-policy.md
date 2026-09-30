@@ -133,6 +133,8 @@ The explicit native fixtures `tests/admission-systemd.py` and
 `tests/admission-install-systemd.py` exercise these lifecycle mechanisms with
 small isolated jobs. The latter installs uniquely named copies of the shipped
 units and preserves its logs and ledger in a new `--output` directory.
+Its policy-upgrade check retains the old entered reservation across restart and
+verifies that subsequent useful work receives the new kernel memory ceiling.
 The two-user admission VM invokes both fixtures.
 
 Comparative frame-time results are optional diagnostics. The

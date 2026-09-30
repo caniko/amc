@@ -37,6 +37,7 @@
             checkPhase = "true";
             installPhase = "touch $out";
             # Checks produce a marker, not the installed CLI executable.
+            postInstall = "";
             postFixup = "";
           });
       in {
