@@ -22,6 +22,7 @@ rustPlatform.buildRustPackage {
         "Cargo.lock"
         "src"
         "crates"
+        "examples"
         "tests"
       ]
       || rel == "nix"
