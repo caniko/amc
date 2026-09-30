@@ -1,3 +1,4 @@
+mod admission;
 mod config;
 mod control;
 mod helpers;
@@ -33,6 +34,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Coordinate production workload reservations across local processes.
+    Admission {
+        #[command(subcommand)]
+        command: admission::AdmissionCommand,
+    },
     /// Actively probe fixture capabilities using a short-lived transient unit.
     Doctor {
         #[arg(long)]
@@ -231,6 +237,7 @@ fn main() {
 
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Admission { command } => admission::execute(command),
         Command::Doctor { json } => {
             let report = systemd::doctor();
             if json {

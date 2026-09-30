@@ -3,6 +3,7 @@
   makeWrapper,
   python3,
   rustPlatform,
+  systemd,
 }:
 rustPlatform.buildRustPackage {
   pname = "amc";
@@ -35,7 +36,7 @@ rustPlatform.buildRustPackage {
   strictDeps = true;
   nativeBuildInputs = [makeWrapper python3];
   postFixup = ''
-    wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3]}
+    wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3 systemd]}
   '';
 
   meta = {

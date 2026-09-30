@@ -4,7 +4,9 @@ AMC provides embeddable memory admission (`amc-runner`) and passive workstation
 telemetry (`amc-telemetry` and the CLI). The CLI also contains local
 fixture/compatibility launch tools for systemd memory policy. RFC 0.4 in
 `docs/rfc-v0.4/` governs native integration. AMC is not a policy standard,
-resident policy daemon, sandbox, or transparent replacement for normal launching.
+sandbox or transparent replacement for normal launching. An optional
+[persistent per-user admission service](docs/persistent-admission.md) coordinates
+native managed jobs across independent processes with durable recovery.
 
 The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
 modular product direction, explicit user-selected priorities, and gaming plus

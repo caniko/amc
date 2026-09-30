@@ -89,6 +89,7 @@
     formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 
     nixosModules.default = import ./nix/module.nix;
+    homeManagerModules.default = import ./nix/home-module.nix;
 
     # Deliberately excluded from checks: run explicitly with
     # nix build .#nixosTests.x86_64-linux.generic
@@ -96,6 +97,10 @@
       system: let
         pkgs = pkgsFor system;
       in {
+        admission = import ./nix/admission-vm-test.nix {
+          inherit pkgs;
+          amcPackage = self.packages.${system}.default;
+        };
         generic = import ./nix/vm-test.nix {
           inherit pkgs;
           amcModule = self.nixosModules.default;
