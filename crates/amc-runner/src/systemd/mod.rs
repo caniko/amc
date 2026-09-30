@@ -321,24 +321,36 @@ fn command_binding(command: &Command, unit: &str, detached: bool) -> bool {
     let unit_arg = format!("--unit={unit}");
     let mut targets_unit = false;
     let mut waits = false;
-    let mut local = true;
-    for arg in command.get_args() {
+    let mut user = false;
+    let mut args = command.get_args();
+    for arg in args.by_ref() {
+        if arg == "--" {
+            // Everything after this separator is literal workload argv.
+            return targets_unit && user && waits != detached && args.next().is_some();
+        }
         let arg = arg.to_string_lossy();
         if arg.as_ref() == unit_arg {
+            if targets_unit {
+                return false;
+            }
             targets_unit = true;
+        } else if arg.starts_with("--unit") || arg.starts_with("-u") {
+            return false;
         }
+        user |= arg.as_ref() == "--user";
         if arg.as_ref() == "--wait" {
             waits = true;
         }
-        if arg.as_ref() == "--scope"
+        if matches!(arg.as_ref(), "--scope" | "--system")
             || arg.starts_with("--machine")
             || arg.starts_with("--host")
-            || arg.as_ref() == "-H"
+            || arg.starts_with("-H")
+            || arg.starts_with("-M")
         {
-            local = false;
+            return false;
         }
     }
-    targets_unit && local && waits != detached
+    false
 }
 
 /// Poll application cancellation after the client exists. A panicking
@@ -507,11 +519,74 @@ mod tests {
 
     fn bound_command(unit: &str, detached: bool) -> Command {
         let mut command = Command::new("sh");
-        command.args(["-c", "exit 0", "--", &format!("--unit={unit}")]);
+        command.args(["-c", "exit 0", "--user", &format!("--unit={unit}")]);
         if !detached {
             command.arg("--wait");
         }
+        command.args(["--", "worker"]);
         command
+    }
+
+    #[test]
+    fn workload_arguments_do_not_change_manager_binding() {
+        let unit = "app-amc-arguments@1.service";
+        for detached in [false, true] {
+            let mut command = Command::new("systemd-run");
+            command.args(["--user", &format!("--unit={unit}"), "--property=Restart=no"]);
+            if !detached {
+                command.arg("--wait");
+            }
+            command.args([
+                "--",
+                "worker",
+                "--host=localhost",
+                "--machine",
+                "--scope",
+                "-H",
+                "--wait",
+                "--unit=foreign.service",
+            ]);
+            assert!(command_binding(&command, unit, detached));
+        }
+    }
+
+    #[test]
+    fn payload_cannot_supply_missing_manager_identity_or_mode() {
+        let unit = "app-amc-arguments@1.service";
+        for arguments in [
+            vec![
+                "--user",
+                "--",
+                "worker",
+                "--unit=app-amc-arguments@1.service",
+            ],
+            vec![
+                "--unit=app-amc-arguments@1.service",
+                "--",
+                "worker",
+                "--user",
+            ],
+            vec![
+                "--user",
+                "--unit=app-amc-arguments@1.service",
+                "--unit=foreign.service",
+                "--",
+                "worker",
+            ],
+        ] {
+            let mut command = Command::new("systemd-run");
+            command.args(arguments);
+            assert!(!command_binding(&command, unit, true));
+        }
+        let mut command = Command::new("systemd-run");
+        command.args([
+            "--user",
+            &format!("--unit={unit}"),
+            "--",
+            "worker",
+            "--wait",
+        ]);
+        assert!(!command_binding(&command, unit, false));
     }
 
     #[test]
@@ -550,8 +625,14 @@ mod tests {
         );
         assert!(!record.submitted());
 
-        let mut remote = bound_command(unit, true);
-        remote.arg("--machine=elsewhere");
+        let mut remote = Command::new("systemd-run");
+        remote.args([
+            "--user",
+            &format!("--unit={unit}"),
+            "--machine=elsewhere",
+            "--",
+            "worker",
+        ]);
         let record = ClientRecord::default();
         assert_eq!(
             execute(
