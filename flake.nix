@@ -36,6 +36,8 @@
             buildPhase = command;
             checkPhase = "true";
             installPhase = "touch $out";
+            # Checks produce a marker, not the installed CLI executable.
+            postFixup = "";
           });
       in {
         fmt = mkCargoCheck "fmt" [pkgs.rustfmt] "cargo fmt --all --check";
@@ -56,13 +58,14 @@
             RUSTDOCFLAGS="-D warnings" cargo doc -p amc-runner --no-deps --locked "''${flags[@]}"
           done
         '';
-        fixture-scripts = pkgs.runCommand "amc-fixture-scripts" {
-          nativeBuildInputs = [pkgs.python3 pkgs.bash];
-        } ''
-          python3 ${self}/scripts/check-fixtures.py
-          bash -n ${self}/scripts/prove-local.sh
-          touch $out
-        '';
+        fixture-scripts =
+          pkgs.runCommand "amc-fixture-scripts" {
+            nativeBuildInputs = [pkgs.python3 pkgs.bash];
+          } ''
+            python3 ${self}/scripts/check-fixtures.py
+            bash -n ${self}/scripts/prove-local.sh
+            touch $out
+          '';
       }
     );
 
