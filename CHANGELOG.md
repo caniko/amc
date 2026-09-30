@@ -12,11 +12,17 @@
   reservations, verified native entry, and an optional Home Manager service.
 - Installed `amc report` with Markdown/JSON output and a booted-Linux diagnostic
   smoke test, verified on Ubuntu 24.04.5.
+- Optional systemd-owned execution deadlines for disposable admitted jobs,
+  independent of the queue wait timeout.
+- Standalone systemd units, a small admission policy and an operational
+  workstation guide covering useful work, upgrade, disable and removal.
 
 ### Changed
 
 - Observation summaries now report per-field interval endpoints, attempted and
   persisted samples, storage durability, and collection timing.
+- Workstation delivery prioritizes foreground stability and bounded useful
+  progress; CS2 recording and frame-time comparisons remain optional diagnostics.
 
 ### Fixed
 

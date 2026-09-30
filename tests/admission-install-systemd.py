@@ -94,16 +94,27 @@ def main():
         assert before["committed_bytes"] == 64 << 20
         client.kill()
         client.wait(timeout=5)
+        # Policy upgrades must retain the entered job's old ceiling while new
+        # work receives the replacement contract after that job terminates.
+        policy["contracts"]["background"]["memory_max"] = 32 << 20
+        policy_path.write_text(json.dumps(policy, indent=2) + "\n")
         systemctl("restart", service)
         wait(lambda: (status() or {}).get("committed_bytes") == 64 << 20)
         after = status()
         assert after["entries"][0]["identity"] == before["entries"][0]["identity"]
+        assert after["entries"][0]["contract"]["memory_max"] == 64 << 20
         (root / "restart-status.json").write_text(json.dumps(after, indent=2) + "\n")
         release.touch()
         wait(lambda: (status() or {}).get("committed_bytes") == 0)
-        useful = subprocess.run(command + [shutil.which("python3"), "-c", "import hashlib; print(hashlib.sha256(b'amc-install-work').hexdigest())"], capture_output=True, text=True, timeout=20, check=False)
+        useful_script = (
+            "import hashlib,json,pathlib; "
+            "group=pathlib.Path('/proc/self/cgroup').read_text().strip().split('::',1)[1]; "
+            "limit=(pathlib.Path('/sys/fs/cgroup')/group.lstrip('/')/'memory.max').read_text().strip(); "
+            "print(json.dumps({'digest':hashlib.sha256(b'amc-install-work').hexdigest(),'memoryMax':limit}))"
+        )
+        useful = subprocess.run(command + [shutil.which("python3"), "-c", useful_script], capture_output=True, text=True, timeout=20, check=False)
         assert useful.returncode == 0
-        assert useful.stdout.strip() == hashlib.sha256(b"amc-install-work").hexdigest()
+        assert json.loads(useful.stdout) == {"digest": hashlib.sha256(b"amc-install-work").hexdigest(), "memoryMax": str(32 << 20)}
         (root / "useful-output.txt").write_text(useful.stdout)
         wait(lambda: (status() or {}).get("entries") == [])
         systemctl("disable", "--now", service)
@@ -118,7 +129,7 @@ def main():
         assert "LoadState=not-found" in absent, absent
         assert (state / "ledger.json").exists(), "removal erased durable state"
         (root / "result.json").write_text(json.dumps({"passed": True, "service": service, "pool": pool, "ledgerPreserved": True}) + "\n")
-        print("PASS: standalone unit installation, effective limits/weights, restart with entered work, useful progress, disable refusal, removal and ledger preservation")
+        print("PASS: standalone unit installation, effective limits/weights, policy upgrade preserving entered work, useful progress under the new ceiling, disable refusal, removal and ledger preservation")
     finally:
         release.touch()
         for client in clients:
