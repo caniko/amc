@@ -20,6 +20,9 @@ in
     name = "amc-persistent-admission";
     nodes.machine = {
       virtualisation.memorySize = 2048;
+      # Expected memcg OOM must kill the bounded job, not panic the guest.
+      # Keep global OOM fatal while overriding the harness's compulsory mode.
+      boot.kernel.sysctl."vm.panic_on_oom" = 1;
       users.users = {
         alice = {
           isNormalUser = true;
