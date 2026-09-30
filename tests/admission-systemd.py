@@ -31,14 +31,14 @@ def main():
             }},
         }))
 
-        def rpc(op, **fields):
+        def rpc(op, *, expect_error=False, **fields):
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(10)
                 client.connect(str(endpoint))
                 client.sendall((json.dumps({"version": 1, "message": {"op": op, **fields}}) + "\n").encode())
                 with client.makefile("rb") as stream:
                     response = json.loads(stream.readline(262145))
-            assert response["error"] is None, response
+            assert (response["error"] is not None) == expect_error, response
             return response
 
         def wait(predicate):
@@ -72,17 +72,55 @@ def main():
             first = subprocess.Popen(command + ["python3", "-c", script, str(started), str(release)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             clients.append(first)
             wait(started.exists)
+            running = rpc("status")["status"]["entries"][0]
+            # Public diagnostic IDs cannot authorize another process to stop
+            # the submitting client's workload.
+            rpc("cancel", id=running["id"], expect_error=True)
+            assert rpc("status")["status"]["committed_bytes"] == 64 << 20
             second = subprocess.Popen(command + ["python3", "-c", "print('second')"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             clients.append(second)
             wait(lambda: len(rpc("status")["status"]["entries"]) == 2)
             assert rpc("status")["status"]["committed_bytes"] == 64 << 20
             server.kill()
             server.wait(timeout=5)
+            server = subprocess.Popen(server_command + ["--systemctl", str(root / "unavailable-manager")])
+            wait(lambda: rpc("status")["status"]["committed_bytes"] == 64 << 20)
+            wait(lambda: bool(rpc("status")["status"]["unreconciled"]))
+            assert rpc("status")["status"]["committed_bytes"] == 64 << 20
+            server.terminate()
+            server.wait(timeout=10)
             server = subprocess.Popen(server_command)
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 64 << 20)
             release.touch()
             assert first.wait(timeout=15) == 0, first.communicate()
             second.wait(timeout=15)  # Unentered work is invalidated by restart.
+            wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
+
+            # A dead submitting client does not own the running reservation.
+            release.unlink()
+            started.unlink()
+            orphan = subprocess.Popen(command + ["python3", "-c", script, str(started), str(release)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            clients.append(orphan)
+            wait(started.exists)
+            orphan.kill()
+            orphan.wait(timeout=5)
+            assert rpc("status")["status"]["committed_bytes"] == 64 << 20
+            release.touch()
+            wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
+
+            # SIGTERM must stop the whole entered workload before capacity is
+            # reusable, and retain the standard shell signal exit status.
+            release.unlink()
+            started.unlink()
+            cancelled = subprocess.Popen(command + ["python3", "-c", script, str(started), str(release)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            clients.append(cancelled)
+            wait(started.exists)
+            cancelled.terminate()
+            assert cancelled.wait(timeout=20) == 143
+            wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
+
+            failed = subprocess.run(command + ["python3", "-c", "raise SystemExit(42)"], capture_output=True, timeout=20)
+            assert failed.returncode == 42, (failed.returncode, failed.stderr)
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
 
             ticket = rpc("enqueue", contract="test", wait_ms=5000)["entry"]["id"]
@@ -97,7 +135,7 @@ def main():
             after = subprocess.run(command + ["python3", "-c", "print('recovered')"], capture_output=True, timeout=20)
             assert after.returncode == 0 and after.stdout.strip() == b"recovered", after.stderr
             wait(lambda: not rpc("status")["status"]["entries"])
-            print("PASS: native limits, streams, shared admission, SIGKILL recovery, entry ownership, and post-OOM progress")
+            print("PASS: native limits, streams, exit status, shared admission, SIGKILL recovery, manager unavailability, client death, cancellation ownership, entry ownership, and post-OOM progress")
         finally:
             release_path = root / "release"
             release_path.touch()

@@ -104,6 +104,12 @@ impl Contract {
             self.pause_file.as_ref().is_none_or(|p| p.is_absolute()),
             "pause marker must be absolute"
         );
+        ensure!(
+            self.pause_file
+                .as_ref()
+                .is_none_or(|p| p.as_os_str().len() <= 4096),
+            "pause marker exceeds path bound"
+        );
         Ok(())
     }
 }
@@ -124,6 +130,13 @@ pub struct Identity {
     pub inode: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientIdentity {
+    pub pid: i32,
+    pub start_ticks: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -133,6 +146,8 @@ pub struct Entry {
     pub phase: Phase,
     pub deadline_ms: u64,
     pub identity: Option<Identity>,
+    #[serde(default)]
+    pub client: Option<ClientIdentity>,
 }
 
 impl Entry {
@@ -216,7 +231,22 @@ impl Ledger {
             phase: Phase::Queued,
             deadline_ms,
             identity: None,
+            client: None,
         });
+        Ok(())
+    }
+
+    pub fn set_client(&mut self, id: &str, client: ClientIdentity) -> Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown ticket"))?;
+        ensure!(
+            client.pid > 0 && client.start_ticks > 0 && entry.client.is_none(),
+            "invalid submitting client"
+        );
+        entry.client = Some(client);
         Ok(())
     }
 
@@ -299,6 +329,10 @@ impl Ledger {
     /// Called by the native pre-exec helper, not the submitting client. The
     /// server verifies the peer PID's placement before persisting this change.
     pub fn enter(&mut self, id: &str, identity: Identity) -> Result<()> {
+        ensure!(
+            identity.cgroup.len() <= 4096 && identity.invocation.len() <= 32,
+            "workload identity exceeds bounds"
+        );
         let entry = self
             .entries
             .iter_mut()
