@@ -23,8 +23,10 @@ digest `sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4`
 `cargo install --path /src --locked`, and Python 3.12.3. Validator regressions
 passed, and the installed CLI reported the recorded 1,800-sample Atlas capture
 in Markdown and JSON. This verifies source installation and offline reporting
-on that Ubuntu image; live `inspect`/`watch` still needs a booted Ubuntu
-systemd/cgroup v2 host. No gaming benefit has been verified.
+on that Ubuntu image. A subsequent [booted Ubuntu diagnostic smoke](ubuntu-diagnostics-20260930.md)
+passed source installation, live inspection, completed and interrupted
+captures, unavailable measurements, and both report formats on Ubuntu 24.04.5
+with systemd 255 and kernel 6.8. No gaming benefit has been verified.
 
 ## Goal And Confirmed Decisions
 
@@ -84,7 +86,7 @@ runtime validation:
 | Diagnostics | `amc inspect`, finite `amc watch`, offline `amc diff`, and `amc report` | Collection completion is not complete lifetime accounting; missing terminal counters stay unavailable |
 | Admission | [amc-runner](../crates/amc-runner/src/lib.rs) has sync/async gates, providers, weighted admission, and diagnostics | Admission affects participating work; it cannot control every browser, game, broker, or already-running allocation |
 | Managed execution | [Runner](../crates/amc-runner/src/systemd/managed.rs) couples admission to owned systemd attempts and retains uncertain reservations | Native enforcement is verified separately; independent Runner instances do not share one global budget |
-| Coordination | [Coordinator](../crates/amc-runner/src/coordinator.rs) shares a byte budget in-process | Cross-process transport, authentication, and restart reconciliation are future work |
+| Coordination | [Coordinator](../crates/amc-runner/src/coordinator.rs) shares a byte budget in-process; the optional [persistent service](persistent-admission.md) adds cross-process coordination | Its recovery/ownership acceptance and consumer rollout need separate evidence; it is not required for the first single-runner comparison |
 | Packaging/checks | [flake.nix](../flake.nix) provides Linux packages, checks, feature-matrix validation, and an explicit VM target | NixOS-focused infrastructure is not evidence of broad distribution/version support |
 | Mechanism evidence | [Recorded VM results](rfc-v0.4/proof-results.md) demonstrate specified containment, lifecycle, and integration behavior | Pressure comparisons, aggregate policy benefit, real gaming outcomes, and general adoption remain unproven |
 
@@ -444,6 +446,20 @@ fixture command is not a weighted-admission runner. Tune the work estimate and
 comparison margins on separate calibration runs; do not infer benefit from
 the prior passive capture or count frames as independent replicates.
 
+Footprint probe (2026-09-30): one fresh-target
+`cargo test --workspace --all-targets --locked -j 2` batch completed all 190
+tests in a retained transient service. Native accounting reported a
+1,134,256,128-byte peak (about 1.06 GiB), 39.34 CPU seconds, and 30.22 seconds
+between main-process start and exit. The service had a 2 GiB max, zero swap,
+200% CPU quota, and 180-second runtime bound. Accounting was exported before
+the service was stopped. Host activity was concurrent, so these timings are
+exploratory rather than a comparison baseline. This single small batch does
+not establish a representative memory-admission challenge for Atlas; validate
+the offered multi-job mix before fixing weights or useful-work margins.
+Evidence: `/data/scratch/tmp/opencode/amc-cargo-calibration-20260930/`, including
+the command, limits, complete log, accounting, and source patch (SHA-256
+`cfc60dea2cffc6cbcbcaba56d52badcc5f8fd764774bb04fb39af564c91c1045`).
+
 ### Consumer-owned Fleetix binding pilot (2026-09-30)
 
 Canix now exposes a read-only Atlas binding in
@@ -484,6 +500,23 @@ cells as well as manager properties; fail rather than treating an unknown cell
 as a match. Re-discover transient unit names on each run. A backend match alone
 does not attest to the tool domain, and native placement does not establish
 gaming responsiveness or coordinated admission.
+
+The Canix binding now also asserts agreement with the resolved Home Manager
+backend service and native tool slice. The consumer-owned
+`tests/amc-binding/check-live.py` reads an evaluated declaration and checks
+manager/kernel limits for the backend, aggregate slice, and one live tool
+service, rechecking identity after observation. Its adjacent README gives the
+guarded evaluation and read-only test commands. Offline negative regressions
+cover wrong placement, changed invocation, mismatched limits, and unknown cells.
+A guarded evaluation of the pure module regression also passed, checking that
+matching resolved settings satisfy the assertions while missing/mismatched
+service and slice settings fail them. This regression is wired into Canix's
+existing `amc-tool-domains` check.
+Current full-configuration verification is blocked by concurrent Canix work:
+the Git-backed evaluation cannot see the newly referenced, untracked
+`home/modules/development/amc.nix`. The runtime checker consequently has no
+fresh evaluated declaration from this tree; the earlier manual live result
+remains the last complete Atlas acceptance evidence.
 
 ### Atlas Endurance Run (started 2026-09-20 ~21:19 local)
 
@@ -552,6 +585,12 @@ Dependencies: slice 2. Do not require Steam/GameMode changes for this slice.
 
 ### 4. Shared Coordination, Conditional
 
+An optional implementation landed in `56bae9f` during this work. Its ten native
+ledger/socket/store tests passed in the combined workspace run. The independent
+Ubuntu and Nix review-fix snapshot predates that implementation; it does not
+verify the service. Use [the service's contract](persistent-admission.md) for
+its interface and recovery rules; retain the acceptance gates below.
+
 - [ ] Confirm that independently running clients actually need one shared budget;
   one runner serving several jobs is not evidence that IPC is required.
 - [ ] Define authenticated ownership, bounded requests, reservation lifecycle,
@@ -586,7 +625,7 @@ flake/README for exact commands and use the pinned project environment. Run chea
 checks before the separately invoked, resource-budgeted VM mechanism tests.
 
 For authorized local flake realization, use the approved cache workflow,
-`canix cache build .#nixosTests.x86_64-linux.generic`, with private publication
+`canix cache binary build .#nixosTests.x86_64-linux.generic --include-tests`, with private publication
 enabled and resource limits selected for the actual host. A cached output is not
 proof of fresh execution. Capture command, source/dirty-tree identity, versions,
 configuration, artifact locations, and verification outcomes for each claim.
@@ -608,18 +647,25 @@ Release gates apply regardless of selected performance objective:
 
 ## Open Decisions And Next Action
 
-Resolved since planning: pilot host is Atlas; telemetry prerequisite and scope
-support are implemented and smoke-validated (see above). Still unresolved:
-chosen game and launcher path, background work under test, frame-time logging
-method, hardware-test approval for the 30-minute session, initial supported
-versions/distributions, desired numerical tradeoff, interface for explicit
-profile selection, and implementation ownership.
+Resolved since planning: pilot host is Atlas; Counter-Strike 2 is the first
+game candidate and gaming-first is the selected objective. The telemetry and
+scope prerequisites are implemented. Ubuntu 24.04.5 has passed the booted
+diagnostic walkthrough. The fixed Cargo batch remains a provisional background
+workload pending memory-demand profiling.
+
+Still unresolved: a verified replay, the actual game execution domain,
+per-frame logging and its overhead, representative background work, numerical
+margins and useful-work floor, and the scheduled comparison session. A source
+installation smoke does not establish general distro support or gaming benefit.
+Explicit profile selection and implementation ownership remain open.
 No launch date, universal threshold, public IPC API, or daemon mandate was agreed.
 
-Next action: user names the game and starts it normally, then runs the Atlas
-session protocol above. Do not build a plugin framework, cross-process daemon,
-or automatic tuner before that evidence. Revisit G2/G3 after measured results;
-revisit shared coordination when independent clients demonstrate the need.
+Next action: verify the CS2 replay and per-frame logger, profile the proposed
+background workload, then freeze the calibration-derived A/B/C protocol.
+The concurrent optional admission-service implementation is a separate
+capability with its own recovery/ownership acceptance gates; its presence does
+not close the single-runner comparison or establish benefit. Revisit G2/G3 after
+measured results.
 A native-only result remains an acceptable outcome.
 
 ## Sources And Provenance

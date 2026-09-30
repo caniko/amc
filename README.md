@@ -20,9 +20,11 @@ From a checkout, install the CLI with Nix (`nix profile install .#default`)
 or Rust (`cargo install --path . --locked`). `amc report` additionally needs
 Python 3.11 or newer on `PATH`; the Nix package includes it. Reporting is
 offline and needs neither systemd nor access to the observed machine.
-Source installation and offline reporting have also been checked in an Ubuntu
-24.04 container; live `inspect`/`watch` on Ubuntu still needs a booted systemd
-and cgroup v2 validation host.
+Source installation and the live inspect → capture → report workflow have also
+passed in a booted Ubuntu 24.04.5 guest with systemd 255 and cgroup v2, including
+cancelled captures and unavailable measurements. See the
+[Ubuntu validation record](docs/ubuntu-diagnostics-20260930.md) for the exact
+environment, reproduction command, and artifacts.
 
 ```sh
 # Identify the actual service/scope that owns your workload first.
