@@ -10,6 +10,9 @@ this is cooperative memory admission, not a sandbox or a fleet scheduler.
 
 The server accepts a versioned JSON file. All sizes are integer bytes:
 
+For a complete standalone slice/service setup, enrollment and lifecycle
+walkthrough, use [gaming-first workstation use](workstation-policy.md).
+
 ```json
 {
   "version": 1,
@@ -50,7 +53,13 @@ threshold policy. Consumers must budget other users and system workloads too.
 amc admission serve --policy /path/to/policy.json
 amc admission status --json
 amc admission exec --contract example --timeout 120 -- command argument
+amc admission exec --contract example --timeout 120 --runtime-max-sec 300 -- command argument
 ```
+
+`--timeout` is the admission wait, not an execution deadline. The optional
+`--runtime-max-sec` gives a disposable job a systemd-owned runtime bound that
+survives client/coordinator death; native stop time is additional. It is omitted
+for long-lived servers unless explicitly requested.
 
 ## Installation and removal
 

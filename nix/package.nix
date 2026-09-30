@@ -36,12 +36,17 @@ rustPlatform.buildRustPackage {
 
   strictDeps = true;
   nativeBuildInputs = [makeWrapper python3];
+  postInstall = ''
+    mkdir -p $out/share/amc/examples
+    cp -r examples/systemd $out/share/amc/examples/
+    cp examples/admission.json $out/share/amc/examples/
+  '';
   postFixup = ''
     wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3 systemd]}
   '';
 
   meta = {
-    description = "Linux memory diagnostics, capture reporting, and disposable policy fixtures";
+    description = "Linux memory admission, passive diagnostics, and native policy fixtures";
     license = with lib.licenses; [
       asl20
       mit

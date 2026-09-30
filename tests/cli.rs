@@ -240,6 +240,29 @@ fn failed_client_spawn_publishes_identity_without_submission() {
 }
 
 #[test]
+fn admission_execution_deadline_rejects_invalid_values_before_contacting_server() {
+    let f = Fixture::new();
+    for value in ["0", "86401", "infinity", "-1"] {
+        let mut command = f.command("reject");
+        command.args([
+            "admission",
+            "exec",
+            "--socket",
+            "/amc-nonexistent/admission.sock",
+            "--contract",
+            "test",
+            &format!("--runtime-max-sec={value}"),
+            "--",
+            "true",
+        ]);
+        let output = bounded(command);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--runtime-max-sec"));
+        assert!(!f.0.join("calls").exists());
+    }
+}
+
+#[test]
 fn report_renders_a_complete_capture_offline_and_rejects_corruption() {
     let f = Fixture::new();
     let capture = f.0.join("capture");

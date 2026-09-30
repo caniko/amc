@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "budget_bytes": 1073741824,
+  "reserve_bytes": 2147483648,
+  "queue_limit": 16,
+  "contracts": {
+    "background": {
+      "slice": "amc-background.slice",
+      "memory_max": 536870912,
+      "memory_swap_max": 0,
+      "max_running": 2,
+      "pause_file": null
+    }
+  }
+}
