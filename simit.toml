@@ -19,5 +19,5 @@ cores = 2
 kvm = true
 capture_results = true
 artifact_retention_days = 30
-extra_setup = ["nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff"]
+extra_setup = ["python3 -B nix/test-hosted-ci.py", "nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff"]
 post_build = ["python3 nix/hosted-ci.py"]

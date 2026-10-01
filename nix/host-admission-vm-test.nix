@@ -26,7 +26,7 @@
     };
   });
 in
-  pkgs.testers.runNixOSTest {
+  (pkgs.testers.runNixOSTest {
     name = "amc-shared-host-admission";
     nodes.machine = {
       imports = [./host-admission-module.nix];
@@ -97,4 +97,7 @@ in
       virtualisation.cores = 2;
     };
     testScript = builtins.readFile ./host-admission-vm-test.py;
-  }
+  }).overrideTestDerivation (previous:
+    assert pkgs.lib.hasInfix "-o $out" previous.buildCommand; {
+      buildCommand = builtins.replaceStrings ["-o $out"] ["-o $out --junit-xml junit.xml"] previous.buildCommand;
+    })
