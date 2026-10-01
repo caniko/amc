@@ -10,6 +10,36 @@ use std::{
 
 pub const MAX_STATE_BYTES: u64 = 1_048_576;
 
+pub(crate) trait Snapshot: serde::Serialize + serde::de::DeserializeOwned {
+    fn validate(&self) -> Result<()>;
+    fn boot_id(&self) -> &str;
+    fn fresh(boot: &str) -> Self;
+}
+
+impl Snapshot for Ledger {
+    fn validate(&self) -> Result<()> {
+        Ledger::validate(self)
+    }
+    fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+    fn fresh(boot: &str) -> Self {
+        Ledger::new(boot.into())
+    }
+}
+
+impl Snapshot for crate::host::HostLedger {
+    fn validate(&self) -> Result<()> {
+        Self::validate(self)
+    }
+    fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+    fn fresh(boot: &str) -> Self {
+        Self::new(boot.into())
+    }
+}
+
 fn validate_boot_id(id: &str) -> Result<()> {
     ensure!(
         id.len() == 36
@@ -58,6 +88,10 @@ pub struct Store {
 
 impl Store {
     pub fn open(directory: &Path, boot_id: &str) -> Result<(Self, Ledger)> {
+        Self::open_snapshot(directory, boot_id)
+    }
+
+    pub(crate) fn open_snapshot<T: Snapshot>(directory: &Path, boot_id: &str) -> Result<(Self, T)> {
         validate_boot_id(boot_id)?;
         private_directory(directory)?;
         let lock = OpenOptions::new()
@@ -87,14 +121,14 @@ impl Store {
                     data.len() as u64 <= MAX_STATE_BYTES,
                     "admission ledger exceeds size bound"
                 );
-                let ledger: Ledger = serde_json::from_slice(&data)
+                let ledger: T = serde_json::from_slice(&data)
                     .context("invalid admission ledger; refusing to forget reservations")?;
                 ledger.validate()?;
-                validate_boot_id(&ledger.boot_id)?;
-                if ledger.boot_id == boot_id {
+                validate_boot_id(ledger.boot_id())?;
+                if ledger.boot_id() == boot_id {
                     ledger
                 } else {
-                    Ledger::new(boot_id.into())
+                    T::fresh(boot_id)
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -102,7 +136,7 @@ impl Store {
                     lock.metadata()?.len() == 0,
                     "initialized admission ledger is missing; refusing to forget reservations"
                 );
-                Ledger::new(boot_id.into())
+                T::fresh(boot_id)
             }
             Err(error) => return Err(error.into()),
         };
@@ -116,8 +150,12 @@ impl Store {
     }
 
     pub fn save(&self, ledger: &Ledger) -> Result<()> {
+        self.save_snapshot(ledger)
+    }
+
+    pub(crate) fn save_snapshot<T: Snapshot>(&self, ledger: &T) -> Result<()> {
         ledger.validate()?;
-        validate_boot_id(&ledger.boot_id)?;
+        validate_boot_id(ledger.boot_id())?;
         let data = serde_json::to_vec(ledger)?;
         ensure!(
             data.len() as u64 <= MAX_STATE_BYTES,
@@ -145,5 +183,52 @@ impl Store {
             self._lock.sync_all()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+    use crate::{
+        host::{HostLedger, Identity, Reservation},
+        ledger::ClientIdentity,
+    };
+
+    #[test]
+    fn host_grants_survive_restart_and_missing_or_corrupt_state_fails_closed() {
+        let boot = "01234567-89ab-cdef-0123-456789abcdef";
+        let path = std::env::temp_dir().join(format!("amc-host-store-{}", fresh_id().unwrap()));
+        let (store, mut ledger) = Store::open_snapshot::<HostLedger>(&path, boot).unwrap();
+        ledger.reservations.push(Reservation {
+            id: "work".into(),
+            domain: "tools".into(),
+            identity: Identity {
+                cgroup: "/users/tools/job".into(),
+                inode: 1,
+                uid: 1000,
+                pid: 123,
+                start_ticks: 5,
+            },
+            memory_bytes: 50,
+            swap_bytes: 0,
+            requested_ms: 0,
+            deadline_ms: 10,
+            granted: true,
+            owners: vec![ClientIdentity {
+                pid: 123,
+                start_ticks: 5,
+            }],
+        });
+        store.save_snapshot(&ledger).unwrap();
+        assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());
+        drop(store);
+        let (store, ledger) = Store::open_snapshot::<HostLedger>(&path, boot).unwrap();
+        assert_eq!(ledger.committed(), 50);
+        drop(store);
+        fs::write(path.join("ledger.json"), "broken").unwrap();
+        assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());
+        fs::remove_file(path.join("ledger.json")).unwrap();
+        assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());
+        fs::remove_dir_all(path).unwrap();
     }
 }

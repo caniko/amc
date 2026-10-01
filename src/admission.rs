@@ -21,6 +21,20 @@ use std::{
 
 #[derive(Debug, Subcommand)]
 pub enum AdmissionCommand {
+    /// Serve ceiling-backed reservations shared by enrolled execution domains.
+    HostServe {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long, default_value = "/run/amc-host/admission.sock")]
+        socket: PathBuf,
+        #[arg(long, default_value = "/var/lib/amc-host")]
+        state: PathBuf,
+    },
+    /// Inspect the root broker's reservations and commitments.
+    HostStatus {
+        #[arg(long, default_value = "/run/amc-host/admission.sock")]
+        socket: PathBuf,
+    },
     /// Serve a durable private per-user admission endpoint.
     Serve {
         #[arg(long)]
@@ -31,6 +45,9 @@ pub enum AdmissionCommand {
         state: Option<PathBuf>,
         #[arg(long, default_value = "systemctl")]
         systemctl: PathBuf,
+        /// Require shared host capacity before a native entry can execute.
+        #[arg(long)]
+        host_socket: Option<PathBuf>,
     },
     /// Show reservations and admission state without changing workloads.
     Status {
@@ -60,6 +77,8 @@ pub enum AdmissionCommand {
         socket: PathBuf,
         #[arg(long)]
         ticket: String,
+        #[arg(long)]
+        host_socket: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -75,11 +94,40 @@ fn socket_path(path: Option<PathBuf>) -> Result<PathBuf> {
 
 pub fn execute(command: AdmissionCommand) -> Result<i32> {
     match command {
+        AdmissionCommand::HostServe {
+            policy,
+            socket,
+            state,
+        } => {
+            let mut bytes = Vec::new();
+            File::open(policy)?
+                .take(MAX_STATE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= MAX_STATE_BYTES,
+                "host policy too large"
+            );
+            let policy = serde_json::from_slice(&bytes)?;
+            let signals = crate::control::Signals::install()?;
+            amc_admission::host_server::serve(policy, &socket, &state, || {
+                signals.cancelled().is_some()
+            })?;
+            Ok(0)
+        }
+        AdmissionCommand::HostStatus { socket } => {
+            let status = amc_admission::host_server::call(
+                &socket,
+                &amc_admission::host_server::Request::Status { version: 1 },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(0)
+        }
         AdmissionCommand::Serve {
             policy,
             socket,
             state,
             systemctl,
+            host_socket,
         } => {
             let mut bytes = Vec::new();
             File::open(policy)?
@@ -104,11 +152,12 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 "admission state directory must be absolute"
             );
             let signals = crate::control::Signals::install()?;
-            server::serve(
+            server::serve_with_host(
                 policy,
                 &socket_path(socket)?,
                 &state,
                 Systemd { systemctl },
+                host_socket.as_deref(),
                 || signals.cancelled().is_some(),
             )?;
             Ok(0)
@@ -160,10 +209,25 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
         AdmissionCommand::Enter {
             socket,
             ticket,
+            host_socket,
             command,
         } => {
             // Authorization is persisted before this reply. If the reply is
             // lost, nothing executes and native reconciliation retires us.
+            if let Some(host_socket) = host_socket {
+                let signals = crate::control::Signals::install()?;
+                let remaining = call(&socket, Message::Poll { id: ticket.clone() })?
+                    .entry
+                    .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
+                    .deadline_ms
+                    .saturating_sub(server::now_ms()?)
+                    .saturating_sub(1000);
+                amc_admission::host_server::acquire(
+                    &host_socket,
+                    Duration::from_millis(remaining),
+                    || signals.cancelled().is_some(),
+                )?;
+            }
             call(&socket, Message::Enter { id: ticket })?;
             Err(Command::new(&command[0]).args(&command[1..]).exec().into())
         }
@@ -180,15 +244,17 @@ fn run(
     use amc_runner::systemd::{Outcome, execute};
     let signals = crate::control::Signals::install()?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
-    let mut entry = call(
+    let response = call(
         socket,
         Message::Enqueue {
             contract: contract.into(),
             wait_ms: timeout * 1000,
         },
-    )?
-    .entry
-    .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
+    )?;
+    let host_socket = response.host_socket;
+    let mut entry = response
+        .entry
+        .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
     while entry.phase == Phase::Queued {
         if signals.cancelled().is_some() || Instant::now() >= deadline {
             let _ = call(socket, Message::Cancel { id: entry.id });
@@ -227,7 +293,7 @@ fn run(
         "OOMPolicy=kill".into(),
         "KillMode=control-group".into(),
         "Restart=no".into(),
-        "TimeoutStartSec=30s".into(),
+        format!("TimeoutStartSec={}s", timeout + 30),
         "TimeoutStopSec=15s".into(),
     ] {
         client.arg(format!("--property={property}"));
@@ -260,8 +326,11 @@ fn run(
         .arg(std::env::current_exe()?)
         .args(["admission", "enter", "--socket"])
         .arg(socket)
-        .args(["--ticket", &entry.id, "--"])
-        .args(argv);
+        .args(["--ticket", &entry.id]);
+    if let Some(host_socket) = host_socket {
+        client.arg("--host-socket").arg(host_socket);
+    }
+    client.arg("--").args(argv);
     let outcome = execute(
         &mut client,
         Path::new("systemctl"),

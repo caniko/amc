@@ -93,6 +93,7 @@
     formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 
     nixosModules.default = import ./nix/module.nix;
+    nixosModules.host-admission = import ./nix/host-admission-module.nix;
     homeManagerModules.default = import ./nix/home-module.nix;
 
     # Deliberately excluded from checks: run explicitly with
@@ -101,6 +102,10 @@
       system: let
         pkgs = pkgsFor system;
       in {
+        shared-admission = import ./nix/host-admission-vm-test.nix {
+          inherit pkgs;
+          package = self.packages.${system}.default;
+        };
         admission = import ./nix/admission-vm-test.nix {
           inherit pkgs;
           amcPackage = self.packages.${system}.default;

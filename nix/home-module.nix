@@ -16,8 +16,13 @@ in {
       description = "AMC package with the admission server and client.";
     };
     policy = lib.mkOption {
-      type = (pkgs.formats.json {}).type;
+      inherit ((pkgs.formats.json {})) type;
       description = "Version 1 admission policy. Native slice limits must be declared by the consumer.";
+    };
+    hostSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional root host admission endpoint; unavailable capacity fails closed.";
     };
   };
   config = lib.mkIf cfg.enable {
@@ -30,7 +35,7 @@ in {
         After = slices;
       };
       Service = {
-        ExecStart = "${lib.getExe cfg.package} admission serve --policy ${policy} --systemctl ${pkgs.systemd}/bin/systemctl";
+        ExecStart = "${lib.getExe cfg.package} admission serve --policy ${policy} --systemctl ${pkgs.systemd}/bin/systemctl" + lib.optionalString (cfg.hostSocket != null) " --host-socket ${lib.escapeShellArg cfg.hostSocket}";
         Environment = ["PATH=${lib.makeBinPath [pkgs.systemd]}"];
         UMask = "0077";
         Restart = "on-failure";

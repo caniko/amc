@@ -36,6 +36,17 @@ pub fn serve(
     native: impl Native,
     stopping: impl Fn() -> bool,
 ) -> Result<()> {
+    serve_with_host(policy, socket, state, native, None, stopping)
+}
+
+pub fn serve_with_host(
+    policy: Policy,
+    socket: &Path,
+    state: &Path,
+    native: impl Native,
+    host_socket: Option<&Path>,
+    stopping: impl Fn() -> bool,
+) -> Result<()> {
     policy.validate()?;
     ensure!(
         socket.is_absolute() && state.is_absolute(),
@@ -134,15 +145,18 @@ pub fn serve(
                     &policy,
                     &mut ledger,
                     &native,
-                    waiting.clone(),
-                    unreconciled.iter().cloned().collect(),
+                    host_socket,
+                    Observations {
+                        waiting: waiting.clone(),
+                        unreconciled: unreconciled.iter().cloned().collect(),
+                    },
                 );
                 // Never acknowledge an uncommitted grant or entry. Persistence
                 // failure terminates the server, leaving native limits in force.
                 if before != serde_json::to_vec(&ledger)? {
                     store.save(&ledger)?;
                 }
-                let response = match result {
+                let mut response = match result {
                     Ok(response) => response,
                     Err(error) => Response {
                         version: 1,
@@ -150,6 +164,7 @@ pub fn serve(
                         ..Response::default()
                     },
                 };
+                response.host_socket = host_socket.map(Path::to_path_buf);
                 let _ = write_frame(&mut stream, &response);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -162,14 +177,19 @@ pub fn serve(
     Ok(())
 }
 
+struct Observations {
+    waiting: std::collections::BTreeMap<String, Decision>,
+    unreconciled: Vec<String>,
+}
+
 fn handle(
     request: Request,
     pid: i32,
     policy: &Policy,
     ledger: &mut Ledger,
     native: &impl Native,
-    waiting: std::collections::BTreeMap<String, Decision>,
-    unreconciled: Vec<String>,
+    host_socket: Option<&Path>,
+    observations: Observations,
 ) -> Result<Response> {
     ensure!(
         request.version == 1,
@@ -215,6 +235,9 @@ fn handle(
             let identity = native
                 .identify(entry, pid)
                 .map_err(|_| anyhow::anyhow!("native workload identity or enforcement mismatch"))?;
+            if let Some(socket) = host_socket {
+                crate::host_server::verify_entry(socket, pid, &identity, &entry.contract)?;
+            }
             ensure!(
                 now_ms()? < entry.deadline_ms,
                 "ticket expired during native verification"
@@ -243,8 +266,8 @@ fn handle(
                 reserve_bytes: policy.reserve_bytes,
                 committed_bytes: ledger.committed(),
                 entries: ledger.entries.clone(),
-                waiting,
-                unreconciled,
+                waiting: observations.waiting,
+                unreconciled: observations.unreconciled,
             })
         }
     }

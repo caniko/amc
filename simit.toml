@@ -1,0 +1,22 @@
+[ci]
+platform = "github"
+provider = "actions"
+runtime = "nix"
+runner = "ubuntu-24.04"
+nix_builds = [
+  ".#packages.x86_64-linux.default",
+  ".#checks.x86_64-linux.test",
+  ".#checks.x86_64-linux.clippy",
+  ".#nixosTests.x86_64-linux.shared-admission",
+]
+
+[ci.nix_build]
+only = true
+timeout_minutes = 120
+max_parallel = 2
+max_jobs = 1
+cores = 2
+kvm = true
+capture_results = true
+artifact_retention_days = 30
+extra_setup = ["nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff"]

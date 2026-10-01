@@ -31,6 +31,9 @@ pub enum Message {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Response {
     pub version: u32,
+    /// Optional root broker; native helpers acquire host capacity before entry.
+    #[serde(default)]
+    pub host_socket: Option<std::path::PathBuf>,
     pub entry: Option<Entry>,
     pub status: Option<Status>,
     pub error: Option<String>,
