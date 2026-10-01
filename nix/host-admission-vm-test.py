@@ -3,7 +3,7 @@ import shlex
 
 # Injected by NixOS's native test driver.
 machine = globals()["machine"]
-subtest = globals()["subtest"]
+test_section = globals()["subtest"]
 globals()["start_all"]()
 machine.wait_for_unit("amc-host-admission.service")
 for user, uid in [("alice", 1000), ("bob", 1001)]:
@@ -30,7 +30,7 @@ def launch(name, uid, contract, command):
                     f"amc admission exec --contract {contract} --timeout 60 -- sh -c " + shlex.quote(command))
 
 
-with subtest("durable root pool tracks every potential execution owner"):
+with test_section("durable root pool tracks every potential execution owner"):
     # Owners are outside this empty bounded slice, just like Nix's handlers.
     write_file("/tmp/pool-owner.py", '''import json, socket, sys, time
 while True:
@@ -61,7 +61,7 @@ time.sleep(120)
     machine.succeed("systemctl stop pool-second")
     wait_committed(0)
 
-with subtest("helper cannot omit host capacity before private entry"):
+with test_section("helper cannot omit host capacity before private entry"):
     write_file("/tmp/omit-host.py", '''import json, socket, subprocess, time
 path = "/run/user/1001/amc/admission.sock"
 def call(op):
@@ -92,7 +92,7 @@ call({"op":"cancel","id":entry["id"]})
     machine.fail("test -f /tmp/bypassed")
     wait_committed(0)
 
-with subtest("simultaneous users, restart persistence, and automatic lending"):
+with test_section("simultaneous users, restart persistence, and automatic lending"):
     launch("alice", 1000, "tool", "touch /tmp/alice-entered; while ! test -e /tmp/alice-finish; do sleep .1; done")
     machine.wait_until_succeeds("test -f /tmp/alice-entered")
     wait_committed(96 * 1048576)
@@ -110,7 +110,7 @@ with subtest("simultaneous users, restart persistence, and automatic lending"):
     machine.succeed("touch /tmp/bob-finish")
     wait_committed(0)
 
-with subtest("changed native enforcement inhibits a fitting smaller job"):
+with test_section("changed native enforcement inhibits a fitting smaller job"):
     launch("held", 1000, "tool", "touch /tmp/held-entered; sleep 120")
     machine.wait_until_succeeds("test -f /tmp/held-entered")
     group = "/sys/fs/cgroup" + status()["reservations"][0]["identity"]["cgroup"]
@@ -124,7 +124,7 @@ with subtest("changed native enforcement inhibits a fitting smaller job"):
     machine.succeed("systemctl stop held-client small-client")
     wait_committed(0)
 
-with subtest("cancelled pending work never executes after native cleanup"):
+with test_section("cancelled pending work never executes after native cleanup"):
     launch("blocking", 1000, "tool", "touch /tmp/blocking-entered; sleep 120")
     machine.wait_until_succeeds("test -f /tmp/blocking-entered")
     launch("cancelled", 1001, "tool", "touch /tmp/cancelled-entered")
