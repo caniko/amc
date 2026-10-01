@@ -6,7 +6,7 @@ use amc_admission::{
     server,
     store::MAX_STATE_BYTES,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 use std::{
     ffi::OsString,
@@ -229,7 +229,8 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 )?;
             }
             call(&socket, Message::Enter { id: ticket })?;
-            Err(Command::new(&command[0]).args(&command[1..]).exec().into())
+            Err(Command::new(&command[0]).args(&command[1..]).exec())
+                .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
     }
 }

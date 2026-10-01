@@ -21,13 +21,23 @@ def status():
 
 def wait_committed(amount):
     machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
-        f'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == {amount}'))
+        f'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == {amount}'), timeout=30)
 
 
 def launch(name, uid, contract, command):
     machine.succeed(f"systemd-run --unit={name}-client --uid={uid} "
+                    "--setenv=PATH=/run/current-system/sw/bin "
                     f"--setenv=XDG_RUNTIME_DIR=/run/user/{uid} -- "
-                    f"amc admission exec --contract {contract} --timeout 60 -- sh -c " + shlex.quote(command))
+                    f"amc admission exec --contract {contract} --timeout 60 -- /bin/sh -c " + shlex.quote(command))
+
+
+def wait_entered(name):
+    try:
+        machine.wait_until_succeeds(f"test -f /tmp/{name}-entered", timeout=30)
+    except Exception:
+        print(machine.succeed("journalctl -b --no-pager -n 100"))
+        print(machine.succeed("amc admission host-status"))
+        raise
 
 
 with test_section("durable root pool tracks every potential execution owner"):
@@ -52,6 +62,8 @@ time.sleep(120)
     wait_committed(96 * 1048576)
     assert len(status()["reservations"]) == 1
     assert len(status()["reservations"][0]["owners"]) == 2
+    machine.succeed("systemd-run --unit=pool-child --slice=builders.slice -- sleep 120")
+    machine.wait_until_succeeds("grep -q '^populated 1$' /sys/fs/cgroup/builders.slice/cgroup.events")
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
     wait_committed(96 * 1048576)
@@ -59,6 +71,9 @@ time.sleep(120)
     machine.sleep(1)
     wait_committed(96 * 1048576)
     machine.succeed("systemctl stop pool-second")
+    machine.sleep(1)
+    wait_committed(96 * 1048576)
+    machine.succeed("systemctl stop pool-child")
     wait_committed(0)
 
 with test_section("helper cannot omit host capacity before private entry"):
@@ -94,7 +109,7 @@ call({"op":"cancel","id":entry["id"]})
 
 with test_section("simultaneous users, restart persistence, and automatic lending"):
     launch("alice", 1000, "tool", "touch /tmp/alice-entered; while ! test -e /tmp/alice-finish; do sleep .1; done")
-    machine.wait_until_succeeds("test -f /tmp/alice-entered")
+    wait_entered("alice")
     wait_committed(96 * 1048576)
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
@@ -105,28 +120,28 @@ with test_section("simultaneous users, restart persistence, and automatic lendin
     own = json.loads(machine.succeed("runuser -u bob -- amc admission host-status"))
     assert own["reservations"] and all(r["identity"]["uid"] == 1001 for r in own["reservations"])
     machine.succeed("touch /tmp/alice-finish")
-    machine.wait_until_succeeds("test -f /tmp/bob-entered")
+    wait_entered("bob")
     wait_committed(96 * 1048576)
     machine.succeed("touch /tmp/bob-finish")
     wait_committed(0)
 
 with test_section("changed native enforcement inhibits a fitting smaller job"):
     launch("held", 1000, "tool", "touch /tmp/held-entered; sleep 120")
-    machine.wait_until_succeeds("test -f /tmp/held-entered")
+    wait_entered("held")
     group = "/sys/fs/cgroup" + status()["reservations"][0]["identity"]["cgroup"]
     machine.succeed(f"echo 100663297 > {group}/memory.max")
     launch("small", 1001, "small", "touch /tmp/small-entered; sleep 120")
     machine.sleep(1)
     machine.fail("test -f /tmp/small-entered")
     machine.succeed(f"echo 100663296 > {group}/memory.max")
-    machine.wait_until_succeeds("test -f /tmp/small-entered")
+    wait_entered("small")
     wait_committed(128 * 1048576)
     machine.succeed("systemctl stop held-client small-client")
     wait_committed(0)
 
 with test_section("cancelled pending work never executes after native cleanup"):
     launch("blocking", 1000, "tool", "touch /tmp/blocking-entered; sleep 120")
-    machine.wait_until_succeeds("test -f /tmp/blocking-entered")
+    wait_entered("blocking")
     launch("cancelled", 1001, "tool", "touch /tmp/cancelled-entered")
     machine.sleep(1)
     machine.fail("test -f /tmp/cancelled-entered")
