@@ -129,11 +129,15 @@ with test_section("changed native enforcement inhibits a fitting smaller job"):
     launch("held", 1000, "tool", "touch /tmp/held-entered; sleep 120")
     wait_entered("held")
     group = "/sys/fs/cgroup" + status()["reservations"][0]["identity"]["cgroup"]
-    machine.succeed(f"echo 100663297 > {group}/memory.max")
+    # The kernel converts byte limits to page counts; +1 byte leaves the
+    # effective limit unchanged. Prove a distinct page-aligned ceiling.
+    machine.succeed(f"echo 101711872 > {group}/memory.max")
+    assert machine.succeed(f"cat {group}/memory.max").strip() == "101711872"
     launch("small", 1001, "small", "touch /tmp/small-entered; sleep 120")
     machine.sleep(1)
     machine.fail("test -f /tmp/small-entered")
     machine.succeed(f"echo 100663296 > {group}/memory.max")
+    assert machine.succeed(f"cat {group}/memory.max").strip() == "100663296"
     wait_entered("small")
     wait_committed(128 * 1048576)
     machine.succeed("systemctl stop held-client small-client")
