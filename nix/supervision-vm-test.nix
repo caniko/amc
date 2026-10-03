@@ -92,7 +92,12 @@ in
           raise AssertionError("supervision condition did not settle within deadline")
       machine.wait_until_succeeds("test -f /run/amc-supervision/health.json")
       def oom_events():
-          return dict((key, int(value)) for key, value in (line.split() for line in machine.succeed("cat /sys/fs/cgroup/memory.events").splitlines()))
+          # The cgroup-v2 root has no memory.events. system.slice aggregates
+          # every supervised service even after its leaf cgroup is removed.
+          events = dict((key, int(value)) for key, value in (line.split() for line in machine.succeed("cat /sys/fs/cgroup/system.slice/memory.events").splitlines()))
+          vmstat = dict((key, int(value)) for key, value in (line.split() for line in machine.succeed("cat /proc/vmstat").splitlines()))
+          events["host_oom_kill"] = vmstat["oom_kill"]
+          return events
       initial_oom = oom_events()
       with subtest("identity-bound recovery waits for descendant cleanup and starts once"):
           first = machine.succeed("systemctl show amc-backend -p InvocationID --value").strip()
@@ -152,6 +157,7 @@ in
           final_oom = oom_events()
           assert initial_oom["oom_kill"] == final_oom["oom_kill"] == 0, (initial_oom, final_oom)
           assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
+          assert initial_oom["host_oom_kill"] == final_oom["host_oom_kill"] == 0, (initial_oom, final_oom)
           machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
       machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/evidence/")
       machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")

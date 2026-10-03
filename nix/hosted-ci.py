@@ -44,7 +44,7 @@ def verify_supervision_evidence(path):
         if not (path / name).is_file():
             raise RuntimeError(f"Native supervision report is missing {name}")
     oom = json.loads((path / "oom.json").read_text())
-    if any(oom[phase][counter] != 0 for phase in ("initial", "final") for counter in ("oom", "oom_kill")):
+    if any(oom[phase][counter] != 0 for phase in ("initial", "final") for counter in ("oom", "oom_kill", "host_oom_kill")):
         raise RuntimeError("Native supervision report contains OOM events")
 
 
