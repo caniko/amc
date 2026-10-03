@@ -13,6 +13,7 @@ ALLOWED = {
     ".#checks.x86_64-linux.test",
     ".#checks.x86_64-linux.clippy",
     ".#nixosTests.x86_64-linux.shared-admission",
+    ".#nixosTests.x86_64-linux.supervision",
 }
 NATIVE_CASES = {
     "durable root pool tracks every potential execution owner",
@@ -21,11 +22,17 @@ NATIVE_CASES = {
     "changed native enforcement inhibits a fitting smaller job",
     "cancelled pending work never executes after native cleanup",
 }
+SUPERVISION_CASES = {
+    "identity-bound recovery waits for descendant cleanup and starts once",
+    "chronological replay and public fail-closed heartbeat",
+    "in-flight supervisor restart trips without replay or forgiven budget",
+    "shadow observations have no intervention authority",
+}
 
 
-def verify_native_report(path):
+def verify_native_report(path, required_cases=NATIVE_CASES):
     cases = ET.parse(path).getroot().findall(".//testcase")
-    if not NATIVE_CASES.issubset({case.get("name") for case in cases}):
+    if not required_cases.issubset({case.get("name") for case in cases}):
         raise RuntimeError("Native VM report is missing required execution cases")
     if any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")):
         raise RuntimeError("Native VM report contains unsuccessful execution cases")
@@ -49,8 +56,13 @@ def retain():
     subprocess.run(["git", "diff", "--exit-code", "--", "flake.lock"], cwd=ROOT, check=True)
     shutil.copyfile(ROOT / "flake.lock", evidence / "flake.lock")
     if "nixosTests" in installable:
-        verify_native_report(output / "junit.xml")
+        required = SUPERVISION_CASES if installable.endswith(".supervision") else NATIVE_CASES
+        verify_native_report(output / "junit.xml", required)
         shutil.copyfile(output / "junit.xml", evidence / "junit.xml")
+        if installable.endswith(".supervision"):
+            # The VM explicitly exports these mechanism receipts. Keeping just
+            # a driver PASS would lose calibration and bounded recovery evidence.
+            shutil.copytree(output / "supervision", evidence / "supervision")
     (evidence / "qualification.json").write_text(json.dumps({
         "schemaVersion": 1,
         "passed": True,
