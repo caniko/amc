@@ -1,0 +1,16 @@
+[package]
+name = "amc-supervision"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bounded native-domain memory supervision and sequential forecasting"
+
+[dependencies]
+amc-admission = { path = "../amc-admission" }
+amc-runner = { path = "../amc-runner", default-features = false, features = ["systemd"] }
+amc-telemetry = { path = "../amc-telemetry" }
+anyhow = "1"
+nix = { version = "0.30", features = ["user", "fs", "signal", "process"] }
+rustix = { version = "1", features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

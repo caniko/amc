@@ -2,6 +2,7 @@ mod admission;
 mod config;
 mod control;
 mod helpers;
+mod supervision;
 mod systemd;
 mod telemetry;
 mod watch;
@@ -38,6 +39,11 @@ enum Command {
     Admission {
         #[command(subcommand)]
         command: admission::AdmissionCommand,
+    },
+    /// Observe enrolled native domains and optionally recover within durable budgets.
+    Supervise {
+        #[command(subcommand)]
+        command: supervision::SupervisionCommand,
     },
     /// Actively probe fixture capabilities using a short-lived transient unit.
     Doctor {
@@ -238,6 +244,7 @@ fn main() {
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Admission { command } => admission::execute(command),
+        Command::Supervise { command } => supervision::execute(command),
         Command::Doctor { json } => {
             let report = systemd::doctor();
             if json {
