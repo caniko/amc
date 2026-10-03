@@ -76,7 +76,7 @@ in
       };
     };
     testScript = ''
-      import json, os, time
+      import json, time
       start_all()
       machine.wait_for_unit("amc-backend.service")
       machine.wait_for_unit("amc-supervision.service")
@@ -91,6 +91,9 @@ in
               time.sleep(0.2)
           raise AssertionError("supervision condition did not settle within deadline")
       machine.wait_until_succeeds("test -f /run/amc-supervision/health.json")
+      def oom_events():
+          return dict((key, int(value)) for key, value in (line.split() for line in machine.succeed("cat /sys/fs/cgroup/memory.events").splitlines()))
+      initial_oom = oom_events()
       with subtest("identity-bound recovery waits for descendant cleanup and starts once"):
           first = machine.succeed("systemctl show amc-backend -p InvocationID --value").strip()
           wait_for(lambda: machine.succeed("cat /var/lib/amc-fixture/invocations").strip() == "2", 200)
@@ -145,8 +148,13 @@ in
           assert machine.succeed("systemctl show amc-backend -p InvocationID --value").strip() == third
           machine.succeed("systemctl stop amc-shadow amc-backend")
 
-      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/evidence/")
-      machine.copy_from_vm("/var/lib/amc-fixture/evidence", os.path.join(os.environ["out"], "supervision"))
+      with subtest("native recovery completes without OOM kills"):
+          final_oom = oom_events()
+          assert initial_oom["oom_kill"] == final_oom["oom_kill"] == 0, (initial_oom, final_oom)
+          assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
+          machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
+      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/evidence/")
+      machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")
     '';
   }).overrideTestDerivation (previous:
     assert pkgs.lib.hasInfix "-o $out" previous.buildCommand; {
