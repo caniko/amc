@@ -1,4 +1,5 @@
-//! Versioned, bounded local protocol. Requests carry no commands or secrets.
+//! Versioned, bounded local protocol. Entry carries a one-use capability;
+//! commands stay client-owned and capabilities are never included in status.
 use crate::ledger::{Decision, Entry};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -23,7 +24,7 @@ pub struct Request {
 pub enum Message {
     Enqueue { contract: String, wait_ms: u64 },
     Poll { id: String },
-    Enter { id: String },
+    Enter { id: String, key: String },
     Cancel { id: String },
     Status,
 }
@@ -34,6 +35,9 @@ pub struct Response {
     /// Optional root broker; native helpers acquire host capacity before entry.
     #[serde(default)]
     pub host_socket: Option<std::path::PathBuf>,
+    /// One-use capability returned only to the enqueue caller, never by Poll/Status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_key: Option<String>,
     pub entry: Option<Entry>,
     pub status: Option<Status>,
     pub error: Option<String>,
