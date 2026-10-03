@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod clock;
+pub mod health;
 pub mod host;
 pub mod host_native;
 pub mod host_server;

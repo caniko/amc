@@ -94,6 +94,8 @@
 
     nixosModules.default = import ./nix/module.nix;
     nixosModules.host-admission = import ./nix/host-admission-module.nix;
+    nixosModules.supervision = import ./nix/supervision-module.nix;
+    lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;
 
     # Deliberately excluded from checks: run explicitly with
@@ -102,6 +104,11 @@
       system: let
         pkgs = pkgsFor system;
       in {
+        supervision = import ./nix/supervision-vm-test.nix {
+          inherit pkgs;
+          package = self.packages.${system}.default;
+          module = self.nixosModules.supervision;
+        };
         shared-admission = import ./nix/host-admission-vm-test.nix {
           inherit pkgs;
           package = self.packages.${system}.default;

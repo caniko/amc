@@ -26,6 +26,7 @@ jobs:
           - ".#checks.x86_64-linux.test"
           - ".#checks.x86_64-linux.clippy"
           - ".#nixosTests.x86_64-linux.shared-admission"
+          - ".#nixosTests.x86_64-linux.supervision"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:
