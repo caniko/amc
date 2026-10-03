@@ -25,6 +25,15 @@ class NativeEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             hosted.verify_native_report(self.report(directory, hosted.NATIVE_CASES | {"main"}))
 
+    def test_supervision_requires_its_own_recovery_and_shadow_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hosted.verify_native_report(self.report(directory, hosted.SUPERVISION_CASES), hosted.SUPERVISION_CASES)
+            with self.assertRaises(RuntimeError):
+                hosted.verify_native_report(self.report(directory, hosted.NATIVE_CASES), hosted.SUPERVISION_CASES)
+            for name in hosted.SUPERVISION_CASES:
+                with self.subTest(missing=name), self.assertRaises(RuntimeError):
+                    hosted.verify_native_report(self.report(directory, hosted.SUPERVISION_CASES - {name}), hosted.SUPERVISION_CASES)
+
     def test_missing_report_cases_and_unsuccessful_cases_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             for names in (set(), {"main"}, hosted.NATIVE_CASES - {next(iter(hosted.NATIVE_CASES))}):
