@@ -620,15 +620,6 @@ mod tests {
         let pid = original.id() as i32;
         let fd = pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty()).unwrap();
         let start = process_start(pid).unwrap();
-        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
-        let cgroup = cgroup
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .unwrap()
-            .to_owned();
-        let inode = fs::metadata(Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')))
-            .unwrap()
-            .ino();
         let mut target = Target {
             domain: Domain {
                 id: "fixture".into(),
@@ -642,15 +633,18 @@ mod tests {
             },
             identity: Identity {
                 invocation: "a".repeat(32),
-                cgroup,
-                inode,
+                // Identity rejection precedes cgroup access. A Nix sandbox
+                // need not mount the host cgroup hierarchy to prove it.
+                cgroup: "/amc-pidfd-identity-fixture".into(),
+                inode: 1,
                 pid,
                 start_ticks: start,
             },
             pidfd: Arc::new(fd),
         };
         target.identity.start_ticks += 1;
-        assert!(target.signal(Signal::KILL).is_err());
+        let error = target.signal(Signal::KILL).unwrap_err();
+        assert!(error.to_string().contains("process identity replaced"));
         assert!(original.try_wait().unwrap().is_none());
         assert_eq!(
             original_gone(&Identity {
@@ -664,6 +658,7 @@ mod tests {
         target.identity.start_ticks = start;
         assert_eq!(original_gone(&target.identity), Some(true));
         assert!(target.signal(Signal::KILL).is_err());
+        assert!(pidfd_send_signal(&*target.pidfd, Signal::KILL).is_err());
         assert!(other.try_wait().unwrap().is_none());
         other.kill().unwrap();
         other.wait().unwrap();
