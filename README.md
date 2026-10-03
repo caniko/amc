@@ -8,6 +8,11 @@ sandbox or transparent replacement for normal launching. An optional
 [persistent per-user admission service](docs/persistent-admission.md) coordinates
 native managed jobs across independent processes with durable recovery.
 
+An optional [native memory supervisor](docs/supervision.md) adds per-invocation
+whole-window forecasting, admission inhibition and identity-bound recovery for
+explicitly authorized backends or disposable jobs. Consumers choose shadow or
+enforcement mode and retain a separate forecast-recovery rollout gate.
+
 The [workstation guide](docs/workstation-policy.md) provides a standalone native
 setup for a stable, usable foreground gaming session with bounded useful
 background progress, including enrollment, deadlines and recovery. Consumers own
