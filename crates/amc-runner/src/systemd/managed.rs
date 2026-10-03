@@ -33,15 +33,19 @@ pub struct LaunchRequest<'a> {
     pub argv: &'a [String],
     /// Validated environment names forwarded via `--setenv=`.
     pub environment: &'a [String],
-    /// Extra `Name=Value` resource properties (memory limits and similar).
+    /// Extra `Name=Value` resource properties: memory/CPU/IO accounting and
+    /// limits, allowed CPUs/memory nodes, tasks accounting/max, Slice,
+    /// OOMPolicy, KillMode, TimeoutStopSec, and RuntimeMaxSec. Other names
+    /// are rejected; lifecycle and executable properties belong to the runner.
     /// Effective enforcement is verified separately; see the runner docs.
     pub properties: &'a [String],
 }
 
 /// Build the submission command for a validated request. The unit identity,
 /// wait mode, and run-once lifecycle are imposed here: transient units are
-/// always retained (never `--collect`, so post-exit state stays observable)
-/// and never restarted, so a released reservation cannot cover a replay.
+/// never explicitly collected with `--collect` (failed units remain visible).
+/// Successful units may be collected by systemd; the backend needs pinned
+/// startup/termination evidence for those. Jobs never restart automatically.
 fn build_command(request: &LaunchRequest<'_>) -> Result<Command, RunError> {
     if !valid_unit(request.unit) || request.weight == 0 || request.argv.is_empty() {
         return Err(RunError::InvalidJob);
@@ -52,13 +56,38 @@ fn build_command(request: &LaunchRequest<'_>) -> Result<Command, RunError> {
         }
     }
     for property in request.properties {
-        let mut parts = property.splitn(2, '=');
-        match (parts.next(), parts.next()) {
-            (Some(name), Some(_))
-                if !name.is_empty()
-                    && !name.starts_with('-')
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => {}
-            _ => return Err(RunError::InvalidJob),
+        let Some((name, _)) = property.split_once('=') else {
+            return Err(RunError::InvalidJob);
+        };
+        // Native resource policy is caller-owned; executable and lifecycle
+        // properties must not override this runner's run-once contract.
+        if !matches!(
+            name,
+            "MemoryAccounting"
+                | "MemoryMin"
+                | "MemoryLow"
+                | "MemoryHigh"
+                | "MemoryMax"
+                | "MemorySwapMax"
+                | "MemoryZSwapMax"
+                | "MemoryOOMGroup"
+                | "CPUAccounting"
+                | "CPUWeight"
+                | "CPUQuota"
+                | "CPUQuotaPeriodSec"
+                | "IOAccounting"
+                | "IOWeight"
+                | "AllowedCPUs"
+                | "AllowedMemoryNodes"
+                | "TasksAccounting"
+                | "TasksMax"
+                | "Slice"
+                | "OOMPolicy"
+                | "KillMode"
+                | "TimeoutStopSec"
+                | "RuntimeMaxSec"
+        ) {
+            return Err(RunError::InvalidJob);
         }
     }
     let mut command = Command::new(request.launcher);
@@ -88,7 +117,7 @@ pub enum RunError {
     AdvisoryAdmission,
     /// Admission refused the requested reservation.
     Admission(AdmitError),
-    /// Invalid service identity or zero reservation.
+    /// Invalid service identity, reservation, argv, environment, or resource property.
     InvalidJob,
     /// Another submission has an uncertain outcome and must be reconciled first.
     Unreconciled,
@@ -108,7 +137,9 @@ impl std::fmt::Display for RunError {
             Self::Config(error) => write!(f, "{error}"),
             Self::Admission(error) => write!(f, "{error}"),
             Self::AdvisoryAdmission => f.write_str("managed jobs require fail-closed admission"),
-            Self::InvalidJob => f.write_str("invalid AMC identity or zero job weight"),
+            Self::InvalidJob => f.write_str(
+                "invalid managed job identity, weight, argv, environment, or resource property",
+            ),
             Self::Unreconciled => {
                 f.write_str("reconcile uncertain submissions before admitting more jobs")
             }
@@ -244,8 +275,8 @@ impl Runner {
             record: &record,
             finished: false,
         };
-        // Retain is forced: transient units stay observable for post-exit
-        // state, and nothing is ever automatically restarted or replayed.
+        // Avoid explicitly collecting failed units, which retain useful
+        // post-exit state. Successful units may still auto-collect natively.
         let outcome = execute(
             &mut command,
             &self.manager,
@@ -443,16 +474,18 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
             fixture
         }
 
-        /// Point the fake manager at a live group holding this test process,
-        /// so population checks observe a genuinely surviving process.
-        fn live_group(&self) -> String {
+        /// A visible live group, or explicitly missing placement evidence in
+        /// a Nix sandbox. Neither establishes that the workload is empty.
+        fn nonempty_or_unobservable_group(&self) {
             let placement = fs::read_to_string("/proc/self/cgroup").expect("cgroup v2 placement");
             let path = placement
                 .lines()
                 .find_map(|line| line.strip_prefix("0::"))
                 .expect("cgroup v2 hierarchy");
+            let visible = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+            let path = if visible.is_dir() { path } else { "" };
+            assert_ne!(super::super::terminated(Some(path)), Some(true));
             fs::write(self.0.join("manager.cgpath"), path).unwrap();
-            path.to_owned()
         }
         fn state(&self, value: &str) {
             fs::write(self.0.join("manager.state"), value).unwrap();
@@ -591,6 +624,33 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
     }
 
     #[test]
+    fn resource_properties_cannot_replace_managed_lifecycle() {
+        let fixture = Fixture::new();
+        let runner = fixture.runner();
+        let launcher = fixture.launcher();
+        let argv = workload("exit 0");
+        for property in [
+            "Restart=always",
+            "Type=forking",
+            "ExecStart=/another/program",
+            "ExecStartPost=/another/program",
+            "RemainAfterExit=yes",
+            "CollectMode=inactive-or-failed",
+            "OnSuccess=foreign.service",
+        ] {
+            let properties = [property.to_owned()];
+            let mut job = request(&launcher, &argv, "app-amc-lifecycle@1.service", true);
+            job.properties = &properties;
+            assert!(
+                matches!(runner.run(job, || None), Err(RunError::InvalidJob)),
+                "{property}"
+            );
+        }
+        assert!(!fixture.0.join("systemd-run.calls").exists());
+        assert_eq!(runner.committed_bytes(), 0);
+    }
+
+    #[test]
     fn detached_reservation_lasts_until_confirmed_termination() {
         let fixture = Fixture::new();
         let runner = fixture.runner();
@@ -721,9 +781,9 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
     }
 
     #[test]
-    fn stopped_service_with_surviving_processes_stays_uncertain() {
+    fn stopped_service_with_nonempty_or_unobservable_domain_stays_uncertain() {
         let fixture = Fixture::new();
-        fixture.live_group();
+        fixture.nonempty_or_unobservable_group();
         fixture.state("inactive");
         let runner = fixture.runner();
         let launcher = fixture.launcher();
@@ -735,7 +795,7 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
                 .unwrap(),
             Outcome::Acknowledged
         );
-        // The service is stopped but its domain still holds this process.
+        // A stopped service alone cannot prove an empty workload domain.
         assert_eq!(runner.reconcile(unit, false).unwrap(), Cleanup::Unknown);
         assert_eq!(runner.committed_bytes(), 100);
         assert_next_blocked_while_unreconciled(&runner, &launcher);

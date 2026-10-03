@@ -49,8 +49,9 @@ non-participants. Safety comes from three layers together:
 - Per-user coordinator. It authenticates local clients and verifies which
   resource domains they own. No client may release another application's
   grant or nominate foreign units for cleanup.
-- Cross-process transport is future work; the current `Coordinator` type
-  proves the accounting model in-process (see `coordinator.rs`).
+- The `Coordinator` type is in-process (see `coordinator.rs`). The optional
+  [persistent admission service](persistent-admission.md) adds a private Unix
+  socket, durable workload identities, and an authenticated native entry gate.
 
 ## Unavailable coordinator
 
