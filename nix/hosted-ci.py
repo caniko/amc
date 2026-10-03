@@ -27,6 +27,7 @@ SUPERVISION_CASES = {
     "chronological replay and public fail-closed heartbeat",
     "in-flight supervisor restart trips without replay or forgiven budget",
     "shadow observations have no intervention authority",
+    "native recovery completes without OOM kills",
 }
 
 
@@ -36,6 +37,15 @@ def verify_native_report(path, required_cases=NATIVE_CASES):
         raise RuntimeError("Native VM report is missing required execution cases")
     if any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")):
         raise RuntimeError("Native VM report contains unsuccessful execution cases")
+
+
+def verify_supervision_evidence(path):
+    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json"):
+        if not (path / name).is_file():
+            raise RuntimeError(f"Native supervision report is missing {name}")
+    oom = json.loads((path / "oom.json").read_text())
+    if any(oom[phase][counter] != 0 for phase in ("initial", "final") for counter in ("oom", "oom_kill")):
+        raise RuntimeError("Native supervision report contains OOM events")
 
 
 def retain():
@@ -62,6 +72,7 @@ def retain():
         if installable.endswith(".supervision"):
             # The VM explicitly exports these mechanism receipts. Keeping just
             # a driver PASS would lose calibration and bounded recovery evidence.
+            verify_supervision_evidence(output / "supervision" / "evidence")
             shutil.copytree(output / "supervision", evidence / "supervision")
     (evidence / "qualification.json").write_text(json.dumps({
         "schemaVersion": 1,

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -10,6 +11,29 @@ spec.loader.exec_module(hosted)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_supervision_exports_are_complete_and_have_no_oom_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json")
+            for name in names:
+                (path / name).write_text("{}")
+            clean = {phase: {"oom": 0, "oom_kill": 0} for phase in ("initial", "final")}
+            (path / "oom.json").write_text(json.dumps(clean))
+            hosted.verify_supervision_evidence(path)
+            for name in names:
+                contents = (path / name).read_text()
+                (path / name).unlink()
+                with self.subTest(missing=name), self.assertRaises(RuntimeError):
+                    hosted.verify_supervision_evidence(path)
+                (path / name).write_text(contents)
+            for phase, counters in clean.items():
+                for counter in counters:
+                    dirty = json.loads(json.dumps(clean))
+                    dirty[phase][counter] = 1
+                    (path / "oom.json").write_text(json.dumps(dirty))
+                    with self.subTest(phase=phase, counter=counter), self.assertRaises(RuntimeError):
+                        hosted.verify_supervision_evidence(path)
+
     def report(self, directory, names, outcome=None):
         root = ET.Element("testsuites")
         suite = ET.SubElement(root, "testsuite")
