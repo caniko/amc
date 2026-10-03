@@ -17,7 +17,7 @@ class NativeEvidenceTests(unittest.TestCase):
             names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json")
             for name in names:
                 (path / name).write_text("{}")
-            clean = {phase: {"oom": 0, "oom_kill": 0} for phase in ("initial", "final")}
+            clean = {phase: {"oom": 0, "oom_kill": 0, "host_oom_kill": 0} for phase in ("initial", "final")}
             (path / "oom.json").write_text(json.dumps(clean))
             hosted.verify_supervision_evidence(path)
             for name in names:
