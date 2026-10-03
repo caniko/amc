@@ -124,6 +124,13 @@ may use it. Clients carry contract names and server-generated tickets, never
 arbitrary release instructions or foreign unit names.
 Cancellation is bound to the submitting peer PID and its kernel start time;
 another process cannot cancel a ticket by copying its public diagnostic ID.
+Entry additionally requires a random one-use capability issued only in the
+enqueue reply. Poll, status and the durable ledger omit it; expiration,
+cancellation and coordinator restart invalidate it. The submitting PID/start
+time must still be live. Native helpers without a capability fail closed, so
+upgrade clients and coordinator together. This prevents a diagnostic ticket ID
+from authorizing another cooperative client; same-UID process inspection and
+user-manager control remain outside this interface's isolation boundary.
 
 `exec` preserves argv, cwd, streams, and the caller's environment except native
 manager-owned variables. It submits once through the existing systemd backend,
@@ -148,6 +155,8 @@ Only a durably recorded entry acknowledgment permits the actual command to run.
   the manager confirms inactivity or unit collection. No submission is replayed.
 - Persistence failure stops the server before it acknowledges the change. Its
   native workloads retain their limits. Recovery uses the last committed state.
+- An unresolved native outcome returns a CLI error even if the launcher exited
+  zero. It is not completion evidence; inspect status before retrying.
 
 The ledger stores contract/identity metadata, not command arguments, environment
 values, or output. Native systemd unit metadata remains subject to the normal

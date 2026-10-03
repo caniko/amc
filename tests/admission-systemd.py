@@ -150,9 +150,10 @@ def main():
             assert failed.returncode == 42, (failed.returncode, failed.stderr)
             wait(lambda: rpc("status")["status"]["committed_bytes"] == 0)
 
-            ticket = rpc("enqueue", contract="test", wait_ms=5000)["entry"]["id"]
+            reservation = rpc("enqueue", contract="test", wait_ms=5000)
+            ticket = reservation["entry"]["id"]
             wait(lambda: rpc("poll", id=ticket)["entry"]["phase"] == "reserved")
-            foreign = subprocess.run([amc, "admission", "enter", "--socket", str(endpoint), "--ticket", ticket, "--", "echo", "MUST-NOT-EXECUTE"], capture_output=True, timeout=10, check=False)
+            foreign = subprocess.run([amc, "admission", "enter", "--socket", str(endpoint), "--ticket", ticket, "--entry-key", reservation["entry_key"], "--", "echo", "MUST-NOT-EXECUTE"], capture_output=True, timeout=10, check=False)
             assert foreign.returncode != 0 and b"MUST-NOT-EXECUTE" not in foreign.stdout
             rpc("cancel", id=ticket)
 

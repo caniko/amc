@@ -86,6 +86,10 @@ pub fn serve_with_host(
     let mut tick = Instant::now();
     let mut cursor = 0usize;
     let mut waiting = std::collections::BTreeMap::new();
+    // Unentered tickets are discarded on restart, so their capabilities are
+    // deliberately volatile and absent from the readable durable ledger.
+    let mut entry_keys: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut unreconciled: std::collections::BTreeSet<_> =
         ledger.entries.iter().map(|e| e.id.clone()).collect();
     while !stopping() {
@@ -125,6 +129,7 @@ pub fn serve_with_host(
             if before != serde_json::to_vec(&ledger)? {
                 store.save(&ledger)?;
             }
+            entry_keys.retain(|id, _| ledger.get(id).is_some_and(|e| e.phase != Phase::Running));
             tick = Instant::now();
         }
         match listener.accept() {
@@ -149,6 +154,7 @@ pub fn serve_with_host(
                     Observations {
                         waiting: waiting.clone(),
                         unreconciled: unreconciled.iter().cloned().collect(),
+                        entry_keys: &mut entry_keys,
                     },
                 );
                 // Never acknowledge an uncommitted grant or entry. Persistence
@@ -177,9 +183,10 @@ pub fn serve_with_host(
     Ok(())
 }
 
-struct Observations {
+struct Observations<'a> {
     waiting: std::collections::BTreeMap<String, Decision>,
     unreconciled: Vec<String>,
+    entry_keys: &'a mut std::collections::BTreeMap<String, String>,
 }
 
 fn handle(
@@ -189,7 +196,7 @@ fn handle(
     ledger: &mut Ledger,
     native: &impl Native,
     host_socket: Option<&Path>,
-    observations: Observations,
+    observations: Observations<'_>,
 ) -> Result<Response> {
     ensure!(
         request.version == 1,
@@ -207,6 +214,7 @@ fn handle(
             );
             let id = fresh_id()?;
             let client = client_identity(pid)?;
+            let key = fresh_id()?;
             ledger.enqueue(
                 id.clone(),
                 &contract,
@@ -214,6 +222,8 @@ fn handle(
                 now_ms()?.saturating_add(wait_ms).saturating_add(30_000),
             )?;
             ledger.set_client(&id, client)?;
+            observations.entry_keys.insert(id.clone(), key.clone());
+            response.entry_key = Some(key);
             response.entry = ledger.get(&id).cloned();
         }
         Message::Poll { id } => {
@@ -224,13 +234,21 @@ fn handle(
                     .clone(),
             );
         }
-        Message::Enter { id } => {
+        Message::Enter { id, key } => {
             let entry = ledger
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
             ensure!(
                 entry.phase == Phase::Reserved && now_ms()? < entry.deadline_ms,
                 "ticket cannot enter"
+            );
+            ensure!(
+                observations.entry_keys.get(&id) == Some(&key),
+                "entry requires the submitting client's capability"
+            );
+            ensure!(
+                entry.client.as_ref().is_some_and(|client| client_identity(client.pid).ok().as_ref() == Some(client)),
+                "submitting client is no longer alive"
             );
             let identity = native
                 .identify(entry, pid)
@@ -243,6 +261,7 @@ fn handle(
                 "ticket expired during native verification"
             );
             ledger.enter(&id, identity)?;
+            observations.entry_keys.remove(&id);
             response.entry = ledger.get(&id).cloned();
         }
         Message::Cancel { id } => {
@@ -252,9 +271,9 @@ fn handle(
                     "only the submitting client may cancel this ticket"
                 );
             }
-            if !ledger.cancel_pending(&id)
-                && let Some(entry) = ledger.get(&id)
-            {
+            if ledger.cancel_pending(&id) {
+                observations.entry_keys.remove(&id);
+            } else if let Some(entry) = ledger.get(&id) {
                 native.stop(entry).map_err(|_| {
                     anyhow::anyhow!("native stop unconfirmed; reservation retained")
                 })?;

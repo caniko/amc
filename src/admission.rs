@@ -78,6 +78,8 @@ pub enum AdmissionCommand {
         #[arg(long)]
         ticket: String,
         #[arg(long)]
+        entry_key: String,
+        #[arg(long)]
         host_socket: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -209,6 +211,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
         AdmissionCommand::Enter {
             socket,
             ticket,
+            entry_key,
             host_socket,
             command,
         } => {
@@ -228,7 +231,13 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                     || signals.cancelled().is_some(),
                 )?;
             }
-            call(&socket, Message::Enter { id: ticket })?;
+            call(
+                &socket,
+                Message::Enter {
+                    id: ticket,
+                    key: entry_key,
+                },
+            )?;
             Err(Command::new(&command[0]).args(&command[1..]).exec())
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
@@ -242,7 +251,7 @@ fn run(
     runtime_max_sec: Option<u64>,
     argv: &[OsString],
 ) -> Result<i32> {
-    use amc_runner::systemd::{Outcome, execute};
+    use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let response = call(
@@ -253,6 +262,9 @@ fn run(
         },
     )?;
     let host_socket = response.host_socket;
+    let entry_key = response
+        .entry_key
+        .ok_or_else(|| anyhow::anyhow!("missing admission entry capability"))?;
     let mut entry = response
         .entry
         .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
@@ -327,7 +339,7 @@ fn run(
         .arg(std::env::current_exe()?)
         .args(["admission", "enter", "--socket"])
         .arg(socket)
-        .args(["--ticket", &entry.id]);
+        .args(["--ticket", &entry.id, "--entry-key", &entry_key]);
     if let Some(host_socket) = host_socket {
         client.arg("--host-socket").arg(host_socket);
     }
@@ -349,25 +361,61 @@ fn run(
             id: entry.id.clone(),
         },
     );
+    outcome_exit(outcome, &entry.unit())
+}
+
+fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32> {
+    use amc_runner::systemd::Outcome;
     match outcome {
         Outcome::Completed(code) => Ok(code),
-        // Fast successful units can be collected before a follow-up manager
-        // query. Preserve systemd-run --wait's exit status; it is NOT release
-        // evidence. The durable server, rather than this client, owns release.
-        Outcome::Unknown { exit_code, .. } => Ok(exit_code),
+        Outcome::Unknown { exit_code, .. } => {
+            anyhow::bail!(
+                "native outcome unresolved for {unit} (launcher exit {exit_code}); reservation remains coordinator-owned; inspect admission status before retrying"
+            )
+        }
         Outcome::Cancelled { signal, .. } => Ok(128 + signal),
         Outcome::TimedOut { .. } => {
             anyhow::bail!(
                 "native submission timed out for {}; inspect admission status before retrying",
-                entry.unit()
+                unit
             )
         }
         _ => {
             anyhow::bail!(
                 "native submission {:?} for {}; inspect admission status before retrying",
                 outcome,
-                entry.unit()
+                unit
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amc_runner::systemd::{Cleanup, Outcome};
+
+    #[test]
+    fn unresolved_native_outcome_never_reports_success() {
+        for cleanup in [Cleanup::Unknown, Cleanup::Stopped] {
+            assert!(
+                outcome_exit(
+                    Outcome::Unknown {
+                        exit_code: 0,
+                        cleanup
+                    },
+                    "fixture.service"
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            outcome_exit(Outcome::Completed(0), "fixture.service").unwrap(),
+            0
+        );
+        assert_eq!(
+            outcome_exit(Outcome::Completed(42), "fixture.service").unwrap(),
+            42
+        );
     }
 }
