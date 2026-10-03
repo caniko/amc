@@ -235,6 +235,10 @@ fn handle(
             );
         }
         Message::Enter { id, key } => {
+            ensure!(
+                native.can_enter(),
+                "host supervision inhibits new execution"
+            );
             let entry = ledger
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
@@ -259,6 +263,10 @@ fn handle(
             ensure!(
                 now_ms()? < entry.deadline_ms,
                 "ticket expired during native verification"
+            );
+            ensure!(
+                native.can_enter(),
+                "host supervision changed during entry verification"
             );
             ledger.enter(&id, identity)?;
             observations.entry_keys.remove(&id);

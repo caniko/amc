@@ -24,6 +24,11 @@ in {
       default = null;
       description = "Optional root host admission endpoint; unavailable capacity fails closed.";
     };
+    healthFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional supervisor heartbeat. Missing, stale or inhibited evidence pauses new entries; existing grants remain charged.";
+    };
   };
   config = lib.mkIf cfg.enable {
     home.packages = [cfg.package];
@@ -35,7 +40,10 @@ in {
         After = slices;
       };
       Service = {
-        ExecStart = "${lib.getExe cfg.package} admission serve --policy ${policy} --systemctl ${pkgs.systemd}/bin/systemctl" + lib.optionalString (cfg.hostSocket != null) " --host-socket ${lib.escapeShellArg cfg.hostSocket}";
+        ExecStart =
+          "${lib.getExe cfg.package} admission serve --policy ${policy} --systemctl ${pkgs.systemd}/bin/systemctl"
+          + lib.optionalString (cfg.hostSocket != null) " --host-socket ${lib.escapeShellArg cfg.hostSocket}"
+          + lib.optionalString (cfg.healthFile != null) " --health-file ${lib.escapeShellArg cfg.healthFile}";
         Environment = ["PATH=${lib.makeBinPath [pkgs.systemd]}"];
         UMask = "0077";
         Restart = "on-failure";

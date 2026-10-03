@@ -29,6 +29,8 @@ pub enum AdmissionCommand {
         socket: PathBuf,
         #[arg(long, default_value = "/var/lib/amc-host")]
         state: PathBuf,
+        #[arg(long)]
+        health_file: Option<PathBuf>,
     },
     /// Inspect the root broker's reservations and commitments.
     HostStatus {
@@ -45,6 +47,9 @@ pub enum AdmissionCommand {
         state: Option<PathBuf>,
         #[arg(long, default_value = "systemctl")]
         systemctl: PathBuf,
+        /// Fail closed when this host supervisor heartbeat is missing/stale/inhibited.
+        #[arg(long)]
+        health_file: Option<PathBuf>,
         /// Require shared host capacity before a native entry can execute.
         #[arg(long)]
         host_socket: Option<PathBuf>,
@@ -100,6 +105,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             policy,
             socket,
             state,
+            health_file,
         } => {
             let mut bytes = Vec::new();
             File::open(policy)?
@@ -111,9 +117,13 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             );
             let policy = serde_json::from_slice(&bytes)?;
             let signals = crate::control::Signals::install()?;
-            amc_admission::host_server::serve(policy, &socket, &state, || {
-                signals.cancelled().is_some()
-            })?;
+            amc_admission::host_server::serve_supervised(
+                policy,
+                &socket,
+                &state,
+                health_file.as_deref(),
+                || signals.cancelled().is_some(),
+            )?;
             Ok(0)
         }
         AdmissionCommand::HostStatus { socket } => {
@@ -129,6 +139,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             socket,
             state,
             systemctl,
+            health_file,
             host_socket,
         } => {
             let mut bytes = Vec::new();
@@ -158,7 +169,10 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 policy,
                 &socket_path(socket)?,
                 &state,
-                Systemd { systemctl },
+                amc_admission::native::Supervised {
+                    native: Systemd { systemctl },
+                    health_file,
+                },
                 host_socket.as_deref(),
                 || signals.cancelled().is_some(),
             )?;
