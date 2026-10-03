@@ -131,6 +131,16 @@ pub fn serve(
     state: &Path,
     stopping: impl Fn() -> bool,
 ) -> Result<()> {
+    serve_supervised(policy, socket, state, None, stopping)
+}
+
+pub fn serve_supervised(
+    policy: HostPolicy,
+    socket: &Path,
+    state: &Path,
+    health_file: Option<&Path>,
+    stopping: impl Fn() -> bool,
+) -> Result<()> {
     ensure!(
         nix::unistd::geteuid().is_root(),
         "host admission requires root"
@@ -200,7 +210,9 @@ pub fn serve(
                 .filter(|r| r.granted)
                 .all(|r| host_native::enforcement(r).is_some())
             {
-                host_native::capacity().ok()
+                host_native::capacity().ok().filter(|_| {
+                    health_file.is_none_or(|path| crate::health::permits(path).unwrap_or(false))
+                })
             } else {
                 None
             };

@@ -17,6 +17,11 @@ in {
       inherit ((pkgs.formats.json {})) type;
       description = "Host policy with finite enrolled domains and ceiling-backed reservations.";
     };
+    healthFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional supervisor heartbeat; unavailable or inhibited evidence forbids new grants without releasing existing reservations.";
+    };
   };
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
@@ -24,7 +29,9 @@ in {
       description = "AMC atomic host capacity reservations";
       wantedBy = ["multi-user.target"];
       serviceConfig = {
-        ExecStart = "${lib.getExe cfg.package} admission host-serve --policy ${policy}";
+        ExecStart =
+          "${lib.getExe cfg.package} admission host-serve --policy ${policy}"
+          + lib.optionalString (cfg.healthFile != null) " --health-file ${lib.escapeShellArg cfg.healthFile}";
         Restart = "on-failure";
         RestartSec = "2s";
         StateDirectory = "amc-host";
