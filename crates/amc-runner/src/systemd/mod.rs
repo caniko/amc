@@ -556,11 +556,7 @@ pub fn execute(
                         if !retain {
                             let _ = cleanup(manager, unit);
                         }
-                        return Outcome::Completed(if client_code == 0 {
-                            0
-                        } else {
-                            state.workload_code.unwrap_or(client_code)
-                        });
+                        return Outcome::Completed(state.workload_code.unwrap_or(client_code));
                     }
                     _ => {
                         return Outcome::Unknown {
@@ -800,6 +796,33 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         );
         assert!(record.submitted() && record.settled());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verified_workload_status_overrides_a_successful_wait_client() {
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-workload-status");
+        for (code, status, expected) in [(1, 42, 42), (2, 9, 137), (1, 0, 0)] {
+            let manager = show_manager(
+                &dir,
+                &format!(
+                    "printf 'LoadState=loaded\\nExecMainStartTimestampMonotonic=1\\nActiveState=inactive\\nExecMainCode={code}\\nExecMainStatus={status}\\nControlGroup=/amc-test-collected\\n'"
+                ),
+            );
+            assert_eq!(
+                execute(
+                    &mut bound_command("app-amc-status@1.service", false),
+                    &manager,
+                    "app-amc-status@1.service",
+                    false,
+                    true,
+                    || None,
+                    &ClientRecord::default(),
+                ),
+                Outcome::Completed(expected)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

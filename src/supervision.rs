@@ -68,12 +68,20 @@ pub fn execute(command: SupervisionCommand) -> Result<i32> {
             let (store, mut snapshot) = amc_supervision::store::Store::open(&state, boot.trim())?;
             if let Some(active) = &snapshot.active {
                 let manager = Manager { systemctl };
+                let empty = match &active.identity {
+                    amc_supervision::recovery::RecoveryIdentity::Process(identity) => {
+                        amc_supervision::native::terminated(&manager, &active.domain, identity)?
+                    }
+                    amc_supervision::recovery::RecoveryIdentity::Failed(identity) => {
+                        amc_supervision::native::failed_matches(
+                            &manager.show(&active.domain)?,
+                            &active.domain,
+                            identity,
+                        ) && amc_supervision::native::empty_failed_slot(identity)?
+                    }
+                };
                 anyhow::ensure!(
-                    amc_supervision::native::terminated(
-                        &manager,
-                        &active.domain,
-                        &active.identity
-                    )?,
+                    empty,
                     "original native domain has not terminated; recovery retained"
                 );
                 snapshot.active = None;

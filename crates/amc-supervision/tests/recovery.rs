@@ -1,6 +1,6 @@
 use amc_supervision::{
     forecast::Settings,
-    policy::{Domain, JobPool, Lifecycle, Mode, Policy},
+    policy::{Domain, Lifecycle, Mode, Policy},
     recovery::{Action, Identity, Phase, State},
 };
 
@@ -189,6 +189,219 @@ fn unhealthy_cooldown_is_deadline_bound_and_finished_jobs_release_the_recovery_s
 }
 
 #[test]
+fn a_healthy_replacement_at_or_after_the_start_deadline_trips() {
+    let p = policy();
+    for observed_at in [11_200, 11_201] {
+        let mut s = state();
+        s.begin(domain(Lifecycle::Restart), identity(), 100, 100, &p)
+            .unwrap();
+        s.advance(200, Some(true), false, true, false, &p);
+        assert_eq!(
+            s.advance(1200, Some(true), false, true, false, &p),
+            Action::Start
+        );
+        assert_eq!(
+            s.advance(observed_at, Some(false), true, true, true, &p),
+            Action::Trip
+        );
+        assert_eq!(s.active.unwrap().phase, Phase::Tripped);
+    }
+}
+
+#[test]
+fn new_job_tickets_share_the_persisted_pool_recovery_budget() {
+    use amc_supervision::policy::JobPool;
+    let mut p = policy();
+    p.domain_recovery_limit = 1;
+    p.job_pools.push(JobPool {
+        id: "jobs".into(),
+        uid: 1000,
+        state: "/state/jobs".into(),
+        contracts: vec!["tool".into()],
+        lifecycle: Lifecycle::Terminate,
+        priority: 0,
+    });
+    let job = |ticket: &str| {
+        let mut d = domain(Lifecycle::Terminate);
+        d.id = format!("jobs-{ticket}");
+        d.unit = format!("app-amc-job-{ticket}.service");
+        d.expected = Some(amc_admission::ledger::Identity {
+            invocation: "a".repeat(32),
+            cgroup: "/job".into(),
+            inode: 1,
+        });
+        d
+    };
+    let mut s = state();
+    s.begin(
+        job("a0e7b901-008c-479c-bf78-3fd6a6fb408d"),
+        identity(),
+        100,
+        100,
+        &p,
+    )
+    .unwrap();
+    s.advance(200, Some(true), false, true, false, &p);
+    assert_eq!(
+        s.advance(1200, Some(true), false, true, false, &p),
+        Action::Finished
+    );
+    let mut restored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(restored.attempts[0].pool.as_deref(), Some("jobs"));
+    assert!(
+        restored
+            .begin(
+                job("ed447a46-39ce-496e-b58c-c6e029e23768"),
+                identity(),
+                101,
+                1201,
+                &p
+            )
+            .is_err()
+    );
+    assert_eq!(restored.attempts.len(), 1);
+    let mut legacy = serde_json::to_value(&s).unwrap();
+    legacy["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pool");
+    let mut restored: State = serde_json::from_value(legacy).unwrap();
+    assert!(
+        restored
+            .begin(
+                job("ed447a46-39ce-496e-b58c-c6e029e23768"),
+                identity(),
+                101,
+                1201,
+                &p
+            )
+            .is_err()
+    );
+    assert_eq!(restored.attempts[0].pool.as_deref(), Some("jobs"));
+
+    // The published predecessor stored the normalized pool directly as domain.
+    let mut legacy = serde_json::to_value(&s).unwrap();
+    legacy["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pool");
+    legacy["attempts"][0]["domain"] = serde_json::json!("jobs");
+    let mut restored: State = serde_json::from_value(legacy).unwrap();
+    assert!(
+        restored
+            .begin(
+                job("ed447a46-39ce-496e-b58c-c6e029e23768"),
+                identity(),
+                101,
+                1201,
+                &p,
+            )
+            .is_err()
+    );
+    assert_eq!(restored.attempts.len(), 1);
+    assert_eq!(restored.attempts[0].pool.as_deref(), Some("jobs"));
+}
+
+#[test]
+fn static_domain_names_cannot_be_reclassified_as_pool_history() {
+    use amc_supervision::policy::JobPool;
+    let mut p = policy();
+    p.domain_recovery_limit = 1;
+    p.domains[0].id = "jobs-a0e7b901-008c-479c-bf78-3fd6a6fb408d".into();
+    p.job_pools.push(JobPool {
+        id: "jobs".into(),
+        uid: 1000,
+        state: "/state/jobs".into(),
+        contracts: vec!["tool".into()],
+        lifecycle: Lifecycle::Terminate,
+        priority: 0,
+    });
+    p.validate().unwrap();
+    let mut s = state();
+    s.begin(p.domains[0].clone(), identity(), 100, 100, &p)
+        .unwrap();
+    s.advance(200, Some(true), false, true, false, &p);
+    s.advance(1200, Some(true), false, true, false, &p);
+    assert_eq!(
+        s.advance(1201, Some(false), true, true, true, &p),
+        Action::Finished
+    );
+    let mut restored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert!(
+        restored
+            .begin(p.domains[0].clone(), identity(), 101, 1202, &p)
+            .is_err()
+    );
+    assert_eq!(restored.attempts.len(), 1);
+    assert!(restored.attempts[0].pool.is_none());
+}
+
+#[test]
+fn cold_failed_backend_uses_durable_cooldown_and_never_replays_after_restart() {
+    use amc_supervision::recovery::{FailedIdentity, RecoveryIdentity};
+    let p = policy();
+    let mut s = state();
+    s.begin_failed(
+        domain(Lifecycle::Restart),
+        FailedIdentity {
+            invocation: "a".repeat(32),
+            parent: "/user.slice".into(),
+            parent_inode: 1,
+            cgroup: "/user.slice/backend.service".into(),
+            inode: None,
+        },
+        100,
+        100,
+        &p,
+    )
+    .unwrap();
+    s.validate().unwrap();
+    assert!(matches!(
+        s.active.as_ref().unwrap().identity,
+        RecoveryIdentity::Failed(_)
+    ));
+    assert_eq!(
+        s.advance(1099, Some(true), false, true, false, &p),
+        Action::None
+    );
+    let mut restarted: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    restarted.reconcile_startup(&s.boot_id);
+    assert_eq!(
+        restarted.advance(1100, Some(true), false, true, false, &p),
+        Action::None
+    );
+    assert_eq!(restarted.active.as_ref().unwrap().phase, Phase::Tripped);
+    assert_eq!(restarted.attempts.len(), 1);
+    assert_eq!(
+        s.advance(1100, Some(true), false, true, false, &p),
+        Action::Start
+    );
+    assert_eq!(
+        s.advance(1101, Some(false), true, true, true, &p),
+        Action::Finished
+    );
+    assert_eq!(s.attempts.len(), 1);
+}
+
+#[test]
+fn lost_cleanup_evidence_during_cooldown_revokes_restart() {
+    let p = policy();
+    for empty in [None, Some(false)] {
+        let mut s = state();
+        s.begin(domain(Lifecycle::Restart), identity(), 100, 100, &p)
+            .unwrap();
+        s.advance(200, Some(true), false, true, false, &p);
+        assert_eq!(s.advance(1200, empty, false, true, false, &p), Action::Trip);
+        assert_eq!(s.active.as_ref().unwrap().phase, Phase::Tripped);
+        assert_eq!(
+            s.advance(1201, Some(true), false, true, false, &p),
+            Action::None
+        );
+        assert_eq!(s.attempts.len(), 1);
+    }
+}
+
+#[test]
 fn chronological_replay_reproduces_growth_and_rejects_reordered_frames() {
     use amc_supervision::{native::Boundary, replay};
     let mut trace = String::new();
@@ -209,52 +422,4 @@ fn chronological_replay_reproduces_growth_and_rejects_reordered_frames() {
     assert!(summary["backend"].strong > 0);
     let reversed = trace.lines().rev().collect::<Vec<_>>().join("\n");
     assert!(replay::run(std::io::Cursor::new(reversed)).is_err());
-}
-
-#[test]
-fn readmission_and_legacy_history_share_the_enrolled_pool_budget() {
-    let mut p = policy();
-    p.job_pools.push(JobPool {
-        id: "tools".into(),
-        uid: 1000,
-        state: "/private-admission".into(),
-        contracts: vec!["read".into()],
-        lifecycle: Lifecycle::Terminate,
-        priority: 0,
-    });
-    let mut s = state();
-    for i in 0..2 {
-        let mut job = domain(Lifecycle::Terminate);
-        job.id = format!("tools-{i:032x}");
-        s.begin(job, identity(), i, i, &p).unwrap();
-        s.active = None;
-    }
-    // A persisted pre-upgrade invocation still consumes the same allowance.
-    s.attempts[0].domain = format!("tools-{:032x}", 0);
-    let mut next = domain(Lifecycle::Terminate);
-    next.id = format!("tools-{:032x}", 2);
-    assert!(s.begin(next, identity(), 2, 2, &p).is_err());
-    assert_eq!(s.attempts.len(), 2);
-}
-
-#[test]
-fn a_healthy_replacement_must_be_observed_before_the_start_deadline() {
-    let p = policy();
-    for (observed, action) in [
-        (199, Action::Finished),
-        (200, Action::Trip),
-        (201, Action::Trip),
-    ] {
-        let mut s = state();
-        s.begin(domain(Lifecycle::Restart), identity(), 0, 0, &p)
-            .unwrap();
-        s.active.as_mut().unwrap().phase = Phase::Starting { deadline_ms: 200 };
-        assert_eq!(
-            s.advance(observed, Some(true), true, true, true, &p),
-            action
-        );
-        if action == Action::Trip {
-            assert!(matches!(s.active.as_ref().unwrap().phase, Phase::Tripped));
-        }
-    }
 }

@@ -14,11 +14,19 @@ class NativeEvidenceTests(unittest.TestCase):
     def test_supervision_exports_are_complete_and_have_no_oom_events(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json")
+            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json", "heartbeat.json", "cold-status.json")
             for name in names:
                 (path / name).write_text("{}")
             clean = {phase: {"oom": 0, "oom_kill": 0, "host_oom_kill": 0} for phase in ("initial", "final")}
             (path / "oom.json").write_text(json.dumps(clean))
+            heartbeat = [
+                {"inhibit": True, "age_ms": 0, "granted": False},
+                {"inhibit": False, "age_ms": 4000, "granted": False},
+                {"inhibit": False, "age_ms": 0, "granted": True},
+            ]
+            (path / "heartbeat.json").write_text(json.dumps(heartbeat))
+            cold = {"recovery": {"active": None, "attempts": [{"domain": "cold-backend"}]}}
+            (path / "cold-status.json").write_text(json.dumps(cold))
             hosted.verify_supervision_evidence(path)
             for name in names:
                 contents = (path / name).read_text()
@@ -26,6 +34,19 @@ class NativeEvidenceTests(unittest.TestCase):
                 with self.subTest(missing=name), self.assertRaises(RuntimeError):
                     hosted.verify_supervision_evidence(path)
                 (path / name).write_text(contents)
+            for index in range(3):
+                broken = json.loads(json.dumps(heartbeat))
+                broken[index]["granted"] = not broken[index]["granted"]
+                (path / "heartbeat.json").write_text(json.dumps(broken))
+                with self.subTest(heartbeat=index), self.assertRaises(RuntimeError):
+                    hosted.verify_supervision_evidence(path)
+            (path / "heartbeat.json").write_text(json.dumps(heartbeat))
+            for recovery in [{}, {"active": None, "attempts": []}, {"active": "tripped", "attempts": cold["recovery"]["attempts"]},
+                             {"active": None, "attempts": cold["recovery"]["attempts"] * 2}]:
+                (path / "cold-status.json").write_text(json.dumps({"recovery": recovery}))
+                with self.subTest(cold=recovery), self.assertRaises(RuntimeError):
+                    hosted.verify_supervision_evidence(path)
+            (path / "cold-status.json").write_text(json.dumps(cold))
             for phase, counters in clean.items():
                 for counter in counters:
                     dirty = json.loads(json.dumps(clean))
