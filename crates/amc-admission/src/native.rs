@@ -11,6 +11,9 @@ use std::{
 };
 
 pub trait Native {
+    fn can_enter(&self) -> bool {
+        true
+    }
     fn headroom(&self, contract: &Contract, reserve: u64) -> Result<Headroom>;
     fn identify(&self, entry: &Entry, peer_pid: i32) -> Result<Identity>;
     fn terminated(&self, entry: &Entry) -> Option<bool>;
@@ -19,6 +22,35 @@ pub trait Native {
 
 pub struct Systemd {
     pub systemctl: PathBuf,
+}
+
+/// Optional host supervision without changing ordinary native admission.
+pub struct Supervised<N> {
+    pub native: N,
+    pub health_file: Option<PathBuf>,
+}
+impl<N: Native> Native for Supervised<N> {
+    fn can_enter(&self) -> bool {
+        self.native.can_enter()
+            && self
+                .health_file
+                .as_ref()
+                .is_none_or(|path| crate::health::permits(path).unwrap_or(false))
+    }
+    fn headroom(&self, c: &Contract, reserve: u64) -> Result<Headroom> {
+        let mut h = self.native.headroom(c, reserve)?;
+        h.paused |= !self.can_enter();
+        Ok(h)
+    }
+    fn identify(&self, e: &Entry, pid: i32) -> Result<Identity> {
+        self.native.identify(e, pid)
+    }
+    fn terminated(&self, e: &Entry) -> Option<bool> {
+        self.native.terminated(e)
+    }
+    fn stop(&self, e: &Entry) -> Result<()> {
+        self.native.stop(e)
+    }
 }
 
 pub fn cgroup_directory(path: &str) -> Result<PathBuf> {

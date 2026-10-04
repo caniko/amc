@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "mode": "shadow",
+  "forecast_recovery": false,
+  "reserve_bytes": 8589934592,
+  "emergency_available_bytes": 2147483648,
+  "emergency_full_psi": 0.02,
+  "term_ms": 15000,
+  "kill_ms": 20000,
+  "cooldown_ms": 30000,
+  "recovery_window_ms": 3600000,
+  "domain_recovery_limit": 3,
+  "host_recovery_limit": 8,
+  "forecast": {
+    "horizon": 60,
+    "calibration": 512,
+    "alpha": 0.05,
+    "max_gap_ms": 1500
+  },
+  "domains": [
+    {
+      "id": "backend",
+      "unit": "example-backend.service",
+      "uid": null,
+      "lifecycle": "restart",
+      "memory_max": 1073741824,
+      "memory_swap_max": 0,
+      "priority": 10
+    }
+  ],
+  "job_pools": []
+}

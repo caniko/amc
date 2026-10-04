@@ -13,6 +13,7 @@ ALLOWED = {
     ".#checks.x86_64-linux.test",
     ".#checks.x86_64-linux.clippy",
     ".#nixosTests.x86_64-linux.shared-admission",
+    ".#nixosTests.x86_64-linux.supervision",
 }
 NATIVE_CASES = {
     "durable root pool tracks every potential execution owner",
@@ -21,14 +22,42 @@ NATIVE_CASES = {
     "changed native enforcement inhibits a fitting smaller job",
     "cancelled pending work never executes after native cleanup",
 }
+SUPERVISION_CASES = {
+    "identity-bound recovery waits for descendant cleanup and starts once",
+    "chronological replay and public fail-closed heartbeat",
+    "in-flight supervisor restart trips without replay or forgiven budget",
+    "shadow observations have no intervention authority",
+    "native recovery completes without OOM kills",
+    "host admission denies inhibited and expired heartbeats",
+    "cold failed backend recovers once with durable invocation accounting",
+}
 
 
-def verify_native_report(path):
+def verify_native_report(path, required_cases=NATIVE_CASES):
     cases = ET.parse(path).getroot().findall(".//testcase")
-    if not NATIVE_CASES.issubset({case.get("name") for case in cases}):
+    if not required_cases.issubset({case.get("name") for case in cases}):
         raise RuntimeError("Native VM report is missing required execution cases")
     if any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")):
         raise RuntimeError("Native VM report contains unsuccessful execution cases")
+
+
+def verify_supervision_evidence(path):
+    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json", "heartbeat.json", "cold-status.json"):
+        if not (path / name).is_file():
+            raise RuntimeError(f"Native supervision report is missing {name}")
+    heartbeat = json.loads((path / "heartbeat.json").read_text())
+    if heartbeat != [
+        {"inhibit": True, "age_ms": 0, "granted": False},
+        {"inhibit": False, "age_ms": 4000, "granted": False},
+        {"inhibit": False, "age_ms": 0, "granted": True},
+    ]:
+        raise RuntimeError("Host admission heartbeat evidence does not prove denial and recovery")
+    cold = json.loads((path / "cold-status.json").read_text()).get("recovery", {})
+    if cold.get("active", True) is not None or len(cold.get("attempts", [])) != 1 or cold["attempts"][0].get("domain") != "cold-backend":
+        raise RuntimeError("Cold failed backend evidence does not prove one accounted recovery")
+    oom = json.loads((path / "oom.json").read_text())
+    if any(oom[phase][counter] != 0 for phase in ("initial", "final") for counter in ("oom", "oom_kill", "host_oom_kill")):
+        raise RuntimeError("Native supervision report contains OOM events")
 
 
 def retain():
@@ -49,8 +78,14 @@ def retain():
     subprocess.run(["git", "diff", "--exit-code", "--", "flake.lock"], cwd=ROOT, check=True)
     shutil.copyfile(ROOT / "flake.lock", evidence / "flake.lock")
     if "nixosTests" in installable:
-        verify_native_report(output / "junit.xml")
+        required = SUPERVISION_CASES if installable.endswith(".supervision") else NATIVE_CASES
+        verify_native_report(output / "junit.xml", required)
         shutil.copyfile(output / "junit.xml", evidence / "junit.xml")
+        if installable.endswith(".supervision"):
+            # The VM explicitly exports these mechanism receipts. Keeping just
+            # a driver PASS would lose calibration and bounded recovery evidence.
+            verify_supervision_evidence(output / "supervision" / "evidence")
+            shutil.copytree(output / "supervision", evidence / "supervision")
     (evidence / "qualification.json").write_text(json.dumps({
         "schemaVersion": 1,
         "passed": True,
