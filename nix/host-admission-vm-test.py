@@ -155,4 +155,40 @@ with test_section("cancelled pending work never executes after native cleanup"):
     machine.sleep(1)
     machine.fail("test -f /tmp/cancelled-entered")
 
+with test_section("short native bursts exceed the normal budget and retain restart accounting"):
+    for name, uid, contract in [("full-a", 1000, "tool"), ("full-b", 1001, "small"), ("full-c", 1000, "small")]:
+        launch(name, uid, contract, f"touch /tmp/{name}-entered; sleep 120")
+        wait_entered(name)
+    wait_committed(160 * 1048576)
+
+    def burst(name, uid, command, runtime=5):
+        machine.succeed(f"systemd-run --unit={name}-client --uid={uid} "
+                        "--setenv=PATH=/run/current-system/sw/bin "
+                        f"--setenv=XDG_RUNTIME_DIR=/run/user/{uid} -- "
+                        f"amc exec --burst --max-ram-usage 32MiB --runtime-max-sec {runtime} --timeout 30 -- "
+                        "/bin/sh -c " + shlex.quote(command))
+
+    burst("burst-a", 1000, "touch /tmp/burst-a-entered; trap '' TERM; sleep 120 & wait")
+    wait_entered("burst-a")
+    state = status()
+    grant = next(r for r in state["reservations"] if r.get("burst"))
+    assert state["committed_bytes"] > state["budget_bytes"]
+    assert state["burst_committed_bytes"] == 32 * 1048576
+    assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
+    machine.succeed("systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    restored = status()
+    assert any(r["id"] == grant["id"] and r["granted"] for r in restored["reservations"])
+    burst("burst-b", 1001, "touch /tmp/burst-b-entered; trap '' TERM; sleep 120 & wait")
+    wait_entered("burst-b")
+    wait_committed(160 * 1048576)
+    # RuntimeMaxSec and bounded final SIGKILL clean descendants without releasing
+    # the still-running normal jobs. A new call cannot erase the durable cooldown.
+    burst("burst-rate", 1001, "touch /tmp/burst-rate-entered", runtime=1)
+    machine.wait_until_succeeds("systemctl show burst-rate-client --property=ActiveState --value | grep -qE 'inactive|failed'", timeout=15)
+    machine.fail("test -f /tmp/burst-rate-entered")
+    assert status()["burst_committed_bytes"] == 0
+    machine.succeed("systemctl stop full-a-client full-b-client full-c-client")
+    wait_committed(0)
+
 machine.succeed("test $(awk '$1 == \"oom_kill\" {print $2}' /proc/vmstat) = 0")

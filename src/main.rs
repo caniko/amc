@@ -2,6 +2,7 @@ mod admission;
 mod config;
 mod control;
 mod helpers;
+mod native_exec;
 mod supervision;
 mod systemd;
 mod telemetry;
@@ -35,6 +36,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Execute a bounded command, optionally requesting short-call burst admission.
+    Exec(native_exec::ExecArgs),
     /// Coordinate production workload reservations across local processes.
     Admission {
         #[command(subcommand)]
@@ -243,6 +246,7 @@ fn main() {
 
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Exec(arguments) => native_exec::execute(arguments),
         Command::Admission { command } => admission::execute(command),
         Command::Supervise { command } => supervision::execute(command),
         Command::Doctor { json } => {

@@ -73,6 +73,12 @@ pub enum AdmissionCommand {
         /// Optional systemd execution deadline for a disposable job, in seconds.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
         runtime_max_sec: Option<u64>,
+        /// Request the policy-defined short-call burst lane.
+        #[arg(long, requires = "max_ram_usage")]
+        burst: bool,
+        /// Explicit per-call hard ceiling, bounded by the selected contract.
+        #[arg(long, value_parser = parse_memory)]
+        max_ram_usage: Option<u64>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -214,12 +220,16 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             contract,
             timeout,
             runtime_max_sec,
+            burst,
+            max_ram_usage,
             command,
         } => run(
             &socket_path(socket)?,
             &contract,
             timeout,
             runtime_max_sec,
+            burst,
+            max_ram_usage,
             &command,
         ),
         AdmissionCommand::Enter {
@@ -263,6 +273,8 @@ fn run(
     contract: &str,
     timeout: u64,
     runtime_max_sec: Option<u64>,
+    burst: bool,
+    max_ram_usage: Option<u64>,
     argv: &[OsString],
 ) -> Result<i32> {
     use amc_runner::systemd::execute;
@@ -270,9 +282,16 @@ fn run(
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let response = call(
         socket,
-        Message::Enqueue {
-            contract: contract.into(),
-            wait_ms: timeout * 1000,
+        match max_ram_usage {
+            Some(memory_max) => Message::EnqueueSized {
+                contract: contract.into(),
+                wait_ms: timeout * 1000,
+                memory_max,
+            },
+            None => Message::Enqueue {
+                contract: contract.into(),
+                wait_ms: timeout * 1000,
+            },
         },
     )?;
     let host_socket = response.host_socket;
@@ -282,6 +301,13 @@ fn run(
     let mut entry = response
         .entry
         .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
+    let runtime_max_sec = match execution_runtime(&entry.contract, burst, runtime_max_sec) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = call(socket, Message::Cancel { id: entry.id });
+            return Err(error);
+        }
+    };
     while entry.phase == Phase::Queued {
         if signals.cancelled().is_some() || Instant::now() >= deadline {
             let _ = call(socket, Message::Cancel { id: entry.id });
@@ -321,12 +347,22 @@ fn run(
         "KillMode=control-group".into(),
         "Restart=no".into(),
         format!("TimeoutStartSec={}s", timeout + 30),
-        "TimeoutStopSec=15s".into(),
+        format!("TimeoutStopSec={}s", if burst { 1 } else { 15 }),
     ] {
         client.arg(format!("--property={property}"));
     }
     if let Some(seconds) = runtime_max_sec {
         client.arg(format!("--property=RuntimeMaxSec={seconds}s"));
+        client.arg("--property=RuntimeRandomizedExtraSec=0");
+    }
+    if burst {
+        client.arg("--property=SendSIGKILL=yes");
+        client.arg("--property=FinalKillSignal=SIGKILL");
+        eprintln!(
+            "AMC burst: {} bytes reserved, {}s native runtime ceiling",
+            entry.contract.memory_max,
+            runtime_max_sec.unwrap_or_default()
+        );
     }
     for (name, _) in std::env::vars_os() {
         let Some(name) = name.to_str() else {
@@ -389,6 +425,48 @@ fn run(
     outcome_exit(outcome, &entry.unit())
 }
 
+pub fn parse_memory(value: &str) -> std::result::Result<u64, String> {
+    let bytes = if let Some((digits, scale)) =
+        [("GB", 1_000_000_000u64), ("MB", 1_000_000), ("KB", 1000)]
+            .into_iter()
+            .find_map(|(suffix, scale)| value.strip_suffix(suffix).map(|digits| (digits, scale)))
+    {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("memory size must be an integral non-negative value".into());
+        }
+        digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(scale))
+            .ok_or("memory size overflow")?
+    } else {
+        crate::config::parse_bytes(value).map_err(|e| e.to_string())?
+    };
+    let bytes = bytes / 4096 * 4096;
+    if bytes == 0 || bytes > i64::MAX as u64 {
+        return Err(
+            "memory ceiling must be positive, <= i64::MAX and 4096-byte aligned (use MiB/GiB)"
+                .into(),
+        );
+    }
+    Ok(bytes)
+}
+
+fn execution_runtime(
+    contract: &amc_admission::ledger::Contract,
+    burst: bool,
+    requested: Option<u64>,
+) -> Result<Option<u64>> {
+    ensure!(
+        contract.burst == burst,
+        "burst flag must match the selected contract"
+    );
+    if let (Some(requested), Some(maximum)) = (requested, contract.runtime_max_sec) {
+        ensure!(requested <= maximum, "requested runtime exceeds contract");
+    }
+    Ok(requested.or(contract.runtime_max_sec))
+}
+
 fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32> {
     use amc_runner::systemd::Outcome;
     match outcome {
@@ -419,6 +497,26 @@ fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32
 mod tests {
     use super::*;
     use amc_runner::systemd::{Cleanup, Outcome};
+
+    #[test]
+    fn declared_decimal_memory_is_rounded_down_and_burst_runtime_cannot_grow() {
+        assert_eq!(parse_memory("512MiB").unwrap(), 536870912);
+        assert_eq!(parse_memory("3GB").unwrap(), 2999996416);
+        assert!(parse_memory("-1GB").is_err());
+        assert!(parse_memory("1KB").is_err());
+        let contract: amc_admission::ledger::Contract = serde_json::from_value(serde_json::json!({
+            "slice": "agent-burst.slice", "memory_max": 536870912, "memory_swap_max": 0,
+            "max_running": 2, "pause_file": null, "burst": true, "runtime_max_sec": 5
+        }))
+        .unwrap();
+        assert_eq!(execution_runtime(&contract, true, None).unwrap(), Some(5));
+        assert_eq!(
+            execution_runtime(&contract, true, Some(2)).unwrap(),
+            Some(2)
+        );
+        assert!(execution_runtime(&contract, true, Some(6)).is_err());
+        assert!(execution_runtime(&contract, false, None).is_err());
+    }
 
     #[test]
     fn unresolved_native_outcome_never_reports_success() {

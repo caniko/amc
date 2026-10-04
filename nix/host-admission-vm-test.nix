@@ -8,6 +8,7 @@
     budget_bytes = 160 * mib;
     reserve_bytes = 64 * mib;
     queue_limit = 16;
+    burst_budget_bytes = 64 * mib;
     contracts = {
       tool = {
         slice = "agent-tools.slice";
@@ -22,6 +23,15 @@
         memory_swap_max = 0;
         max_running = 4;
         pause_file = null;
+      };
+      tool-burst = {
+        slice = "agent-burst.slice";
+        memory_max = 32 * mib;
+        memory_swap_max = 0;
+        max_running = 2;
+        pause_file = null;
+        burst = true;
+        runtime_max_sec = 5;
       };
     };
   });
@@ -43,6 +53,13 @@ in
           resume_ms = 250;
           aging_ms = 1000;
           queue_limit = 16;
+          burst = {
+            budget_bytes = 64 * mib;
+            max_job_bytes = 32 * mib;
+            max_running = 2;
+            max_runtime_ms = 5000;
+            min_interval_ms = 10000;
+          };
           domains =
             (map (uid: {
               name = "tools-${toString uid}";
@@ -51,6 +68,15 @@ in
               ceiling_bytes = 96 * mib;
               swap_bytes = 0;
               fair_share_bytes = 80 * mib;
+            }) [1000 1001])
+            ++ (map (uid: {
+              name = "burst-${toString uid}";
+              inherit uid;
+              cgroup = "/user.slice/user-${toString uid}.slice/user@${toString uid}.service/agent.slice/agent-burst.slice";
+              ceiling_bytes = 32 * mib;
+              swap_bytes = 0;
+              fair_share_bytes = 80 * mib;
+              burst = true;
             }) [1000 1001])
             ++ [
               {
@@ -76,6 +102,10 @@ in
         MemoryMax = "256M";
         MemorySwapMax = 0;
       };
+      systemd.user.slices.agent-burst.sliceConfig = {
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+      };
       systemd.slices.builders.sliceConfig = {
         MemoryMax = "96M";
         MemorySwapMax = 0;
@@ -84,8 +114,8 @@ in
       systemd.services.amc-host-admission.after = ["builders.slice"];
       systemd.user.services.amc-admission = {
         wantedBy = ["default.target"];
-        requires = ["agent-tools.slice"];
-        after = ["agent-tools.slice"];
+        requires = ["agent-tools.slice" "agent-burst.slice"];
+        after = ["agent-tools.slice" "agent-burst.slice"];
         serviceConfig = {
           ExecStart = "${package}/bin/amc admission serve --policy ${userPolicy} --host-socket /run/amc-host/admission.sock";
           Restart = "on-failure";

@@ -35,6 +35,7 @@ rustPlatform.buildRustPackage {
   cargoTestFlags = ["-p" "amc"];
 
   strictDeps = true;
+  passthru.nativeExecVersion = 1;
   nativeBuildInputs = [makeWrapper python3];
   postInstall = ''
     mkdir -p $out/share/amc/examples

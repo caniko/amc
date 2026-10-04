@@ -95,6 +95,7 @@
     nixosModules.default = import ./nix/module.nix;
     nixosModules.host-admission = import ./nix/host-admission-module.nix;
     lib.hostDomainPressureVersion = 1;
+    lib.admissionBurstVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;
