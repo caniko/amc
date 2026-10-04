@@ -5,7 +5,7 @@ use crate::{
     forecast::{Forecast, Report},
     native::{self, Manager, Session, Target},
     policy::{Domain, Lifecycle, Mode, Policy},
-    recovery::{Action, Phase, Recovery, State},
+    recovery::{Action, FailedIdentity, Phase, Recovery, RecoveryIdentity, State},
     store::{Store, atomic_json},
 };
 use amc_admission::{
@@ -40,6 +40,7 @@ struct Seen {
     domain: Domain,
     shown: Option<BTreeMap<String, String>>,
     session: Option<Session>,
+    failed: Option<FailedIdentity>,
     observed_boot_ms: u64,
 }
 enum Discovery {
@@ -48,7 +49,7 @@ enum Discovery {
 }
 enum Work {
     Signal(Target, Signal),
-    Start(Domain, String),
+    Start(Domain, RecoveryIdentity),
 }
 struct WorkResult {
     id: String,
@@ -74,9 +75,11 @@ fn permitted(
         return false;
     };
     if &active.domain != domain
-        || active.identity.invocation != invocation
+        || active.identity.invocation() != invocation
         || domain.lifecycle == Lifecycle::Observe
         || (matches!(kind, Intervention::Start) && domain.lifecycle != Lifecycle::Restart)
+        || (!matches!(kind, Intervention::Start)
+            && !matches!(active.identity, RecoveryIdentity::Process(_)))
     {
         return false;
     }
@@ -133,10 +136,21 @@ fn discover_one(manager: &Manager, domain: &Domain, policy: &Policy, known: &Mut
     } else {
         None
     };
+    let failed = shown
+        .as_ref()
+        .filter(|s| native::field(s, "ActiveState") == "failed")
+        .filter(|_| {
+            known
+                .lock()
+                .ok()
+                .is_some_and(|k| !k.identities.contains_key(&domain.id))
+        })
+        .and_then(|_| manager.failed_identity(domain, policy).ok());
     Seen {
         domain: domain.clone(),
         shown,
         session,
+        failed,
         observed_boot_ms: boot_ms().unwrap_or(0),
     }
 }
@@ -186,7 +200,7 @@ fn actuation_worker(
 ) {
     while let Ok(work) = rx.recv() {
         let (id, invocation) = match &work {
-            Work::Start(d, i) => (d.id.clone(), i.clone()),
+            Work::Start(d, i) => (d.id.clone(), i.invocation().to_owned()),
             Work::Signal(t, _) => (t.domain.id.clone(), t.identity.invocation.clone()),
         };
         let authorized = |domain: &Domain, kind| {
@@ -197,7 +211,7 @@ fn actuation_worker(
                 .is_some_and(|(a, ms)| permitted(a.as_ref(), domain, &invocation, kind, ms))
         };
         let result = match work {
-            Work::Start(domain, _) => manager.start(&domain, || {
+            Work::Start(domain, origin) => manager.start(&domain, &origin, &policy, || {
                 authorized(&domain, Intervention::Start)
                     && host_healthy(&host::snapshot(Path::new("/proc"), None), &policy)
             }),
@@ -353,6 +367,7 @@ pub fn serve(
     let mut models: BTreeMap<String, Forecast> = BTreeMap::new();
     let mut seen: BTreeMap<String, Option<BTreeMap<String, String>>> = BTreeMap::new();
     let mut seen_at: BTreeMap<String, u64> = BTreeMap::new();
+    let mut failures = BTreeMap::new();
     let mut jobs = BTreeSet::new();
     let mut pools_healthy = policy.job_pools.is_empty();
     let mut pools_seen_at = None;
@@ -377,6 +392,11 @@ pub fn serve(
                             sessions.insert(update.domain.id.clone(), session);
                         }
                         seen_at.insert(update.domain.id.clone(), update.observed_boot_ms);
+                        if let Some(failed) = update.failed {
+                            failures.insert(update.domain.id.clone(), failed);
+                        } else {
+                            failures.remove(&update.domain.id);
+                        }
                         seen.insert(update.domain.id, update.shown);
                     }
                     Discovery::Pools(new, healthy, observed) => {
@@ -394,6 +414,7 @@ pub fn serve(
                 wanted(id) || state.active.as_ref().is_some_and(|a| &a.domain.id == id)
             });
             seen_at.retain(|id, _| seen.contains_key(id));
+            failures.retain(|id, _| wanted(id));
             let host = host::snapshot(Path::new("/proc"), Some(ms));
             let available = host_number(&host, "meminfo.MemAvailable");
             let total = host_number(&host, "meminfo.MemTotal");
@@ -554,6 +575,25 @@ pub fn serve(
                     if !inactive && !state.active.as_ref().is_some_and(|a| &a.domain.id == id) {
                         degraded = true;
                     }
+                    if domain.lifecycle == Lifecycle::Restart
+                        && seen
+                            .get(id)
+                            .and_then(|s| s.as_ref())
+                            .is_some_and(|s| native::field(s, "ActiveState") == "failed")
+                    {
+                        let verified = failures.get(id).is_some_and(|identity| {
+                            seen_at
+                                .get(id)
+                                .is_some_and(|at| ms.saturating_sub(*at) <= 3000)
+                                && native::empty_failed_slot(identity).unwrap_or(false)
+                        });
+                        if !verified && !state.active.as_ref().is_some_and(|a| &a.domain.id == id) {
+                            degraded = true;
+                        }
+                        if verified && healthy {
+                            candidates.push((domain.priority, std::cmp::Reverse(0), id.clone()));
+                        }
+                    }
                     reports.push(DomainReport {
                         id: id.clone(),
                         status: if inactive { "inactive" } else { "unenrolled" },
@@ -571,7 +611,7 @@ pub fn serve(
             if results.try_iter().any(|r| {
                 !r.ok
                     && state.active.as_ref().is_some_and(|a| {
-                        a.domain.id == r.id && a.identity.invocation == r.invocation
+                        a.domain.id == r.id && a.identity.invocation() == r.invocation
                     })
             }) && let Some(active) = &mut state.active
             {
@@ -580,14 +620,23 @@ pub fn serve(
             let mut action = Action::None;
             if let Some(active) = &state.active {
                 let shown = seen.get(&active.domain.id).and_then(|s| s.as_ref());
-                let replacement = sessions
-                    .get(&active.domain.id)
-                    .is_some_and(|s| s.identity != active.identity)
-                    || shown.is_some_and(|s| {
-                        !native::field(s, "InvocationID").is_empty()
-                            && native::field(s, "InvocationID") != active.identity.invocation
-                    });
-                let empty = recovering.as_mut().and_then(|s| s.empty()).filter(|_| {
+                let replacement = sessions.get(&active.domain.id).is_some_and(|s| {
+                    RecoveryIdentity::Process(s.identity.clone()) != active.identity
+                }) || shown.is_some_and(|s| {
+                    !native::field(s, "InvocationID").is_empty()
+                        && native::field(s, "InvocationID") != active.identity.invocation()
+                });
+                let empty = match &active.identity {
+                    RecoveryIdentity::Process(_) => recovering.as_mut().and_then(|s| s.empty()),
+                    RecoveryIdentity::Failed(identity) => {
+                        native::empty_failed_slot(identity).ok().filter(|_| {
+                            shown.is_some_and(|s| {
+                                native::failed_matches(s, &active.domain, identity)
+                            })
+                        })
+                    }
+                }
+                .filter(|_| {
                     seen_at
                         .get(&active.domain.id)
                         .is_some_and(|at| ms.saturating_sub(*at) <= 3000)
@@ -612,57 +661,77 @@ pub fn serve(
             if policy.mode == Mode::Enforce && state.active.is_none() && action != Action::Finished
             {
                 candidates.sort();
-                if let Some((_, _, id)) = candidates.first()
-                    && let Some(source) = sessions.remove(id)
-                {
-                    let domain = source.domain.clone();
-                    let identity = source.identity.clone();
-                    if state
-                        .begin(domain.clone(), identity.clone(), now_ms()?, ms, &policy)
-                        .is_err()
-                    {
-                        state.active = Some(Recovery {
-                            domain,
-                            identity,
-                            phase: Phase::Tripped,
+                if let Some((_, _, id)) = candidates.first() {
+                    let source = sessions.remove(id);
+                    let origin = source
+                        .as_ref()
+                        .map(|s| (s.domain.clone(), s.identity.clone().into()))
+                        .or_else(|| {
+                            failures
+                                .get(id)
+                                .cloned()
+                                .zip(policy.domains.iter().find(|d| &d.id == id).cloned())
+                                .map(|(i, d)| (d, RecoveryIdentity::Failed(i)))
                         });
-                    }
-                    recovering = Some(source);
-                    models.remove(id);
-                    // Publish inhibition before durable I/O or any signal.
-                    atomic_json(
-                        &runtime.join("health.json"),
-                        &Health {
-                            version: 1,
-                            boot_id: boot.clone(),
-                            observed_boot_ms: ms,
-                            inhibit: true,
-                            degraded,
-                        },
-                        0o644,
-                        false,
-                    )?;
-                    store.save(&state)?;
-                    *authority
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("recovery authority unavailable"))? =
-                        state.active.clone();
-                    if !matches!(
-                        state.active.as_ref().map(|a| &a.phase),
-                        Some(Phase::Tripped)
-                    ) {
-                        let target = recovering
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("missing recovery source"))?
-                            .target();
-                        if work.try_send(Work::Signal(target, Signal::TERM)).is_err() {
-                            state
-                                .active
-                                .as_mut()
-                                .ok_or_else(|| anyhow::anyhow!("missing recovery"))?
-                                .phase = Phase::Tripped;
+                    if let Some((domain, identity)) = origin {
+                        let begin = match &identity {
+                            RecoveryIdentity::Process(identity) => state.begin(
+                                domain.clone(),
+                                identity.clone(),
+                                now_ms()?,
+                                ms,
+                                &policy,
+                            ),
+                            RecoveryIdentity::Failed(identity) => state.begin_failed(
+                                domain.clone(),
+                                identity.clone(),
+                                now_ms()?,
+                                ms,
+                                &policy,
+                            ),
+                        };
+                        if begin.is_err() {
+                            state.active = Some(Recovery {
+                                domain,
+                                identity,
+                                phase: Phase::Tripped,
+                            });
                         }
-                        eprintln!("amc supervision: persisted intervention for {id}");
+                        recovering = source;
+                        models.remove(id);
+                        // Publish inhibition before durable I/O or any signal.
+                        atomic_json(
+                            &runtime.join("health.json"),
+                            &Health {
+                                version: 1,
+                                boot_id: boot.clone(),
+                                observed_boot_ms: ms,
+                                inhibit: true,
+                                degraded,
+                            },
+                            0o644,
+                            false,
+                        )?;
+                        store.save(&state)?;
+                        *authority
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("recovery authority unavailable"))? =
+                            state.active.clone();
+                        if !matches!(
+                            state.active.as_ref().map(|a| &a.phase),
+                            Some(Phase::Tripped)
+                        ) && let Some(source) = &recovering
+                        {
+                            let target = source.target();
+                            if work.try_send(Work::Signal(target, Signal::TERM)).is_err() {
+                                state
+                                    .active
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow::anyhow!("missing recovery"))?
+                                    .phase = Phase::Tripped;
+                            }
+                            eprintln!("amc supervision: persisted intervention for {id}");
+                        }
                     }
                 }
             }
@@ -680,7 +749,7 @@ pub fn serve(
                         .is_ok()
                 }),
                 Action::Start => state.active.as_ref().is_some_and(|a| {
-                    work.try_send(Work::Start(a.domain.clone(), a.identity.invocation.clone()))
+                    work.try_send(Work::Start(a.domain.clone(), a.identity.clone()))
                         .is_ok()
                 }),
                 Action::Finished => {
@@ -810,20 +879,21 @@ mod tests {
                 inode: 1,
                 pid: 1,
                 start_ticks: 1,
-            },
+            }
+            .into(),
             phase: Phase::Terminating { deadline_ms: 100 },
         };
         assert!(permitted(
             Some(&active),
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Term,
             99
         ));
         assert!(!permitted(
             Some(&active),
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Term,
             100
         ));
@@ -831,14 +901,14 @@ mod tests {
         assert!(!permitted(
             Some(&active),
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Term,
             100
         ));
         assert!(permitted(
             Some(&active),
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Start,
             100
         ));
@@ -853,14 +923,14 @@ mod tests {
         assert!(!permitted(
             Some(&active),
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Start,
             100
         ));
         assert!(!permitted(
             None,
             &domain,
-            &active.identity.invocation,
+            active.identity.invocation(),
             Intervention::Kill,
             100
         ));

@@ -3,7 +3,7 @@
 //! cgroup mutation. A replacement process can never inherit an old pidfd.
 use crate::{
     policy::{Domain, Lifecycle, Mode, Policy},
-    recovery::Identity,
+    recovery::{FailedIdentity, Identity, RecoveryIdentity},
 };
 use amc_admission::{
     ledger::{Ledger, Phase},
@@ -62,7 +62,7 @@ impl Manager {
 
     pub fn show(&self, domain: &Domain) -> Result<BTreeMap<String, String>> {
         let text = capture(self.command(domain)?.args(["show", "--no-pager",
-            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Restart,KillMode,OOMPolicy,TimeoutStopUSec,MemoryMax,MemorySwapMax,Result", "--", &domain.unit]))?;
+            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Slice,Restart,KillMode,OOMPolicy,TimeoutStopUSec,MemoryMax,MemorySwapMax,Result", "--", &domain.unit]))?;
         Ok(text
             .lines()
             .filter_map(|l| l.split_once('='))
@@ -72,7 +72,13 @@ impl Manager {
 
     /// Only issued after original termination, cooldown, current healthy
     /// headroom, durable accounting, and fresh native inactive verification.
-    pub fn start(&self, domain: &Domain, may_start: impl Fn() -> bool) -> Result<()> {
+    pub fn start(
+        &self,
+        domain: &Domain,
+        origin: &RecoveryIdentity,
+        policy: &Policy,
+        may_start: impl Fn() -> bool,
+    ) -> Result<()> {
         ensure!(
             domain.lifecycle == Lifecycle::Restart,
             "only backends may start"
@@ -83,15 +89,35 @@ impl Manager {
             "replacement is already active; refusing start"
         );
         ensure!(
+            field(&shown, "MainPID") == "0"
+                && (field(&shown, "InvocationID") == origin.invocation()
+                    || (matches!(origin, RecoveryIdentity::Process(_))
+                        && field(&shown, "InvocationID").is_empty())),
+            "native invocation changed; refusing start"
+        );
+        if let RecoveryIdentity::Failed(identity) = origin {
+            ensure!(
+                failed_matches(&shown, domain, identity) && empty_failed_slot(identity)?,
+                "failed invocation no longer independently empty"
+            );
+        }
+        ensure!(
             field(&shown, "Restart") == "no"
                 && field(&shown, "KillMode") == "control-group"
-                && field(&shown, "OOMPolicy") == "kill",
+                && field(&shown, "OOMPolicy") == "kill"
+                && cleanup_bounded(&shown, policy),
             "backend lifecycle changed; refusing start"
         );
         ensure!(
             limits_match(&shown, domain),
             "backend hard ceilings changed; refusing start"
         );
+        if let RecoveryIdentity::Process(identity) = origin {
+            ensure!(
+                terminated(self, domain, identity)?,
+                "original process or descendants still present; refusing start"
+            );
+        }
         ensure!(
             may_start(),
             "restart headroom or recovery authority changed"
@@ -304,6 +330,153 @@ impl Target {
     }
 }
 
+impl Manager {
+    /// Cold failure recovery never fabricates a PID or grants signal authority.
+    /// A native slice identifies the exact service slot even after collection;
+    /// its stable parent and empty subtree are verified independently of systemd.
+    pub fn failed_identity(&self, domain: &Domain, policy: &Policy) -> Result<FailedIdentity> {
+        let shown = self.show(domain)?;
+        ensure!(
+            domain.lifecycle == Lifecycle::Restart
+                && domain.expected.is_none()
+                && field(&shown, "LoadState") == "loaded"
+                && field(&shown, "ActiveState") == "failed"
+                && field(&shown, "MainPID") == "0"
+                && !field(&shown, "Result").is_empty()
+                && field(&shown, "Result") != "success"
+                && field(&shown, "Restart") == "no"
+                && field(&shown, "KillMode") == "control-group"
+                && field(&shown, "OOMPolicy") == "kill"
+                && limits_match(&shown, domain)
+                && cleanup_bounded(&shown, policy),
+            "failed backend lacks recovery authority"
+        );
+        let invocation = field(&shown, "InvocationID").to_owned();
+        ensure!(
+            invocation.len() == 32 && invocation.bytes().all(|b| b.is_ascii_hexdigit()),
+            "failed invocation unavailable"
+        );
+        let slice = field(&shown, "Slice");
+        ensure!(
+            slice.ends_with(".slice")
+                && slice
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+            "failed backend slice unavailable"
+        );
+        let mut parent_domain = domain.clone();
+        parent_domain.unit = slice.into();
+        let parent = self.show(&parent_domain)?;
+        ensure!(
+            field(&parent, "LoadState") == "loaded" && field(&parent, "ActiveState") == "active",
+            "failed backend parent unavailable"
+        );
+        let parent = field(&parent, "ControlGroup").to_owned();
+        let parent_directory = cgroup_directory(&parent)?;
+        let parent_inode = fs::metadata(&parent_directory)?.ino();
+        let cgroup = format!("{parent}/{}", domain.unit);
+        ensure!(
+            field(&shown, "ControlGroup").is_empty() || field(&shown, "ControlGroup") == cgroup,
+            "failed backend service slot differs"
+        );
+        let inode = match fs::metadata(cgroup_directory(&cgroup)?) {
+            Ok(metadata) => Some(metadata.ino()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let identity = FailedIdentity {
+            invocation,
+            parent,
+            parent_inode,
+            cgroup,
+            inode,
+        };
+        ensure!(
+            empty_failed_slot(&identity)? && failed_matches(&self.show(domain)?, domain, &identity),
+            "failed backend changed or still populated"
+        );
+        Ok(identity)
+    }
+}
+
+pub fn failed_matches(
+    shown: &BTreeMap<String, String>,
+    domain: &Domain,
+    identity: &FailedIdentity,
+) -> bool {
+    field(shown, "LoadState") == "loaded"
+        && field(shown, "ActiveState") == "failed"
+        && field(shown, "MainPID") == "0"
+        && field(shown, "InvocationID") == identity.invocation
+        && !field(shown, "Result").is_empty()
+        && field(shown, "Result") != "success"
+        && field(shown, "Restart") == "no"
+        && field(shown, "KillMode") == "control-group"
+        && field(shown, "OOMPolicy") == "kill"
+        && limits_match(shown, domain)
+        && (field(shown, "ControlGroup").is_empty()
+            || field(shown, "ControlGroup") == identity.cgroup)
+}
+
+pub fn empty_failed_slot(identity: &FailedIdentity) -> Result<bool> {
+    empty_failed_slot_at(Path::new("/sys/fs/cgroup"), identity)
+}
+
+fn empty_failed_slot_at(root: &Path, identity: &FailedIdentity) -> Result<bool> {
+    // Validate before mapping native absolute cgroup names beneath the mount.
+    cgroup_directory(&identity.parent)?;
+    cgroup_directory(&identity.cgroup)?;
+    let parent = root.join(identity.parent.trim_start_matches('/'));
+    let directory = root.join(identity.cgroup.trim_start_matches('/'));
+    ensure!(
+        directory.parent() == Some(parent.as_path()),
+        "failed service slot is outside its parent"
+    );
+    let parent_matches = || {
+        fs::symlink_metadata(&parent).is_ok_and(|m| m.is_dir() && m.ino() == identity.parent_inode)
+    };
+    ensure!(
+        parent_matches(),
+        "failed service parent replaced or unreadable"
+    );
+    let empty = match fs::symlink_metadata(&directory) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && identity.inode == Some(metadata.ino()),
+                "failed service slot replaced"
+            );
+            let mut reader = PinnedReader::open(&directory)?;
+            ensure!(
+                Some(reader.inode()?) == identity.inode,
+                "failed service slot replaced during pin"
+            );
+            let snapshot = reader.snapshot(&identity.cgroup, None, None);
+            let populated = snapshot
+                .files
+                .get("cgroup.events")
+                .and_then(|m| m.value.as_ref())
+                .and_then(|v| v.get("populated"))
+                .and_then(|v| v.as_u64());
+            ensure!(
+                populated.is_some_and(|p| p <= 1),
+                "failed service population unknown"
+            );
+            ensure!(
+                fs::symlink_metadata(&directory)?.ino() == metadata.ino(),
+                "failed service slot changed during read"
+            );
+            populated == Some(0)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        parent_matches(),
+        "failed service parent changed during read"
+    );
+    Ok(empty)
+}
+
 fn verify_process(domain: &Domain, identity: &Identity) -> Result<()> {
     ensure!(
         process_start(identity.pid)? == identity.start_ticks,
@@ -501,7 +674,9 @@ pub fn terminated(manager: &Manager, domain: &Domain, identity: &Identity) -> Re
     let shown = manager.show(domain)?;
     ensure!(
         matches!(field(&shown, "ActiveState"), "inactive" | "failed")
-            && field(&shown, "MainPID") == "0",
+            && field(&shown, "MainPID") == "0"
+            && (field(&shown, "InvocationID").is_empty()
+                || field(&shown, "InvocationID") == identity.invocation),
         "native unit is active or ambiguous"
     );
     let gone = original_gone(identity)
@@ -574,7 +749,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn restart_requires_current_authorization_and_matching_native_ceilings() {
+    fn restart_requires_fresh_native_authority_and_original_termination() {
         let root = std::env::temp_dir().join(format!(
             "amc-start-{}",
             amc_admission::store::fresh_id().unwrap()
@@ -582,13 +757,13 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let executable = root.join("systemctl");
         let marker = root.join("started");
-        let script = |limit| {
+        let script = |limit, stop| {
             format!(
-                "#!/bin/sh\nif [ \"$2\" = show ]; then\ncat <<'EOF'\nActiveState=inactive\nRestart=no\nKillMode=control-group\nOOMPolicy=kill\nMemoryMax={limit}\nMemorySwapMax=0\nEOF\nelse\n: > '{}'\nfi\n",
+                "#!/bin/sh\nif [ \"$2\" = show ]; then\ncat <<'EOF'\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nInvocationID=\nRestart=no\nKillMode=control-group\nOOMPolicy=kill\nTimeoutStopUSec={stop}\nMemoryMax={limit}\nMemorySwapMax=0\nEOF\nelse\n: > '{}'\nfi\n",
                 marker.display()
             )
         };
-        fs::write(&executable, script(1024)).unwrap();
+        fs::write(&executable, script(1024, "3s")).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let manager = Manager {
             systemctl: executable.clone(),
@@ -603,14 +778,89 @@ mod tests {
             priority: 0,
             expected: None,
         };
-        assert!(manager.start(&domain, || false).is_err());
+        let origin = RecoveryIdentity::Process(Identity {
+            invocation: "a".repeat(32),
+            cgroup: "/fixture.service".into(),
+            inode: 1,
+            pid: 1,
+            start_ticks: 1,
+        });
+        let policy: Policy =
+            serde_json::from_str(include_str!("../../../examples/supervision.json")).unwrap();
+        assert!(manager.start(&domain, &origin, &policy, || false).is_err());
         assert!(!marker.exists());
-        fs::write(&executable, script(2048)).unwrap();
-        assert!(manager.start(&domain, || true).is_err());
+        fs::write(&executable, script(2048, "3s")).unwrap();
+        assert!(manager.start(&domain, &origin, &policy, || true).is_err());
         assert!(!marker.exists());
-        fs::write(&executable, script(1024)).unwrap();
-        manager.start(&domain, || true).unwrap();
+        for stop in ["infinity", "21s", "", "0"] {
+            fs::write(&executable, script(1024, stop)).unwrap();
+            assert!(manager.start(&domain, &origin, &policy, || true).is_err());
+            assert!(!marker.exists());
+        }
+        fs::write(&executable, script(1024, "3s")).unwrap();
+        let live = RecoveryIdentity::Process(Identity {
+            pid: std::process::id() as i32,
+            start_ticks: process_start(std::process::id() as i32).unwrap(),
+            ..match &origin {
+                RecoveryIdentity::Process(i) => i.clone(),
+                _ => unreachable!(),
+            }
+        });
+        assert!(manager.start(&domain, &live, &policy, || true).is_err());
+        assert!(!marker.exists());
+        fs::write(
+            &executable,
+            script(1024, "3s").replace(
+                "InvocationID=\n",
+                &format!("InvocationID={}\n", "b".repeat(32)),
+            ),
+        )
+        .unwrap();
+        let RecoveryIdentity::Process(identity) = &origin else {
+            unreachable!()
+        };
+        assert!(terminated(&manager, &domain, identity).is_err());
+        assert!(manager.start(&domain, &origin, &policy, || true).is_err());
+        assert!(!marker.exists());
+        fs::write(&executable, script(1024, "3s")).unwrap();
+        manager.start(&domain, &origin, &policy, || true).unwrap();
         assert!(marker.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn failed_service_needs_an_independently_empty_unreplaced_native_slot() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-failed-slot-{}",
+            amc_admission::store::fresh_id().unwrap()
+        ));
+        let parent = root.join("system.slice");
+        let slot = parent.join("fixture.service");
+        fs::create_dir_all(&slot).unwrap();
+        let mut identity = FailedIdentity {
+            invocation: "a".repeat(32),
+            parent: "/system.slice".into(),
+            parent_inode: fs::metadata(&parent).unwrap().ino(),
+            cgroup: "/system.slice/fixture.service".into(),
+            inode: Some(fs::metadata(&slot).unwrap().ino()),
+        };
+        fs::write(slot.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(!empty_failed_slot_at(&root, &identity).unwrap());
+        fs::write(slot.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).unwrap());
+        fs::write(slot.join("cgroup.events"), "not population evidence\n").unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).is_err());
+        fs::rename(&slot, parent.join("old.service")).unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).unwrap());
+        fs::create_dir(&slot).unwrap();
+        fs::write(slot.join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).is_err());
+        identity.inode = None;
+        assert!(empty_failed_slot_at(&root, &identity).is_err());
+        fs::remove_dir_all(&slot).unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).unwrap());
+        fs::rename(&parent, root.join("old.slice")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        assert!(empty_failed_slot_at(&root, &identity).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

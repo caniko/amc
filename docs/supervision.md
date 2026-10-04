@@ -117,11 +117,21 @@ in-memory authority after its manager query. Queued, expired or revoked actions
 cannot inherit a replacement phase. Failed queries, unavailable workers,
 unknown termination and exhausted budgets trip rather than broaden authority.
 
+Dispatch also rechecks the bounded native stop timeout and independently proves
+that the original process and descendants are gone. A backend first discovered
+in a failed state uses its retained invocation and verified empty service slot;
+it enters cooldown without acquiring signal authority. Loss of cleanup evidence
+during cooldown trips rather than authorizing a start.
+
 Attempts survive supervisor restart/reboot and policy edits. The accounting
 window only grows: shortening policy does not forgive existing recovery
 history. A backwards wall clock forbids another attempt; cross-boot accounting
 assumes a trustworthy wall clock. Persisted in-flight recovery becomes `tripped`
 on startup and is never replayed automatically.
+
+Disposable jobs share the recovery budget of their enrolled pool across UUID
+ticket changes. Persisted per-ticket history is migrated into that same pool
+budget without forgiving consumed attempts.
 
 To reconcile a trip, stop the supervisor and resolve the native domain first:
 
