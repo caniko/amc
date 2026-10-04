@@ -17,6 +17,36 @@ pub struct HostPolicy {
     pub aging_ms: u64,
     pub queue_limit: usize,
     pub domains: Vec<Domain>,
+    /// Optional, separately bounded short-call allowance above the normal budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<BurstPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BurstPolicy {
+    pub budget_bytes: u64,
+    pub max_job_bytes: u64,
+    pub max_running: usize,
+    pub max_runtime_ms: u64,
+    /// Per-UID start interval; survives broker restart and completed jobs.
+    pub min_interval_ms: u64,
+}
+
+impl BurstPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.budget_bytes > 0
+                && self.budget_bytes <= i64::MAX as u64
+                && self.max_job_bytes > 0
+                && self.max_job_bytes <= self.budget_bytes
+                && (1..=8).contains(&self.max_running)
+                && (1000..=30_000).contains(&self.max_runtime_ms)
+                && (self.max_runtime_ms + 1000..=3_600_000).contains(&self.min_interval_ms),
+            "invalid short-call burst policy"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -37,6 +67,9 @@ pub struct Domain {
     /// Additional host RAM floor; ceiling-backed reservations still apply.
     #[serde(default)]
     pub min_available_bytes: u64,
+    /// Only this enrolled subtree can use the burst allowance.
+    #[serde(default, skip_serializing_if = "crate::ledger::is_false")]
+    pub burst: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -68,6 +101,15 @@ impl HostPolicy {
                 "invalid host PSI percentage"
             );
         }
+        if let Some(burst) = &self.burst {
+            burst.validate()?;
+            ensure!(
+                self.budget_bytes
+                    .checked_add(burst.budget_bytes)
+                    .is_some_and(|total| total <= i64::MAX as u64),
+                "host burst budget overflow"
+            );
+        }
         let mut names = BTreeSet::new();
         for d in &self.domains {
             ensure!(
@@ -83,6 +125,16 @@ impl HostPolicy {
                     && d.fair_share_bytes > 0,
                 "host domain cannot fit budget"
             );
+            if d.burst {
+                let burst = self
+                    .burst
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("burst domain needs burst policy"))?;
+                ensure!(
+                    d.uid != 0 && d.swap_bytes == 0 && d.ceiling_bytes <= burst.max_job_bytes,
+                    "burst domain must be a small zero-swap user execution domain"
+                );
+            }
             for other in &self.domains {
                 ensure!(
                     d.name == other.name
@@ -124,6 +176,11 @@ pub struct Reservation {
     /// Root execution owners may share one already-bounded aggregate pool.
     #[serde(default)]
     pub owners: Vec<crate::ledger::ClientIdentity>,
+    #[serde(default, skip_serializing_if = "crate::ledger::is_false")]
+    pub burst: bool,
+    /// Native manager-observed deadline, never a client's duration prediction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_max_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,6 +189,8 @@ pub struct HostLedger {
     pub version: u32,
     pub boot_id: String,
     pub reservations: Vec<Reservation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub burst_last_granted: BTreeMap<u32, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -144,6 +203,10 @@ pub enum WaitReason {
     AncestorHeadroom,
     AgedRequest,
     Unknown,
+    BurstPolicy,
+    BurstBudget,
+    BurstConcurrency,
+    BurstRate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -161,12 +224,15 @@ impl HostLedger {
             version: 1,
             boot_id,
             reservations: Vec::new(),
+            burst_last_granted: BTreeMap::new(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.version == 1 && self.reservations.len() <= 256,
+            self.version == 1
+                && self.reservations.len() <= 256
+                && self.burst_last_granted.len() <= 256,
             "invalid host ledger"
         );
         let mut ids = BTreeSet::new();
@@ -191,6 +257,17 @@ impl HostLedger {
                 "invalid host reservation"
             );
             ensure!(
+                if r.burst {
+                    r.identity.uid != 0
+                        && r.swap_bytes == 0
+                        && r.runtime_max_ms
+                            .is_some_and(|ms| (1..=30_000).contains(&ms))
+                } else {
+                    r.runtime_max_ms.is_none()
+                },
+                "invalid burst reservation proof"
+            );
+            ensure!(
                 (1..=256).contains(&r.owners.len())
                     && r.owners.iter().all(|o| o.pid > 0 && o.start_ticks > 0),
                 "invalid native execution owners"
@@ -206,6 +283,49 @@ impl HostLedger {
             .fold(0u64, |sum, r| sum.saturating_add(r.memory_bytes))
     }
 
+    pub fn burst_committed(&self) -> u64 {
+        self.reservations
+            .iter()
+            .filter(|r| r.granted && r.burst)
+            .fold(0u64, |sum, r| sum.saturating_add(r.memory_bytes))
+    }
+
+    fn burst_wait(&self, r: &Reservation, policy: &HostPolicy, now: u64) -> Option<WaitReason> {
+        let Some(burst) = &policy.burst else {
+            return Some(WaitReason::BurstPolicy);
+        };
+        if r.memory_bytes > burst.max_job_bytes
+            || r.swap_bytes != 0
+            || !r
+                .runtime_max_ms
+                .is_some_and(|ms| ms > 0 && ms <= burst.max_runtime_ms)
+            || !policy
+                .domains
+                .iter()
+                .any(|d| d.name == r.domain && d.uid == r.identity.uid && d.burst)
+        {
+            Some(WaitReason::BurstPolicy)
+        } else if r.memory_bytes > burst.budget_bytes.saturating_sub(self.burst_committed()) {
+            Some(WaitReason::BurstBudget)
+        } else if self
+            .reservations
+            .iter()
+            .filter(|r| r.granted && r.burst)
+            .count()
+            >= burst.max_running
+        {
+            Some(WaitReason::BurstConcurrency)
+        } else if self
+            .burst_last_granted
+            .get(&r.identity.uid)
+            .is_some_and(|last| now.saturating_sub(*last) < burst.min_interval_ms)
+        {
+            Some(WaitReason::BurstRate)
+        } else {
+            None
+        }
+    }
+
     /// Idempotent retries bind to the native identity, not the socket lifetime.
     pub fn request(&mut self, reservation: Reservation, policy: &HostPolicy) -> Result<String> {
         let domain = policy
@@ -213,6 +333,30 @@ impl HostLedger {
             .iter()
             .find(|d| d.name == reservation.domain && d.uid == reservation.identity.uid)
             .ok_or_else(|| anyhow::anyhow!("unknown host domain"))?;
+        ensure!(
+            reservation.burst == domain.burst,
+            "native burst class mismatch"
+        );
+        if reservation.burst {
+            let burst = policy
+                .burst
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("burst admission is disabled"))?;
+            ensure!(
+                reservation.identity.uid != 0
+                    && reservation.swap_bytes == 0
+                    && reservation.memory_bytes <= burst.max_job_bytes
+                    && reservation
+                        .runtime_max_ms
+                        .is_some_and(|ms| ms > 0 && ms <= burst.max_runtime_ms),
+                "burst requires a small zero-swap boundary and verified short native deadline"
+            );
+        } else {
+            ensure!(
+                reservation.runtime_max_ms.is_none(),
+                "unexpected burst deadline proof"
+            );
+        }
         ensure!(
             reservation.memory_bytes > 0
                 && reservation.memory_bytes <= domain.ceiling_bytes
@@ -246,7 +390,9 @@ impl HostLedger {
                         && reservation.identity.uid == 0
                         && r.domain == reservation.domain))
                     && r.memory_bytes == reservation.memory_bytes
-                    && r.swap_bytes == reservation.swap_bytes,
+                    && r.swap_bytes == reservation.swap_bytes
+                    && r.burst == reservation.burst
+                    && r.runtime_max_ms == reservation.runtime_max_ms,
                 "native identity or ceiling changed"
             );
             let owner = crate::ledger::ClientIdentity {
@@ -286,6 +432,9 @@ impl HostLedger {
     ) -> BTreeMap<String, WaitReason> {
         self.reservations
             .retain(|r| r.granted || now < r.deadline_ms);
+        // Every supported cooldown is <= one hour; older history can be pruned.
+        self.burst_last_granted
+            .retain(|_, last| now.saturating_sub(*last) <= 3_600_000);
         healthy_since.retain(|name, _| policy.domains.iter().any(|d| &d.name == name));
         for domain in &policy.domains {
             let healthy = capacity.is_some_and(|c| {
@@ -305,6 +454,7 @@ impl HostLedger {
         }
         let mut waiting = BTreeMap::new();
         let mut aged_block = false;
+        let mut burst_aged_block = false;
         let mut pending: Vec<_> = (0..self.reservations.len())
             .filter(|i| !self.reservations[*i].granted)
             .collect();
@@ -350,13 +500,21 @@ impl HostLedger {
             let ready = healthy_since
                 .get(&r.domain)
                 .is_some_and(|since| now.saturating_sub(*since) >= policy.resume_ms);
+            let burst_wait = r.burst.then(|| self.burst_wait(r, policy, now)).flatten();
+            let budget = policy.budget_bytes.saturating_add(if r.burst {
+                policy.burst.as_ref().map_or(0, |b| b.budget_bytes)
+            } else {
+                0
+            });
             let reason = if capacity.is_none() {
                 Some(WaitReason::Unknown)
             } else if !ready {
                 Some(WaitReason::Pressure)
-            } else if aged_block {
+            } else if let Some(reason) = burst_wait {
+                Some(reason)
+            } else if aged_block && (!r.burst || burst_aged_block) {
                 Some(WaitReason::AgedRequest)
-            } else if r.memory_bytes > policy.budget_bytes.saturating_sub(committed) {
+            } else if r.memory_bytes > budget.saturating_sub(committed) {
                 Some(WaitReason::Budget)
             } else if r.memory_bytes
                 > capacity
@@ -391,10 +549,34 @@ impl HostLedger {
             if let Some(reason) = reason {
                 // An aged request whose own pressure gate is closed cannot
                 // veto healthy peers. Capacity/fairness waits still age-block.
-                aged_block |= reason != WaitReason::Pressure
+                aged_block |= !r.burst
+                    && reason != WaitReason::Pressure
                     && now.saturating_sub(r.requested_ms) >= policy.aging_ms;
+                // A waiting bulk job that could fit once bursts drain must get
+                // that quiet window. A full normal budget can still serve bursts.
+                if !r.burst
+                    && reason != WaitReason::Pressure
+                    && now.saturating_sub(r.requested_ms) >= policy.aging_ms
+                {
+                    let burst_committed = self.burst_committed();
+                    let normal_committed = committed.saturating_sub(burst_committed);
+                    // If even reclaiming every burst byte cannot make this
+                    // request fit, an aged bulk wait must not veto diagnostics.
+                    // This is only a backfill veto, never headroom for a grant.
+                    let possible_host_bytes = capacity
+                        .map_or(0, |c| c.available_bytes)
+                        .saturating_add(burst_committed)
+                        .saturating_sub(policy.reserve_bytes)
+                        .saturating_sub(normal_committed);
+                    burst_aged_block |= r.memory_bytes
+                        <= policy.budget_bytes.saturating_sub(normal_committed)
+                        && r.memory_bytes <= possible_host_bytes;
+                }
                 waiting.insert(r.id.clone(), reason);
             } else {
+                if r.burst {
+                    self.burst_last_granted.insert(r.identity.uid, now);
+                }
                 self.reservations[i].granted = true;
             }
         }

@@ -112,6 +112,7 @@ fn policy() -> HostPolicy {
         resume_ms: 250,
         aging_ms: 1000,
         queue_limit: 32,
+        burst: None,
         domains: (1000..=1003)
             .map(|uid| Domain {
                 name: format!("tools-{uid}"),
@@ -122,6 +123,7 @@ fn policy() -> HostPolicy {
                 fair_share_bytes: 40,
                 io_pressure: IoPressure::Enforce,
                 min_available_bytes: 0,
+                burst: false,
             })
             .collect(),
     }
@@ -143,6 +145,8 @@ fn job(id: &str, uid: u32, bytes: u64) -> Reservation {
         deadline_ms: 10_000,
         granted: false,
         owners: vec![],
+        burst: false,
+        runtime_max_ms: None,
     }
 }
 fn capacity() -> Option<Capacity> {
@@ -294,6 +298,7 @@ fn independent_root_handlers_join_one_bounded_pool_without_releasing_each_other(
         fair_share_bytes: 40,
         io_pressure: IoPressure::Enforce,
         min_available_bytes: 0,
+        burst: false,
     });
     p.validate().unwrap();
     let mut l = HostLedger::new("boot".into());

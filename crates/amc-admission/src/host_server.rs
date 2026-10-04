@@ -44,6 +44,12 @@ pub struct Response {
     pub ticket: Option<String>,
     pub waiting: Option<WaitReason>,
     pub committed_bytes: u64,
+    #[serde(default)]
+    pub budget_bytes: u64,
+    #[serde(default)]
+    pub burst_budget_bytes: u64,
+    #[serde(default)]
+    pub burst_committed_bytes: u64,
     pub reservations: Option<Vec<Reservation>>,
     pub error: Option<String>,
 }
@@ -119,7 +125,12 @@ pub fn verify_entry(
                 && r.identity.cgroup == identity.cgroup
                 && r.identity.inode == identity.inode
                 && r.memory_bytes == contract.memory_max
-                && r.swap_bytes == contract.memory_swap_max)),
+                && r.swap_bytes == contract.memory_swap_max
+                && r.burst == contract.burst
+                && (!r.burst
+                    || r.runtime_max_ms.is_some_and(|ms| contract
+                        .runtime_max_sec
+                        .is_some_and(|seconds| ms <= seconds * 1000))))),
         "native entry has no matching durable host reservation"
     );
     Ok(())
@@ -241,6 +252,9 @@ pub fn serve_supervised(
                     let mut reply = Response {
                         version: 1,
                         committed_bytes: ledger.committed(),
+                        budget_bytes: policy.budget_bytes,
+                        burst_budget_bytes: policy.burst.as_ref().map_or(0, |b| b.budget_bytes),
+                        burst_committed_bytes: ledger.burst_committed(),
                         ..Default::default()
                     };
                     match request {
@@ -282,6 +296,16 @@ pub fn serve_supervised(
                                     )?
                                 };
                             let now = crate::clock::boot_ms()?;
+                            let burst = policy
+                                .domains
+                                .iter()
+                                .find(|d| d.name == domain)
+                                .is_some_and(|d| d.burst);
+                            let runtime_max_ms = if burst {
+                                Some(host_native::burst_runtime(&identity)?)
+                            } else {
+                                None
+                            };
                             let id = ledger.request(
                                 Reservation {
                                     id: fresh_id()?,
@@ -293,6 +317,8 @@ pub fn serve_supervised(
                                     deadline_ms: now.saturating_add(wait_ms),
                                     granted: false,
                                     owners: vec![],
+                                    burst,
+                                    runtime_max_ms,
                                 },
                                 &policy,
                             )?;

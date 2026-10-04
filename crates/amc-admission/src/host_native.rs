@@ -127,7 +127,52 @@ pub fn enforcement(r: &crate::host::Reservation) -> Option<()> {
     {
         return None;
     }
+    if r.burst && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
+        return None;
+    }
     Some(())
+}
+
+/// Query the execution owner's actual manager, rather than trusting an estimate
+/// or the submitting helper's argv. The root broker can address each user bus.
+pub fn burst_runtime(identity: &Identity) -> Result<u64> {
+    let text = amc_runner::systemd::capture(std::process::Command::new("systemctl").args([
+        "--user", &format!("--machine={}@.host", identity.uid), "show", "--no-pager",
+        "--property=ControlGroup,MainPID,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal,Restart,KillMode,OOMPolicy",
+        "--", Path::new(&identity.cgroup).file_name().and_then(|s| s.to_str()).context("missing burst unit")?,
+    ]))?;
+    let runtime = verified_burst_runtime(&text, identity)?;
+    ensure!(
+        process_start(identity.pid)? == identity.start_ticks,
+        "burst process identity changed"
+    );
+    Ok(runtime)
+}
+
+fn verified_burst_runtime(text: &str, identity: &Identity) -> Result<u64> {
+    let fields: std::collections::BTreeMap<_, _> =
+        text.lines().filter_map(|l| l.split_once('=')).collect();
+    let get = |name| fields.get(name).copied().unwrap_or("");
+    ensure!(
+        get("ControlGroup") == identity.cgroup
+            && get("MainPID").parse::<i32>()? == identity.pid
+            && get("Restart") == "no"
+            && get("KillMode") == "control-group"
+            && get("OOMPolicy") == "kill"
+            && get("SendSIGKILL") == "yes"
+            && get("FinalKillSignal") == "9"
+            && crate::native::duration_us(get("RuntimeRandomizedExtraUSec")) == Some(0)
+            && crate::native::duration_us(get("TimeoutStopUSec"))
+                .is_some_and(|timeout| timeout > 0 && timeout <= 1_000_000),
+        "burst native identity or cleanup enforcement mismatch"
+    );
+    let micros = crate::native::duration_us(get("RuntimeMaxUSec"))
+        .context("missing finite native runtime")?;
+    ensure!(
+        micros > 0 && micros <= 30_000_000 && micros.is_multiple_of(1000),
+        "burst requires a finite short native deadline"
+    );
+    Ok(micros / 1000)
 }
 
 pub fn owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
@@ -290,6 +335,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn burst_deadline_requires_native_identity_and_bounded_cleanup() {
+        let identity = Identity {
+            cgroup: "/burst/job.service".into(),
+            inode: 1,
+            uid: 1000,
+            pid: 42,
+            start_ticks: 1,
+        };
+        let valid = "ControlGroup=/burst/job.service\nMainPID=42\nRestart=no\nKillMode=control-group\nOOMPolicy=kill\nSendSIGKILL=yes\nFinalKillSignal=9\nRuntimeMaxUSec=5s\nRuntimeRandomizedExtraUSec=0\nTimeoutStopUSec=1s\n";
+        assert_eq!(verified_burst_runtime(valid, &identity).unwrap(), 5000);
+        for (before, after) in [
+            ("MainPID=42", "MainPID=43"),
+            ("Restart=no", "Restart=always"),
+            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=infinity"),
+            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=30s 1us"),
+            (
+                "RuntimeRandomizedExtraUSec=0",
+                "RuntimeRandomizedExtraUSec=1s",
+            ),
+            ("TimeoutStopUSec=1s", "TimeoutStopUSec=15s"),
+            ("TimeoutStopUSec=1s", "TimeoutStopUSec=0"),
+            ("SendSIGKILL=yes", "SendSIGKILL=no"),
+            ("FinalKillSignal=9", "FinalKillSignal=19"),
+        ] {
+            assert!(
+                verified_burst_runtime(&valid.replace(before, after), &identity).is_err(),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
     fn shared_ancestor_swap_cannot_be_spent_twice_with_ample_host_swap() {
         use crate::host::{HostLedger, HostPolicy, Reservation, WaitReason};
         let root = std::env::temp_dir().join(format!(
@@ -335,6 +412,8 @@ mod tests {
                         deadline_ms: 10_000,
                         granted: false,
                         owners: vec![],
+                        burst: false,
+                        runtime_max_ms: None,
                     },
                     &policy,
                 )
@@ -450,6 +529,8 @@ mod tests {
                 pid,
                 start_ticks: ticks,
             }],
+            burst: false,
+            runtime_max_ms: None,
         };
         assert_eq!(empty_reservation(&r), Some(false));
         r.owners.insert(

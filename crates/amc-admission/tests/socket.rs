@@ -51,6 +51,7 @@ fn policy() -> Policy {
         budget_bytes: 1000,
         reserve_bytes: 100,
         queue_limit: 16,
+        burst_budget_bytes: 0,
         contracts: BTreeMap::from([(
             "tool".into(),
             Contract {
@@ -59,6 +60,8 @@ fn policy() -> Policy {
                 memory_swap_max: 0,
                 max_running: 2,
                 pause_file: None,
+                burst: false,
+                runtime_max_sec: None,
             },
         )]),
     }
@@ -264,6 +267,80 @@ fn invalid_protocol_never_allocates_capacity() {
             .unwrap()
             .entries
             .is_empty()
+    );
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sized_wire_calls_shrink_contracts_and_bursts_require_a_host_broker() {
+    let root = std::env::temp_dir().join(format!("amc-sized-{}", fresh_id().unwrap()));
+    let socket = root.join("run/admission.sock");
+    let done = Arc::new(AtomicBool::new(false));
+    let server = thread::spawn({
+        let root = root.clone();
+        let done = done.clone();
+        move || {
+            let mut p = policy();
+            p.burst_budget_bytes = 100;
+            p.contracts.insert(
+                "burst".into(),
+                Contract {
+                    slice: "agent-burst.slice".into(),
+                    memory_max: 100,
+                    memory_swap_max: 0,
+                    max_running: 1,
+                    pause_file: None,
+                    burst: true,
+                    runtime_max_sec: Some(5),
+                },
+            );
+            serve(
+                p,
+                &root.join("run/admission.sock"),
+                &root.join("state"),
+                Fake {
+                    terminated: Arc::new(AtomicBool::new(false)),
+                },
+                || done.load(Ordering::SeqCst),
+            )
+        }
+    });
+    wait(|| call(&socket, Message::Status).is_ok());
+    let entry = call(
+        &socket,
+        Message::EnqueueSized {
+            contract: "tool".into(),
+            wait_ms: 5000,
+            memory_max: 100,
+        },
+    )
+    .unwrap()
+    .entry
+    .unwrap();
+    assert_eq!(entry.contract.memory_max, 100);
+    for (contract, memory_max) in [("tool", 0), ("tool", 601), ("burst", 100)] {
+        assert!(
+            call(
+                &socket,
+                Message::EnqueueSized {
+                    contract: contract.into(),
+                    wait_ms: 5000,
+                    memory_max,
+                }
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(
+        call(&socket, Message::Status)
+            .unwrap()
+            .status
+            .unwrap()
+            .entries
+            .len(),
+        1
     );
     done.store(true, Ordering::SeqCst);
     server.join().unwrap().unwrap();

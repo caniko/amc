@@ -218,6 +218,8 @@ mod host_tests {
                 pid: 123,
                 start_ticks: 5,
             }],
+            burst: false,
+            runtime_max_ms: None,
         });
         store.save_snapshot(&ledger).unwrap();
         assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());

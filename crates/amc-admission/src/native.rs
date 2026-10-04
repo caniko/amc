@@ -68,11 +68,40 @@ pub fn cgroup_directory(path: &str) -> Result<PathBuf> {
     Ok(Path::new("/sys/fs/cgroup").join(relative))
 }
 
+/// `systemctl show` renders USec properties as timespans (e.g. `5s 500ms`).
+/// Parse exact integral microseconds, rejecting infinity, overflow and negatives.
+pub fn duration_us(text: &str) -> Option<u64> {
+    if text == "0" {
+        return Some(0);
+    }
+    let mut total = 0u64;
+    let mut present = false;
+    for part in text.split_whitespace() {
+        let (digits, scale) = [
+            ("min", 60_000_000u64),
+            ("ms", 1000),
+            ("us", 1),
+            ("µs", 1),
+            ("s", 1_000_000),
+            ("h", 3_600_000_000),
+            ("d", 86_400_000_000),
+        ]
+        .into_iter()
+        .find_map(|(suffix, scale)| part.strip_suffix(suffix).map(|n| (n, scale)))?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        total = total.checked_add(digits.parse::<u64>().ok()?.checked_mul(scale)?)?;
+        present = true;
+    }
+    present.then_some(total)
+}
+
 impl Systemd {
     fn show(&self, unit: &str) -> Result<BTreeMap<String, String>> {
         let text = capture(Command::new(&self.systemctl).args([
             "--user", "show", "--no-pager",
-            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Slice,Restart,KillMode,OOMPolicy",
+            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Slice,Restart,KillMode,OOMPolicy,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal",
             "--", unit,
         ]))?;
         Ok(text
@@ -147,6 +176,23 @@ impl Native for Systemd {
                 && field(&unit, "OOMPolicy") == "kill",
             "wrong workload lifecycle"
         );
+        if let Some(seconds) = entry.contract.runtime_max_sec {
+            ensure!(
+                duration_us(field(&unit, "RuntimeMaxUSec"))
+                    .is_some_and(|runtime| runtime > 0 && runtime <= seconds * 1_000_000)
+                    && duration_us(field(&unit, "RuntimeRandomizedExtraUSec")) == Some(0),
+                "native runtime deadline mismatch"
+            );
+        }
+        if entry.contract.burst {
+            ensure!(
+                duration_us(field(&unit, "TimeoutStopUSec"))
+                    .is_some_and(|timeout| timeout > 0 && timeout <= 1_000_000)
+                    && field(&unit, "SendSIGKILL") == "yes"
+                    && field(&unit, "FinalKillSignal") == "9",
+                "burst cleanup deadline mismatch"
+            );
+        }
         let cgroup = field(&unit, "ControlGroup");
         let process = fs::read_to_string(format!("/proc/{peer_pid}/cgroup"))?;
         ensure!(
@@ -226,5 +272,38 @@ impl Native for Systemd {
             &entry.unit(),
         ]))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_timespans_are_exact_and_unknown_deadlines_fail_closed() {
+        for (text, expected) in [
+            ("0", 0),
+            ("5s", 5_000_000),
+            ("1s 500ms", 1_500_000),
+            ("30s 1us", 30_000_001),
+            ("1min 2s", 62_000_000),
+            ("1µs", 1),
+        ] {
+            assert_eq!(duration_us(text), Some(expected), "{text}");
+        }
+        for text in [
+            "",
+            "infinity",
+            "5000000",
+            "-1s",
+            "+1s",
+            "NaNs",
+            "1.5s",
+            "1s unknown",
+            "18446744073709551615s",
+            "18446744073709551615us 1us",
+        ] {
+            assert_eq!(duration_us(text), None, "{text}");
+        }
     }
 }
