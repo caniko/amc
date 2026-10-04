@@ -87,7 +87,8 @@ def call(op):
         r = json.loads(s.makefile().readline())
     assert not r["error"], r
     return r
-entry = call({"op":"enqueue","contract":"small","wait_ms":10000})["entry"]
+ticket = call({"op":"enqueue","contract":"small","wait_ms":10000})
+entry = ticket["entry"]
 for _ in range(40):
     entry = call({"op":"poll","id":entry["id"]})["entry"]
     if entry["phase"] == "reserved":
@@ -98,7 +99,7 @@ r = subprocess.run(["systemd-run","--user","--wait","--pipe","--service-type=exe
     "--unit=app-amc-job-"+entry["id"]+".service","--property=Slice=agent-tools.slice",
     "--property=MemoryMax=33554432","--property=MemorySwapMax=0","--property=Restart=no",
     "--property=KillMode=control-group","--property=OOMPolicy=kill","--","amc","admission","enter","--socket",path,
-    "--ticket",entry["id"],"--","touch","/tmp/bypassed"], capture_output=True, text=True)
+    "--ticket",entry["id"],"--entry-key",ticket["entry_key"],"--","touch","/tmp/bypassed"], capture_output=True, text=True)
 assert r.returncode != 0, r
 assert "native entry has no matching durable host reservation" in r.stdout + r.stderr, r
 call({"op":"cancel","id":entry["id"]})

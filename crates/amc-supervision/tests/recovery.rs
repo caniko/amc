@@ -1,6 +1,6 @@
 use amc_supervision::{
     forecast::Settings,
-    policy::{Domain, Lifecycle, Mode, Policy},
+    policy::{Domain, JobPool, Lifecycle, Mode, Policy},
     recovery::{Action, Identity, Phase, State},
 };
 
@@ -209,4 +209,52 @@ fn chronological_replay_reproduces_growth_and_rejects_reordered_frames() {
     assert!(summary["backend"].strong > 0);
     let reversed = trace.lines().rev().collect::<Vec<_>>().join("\n");
     assert!(replay::run(std::io::Cursor::new(reversed)).is_err());
+}
+
+#[test]
+fn readmission_and_legacy_history_share_the_enrolled_pool_budget() {
+    let mut p = policy();
+    p.job_pools.push(JobPool {
+        id: "tools".into(),
+        uid: 1000,
+        state: "/private-admission".into(),
+        contracts: vec!["read".into()],
+        lifecycle: Lifecycle::Terminate,
+        priority: 0,
+    });
+    let mut s = state();
+    for i in 0..2 {
+        let mut job = domain(Lifecycle::Terminate);
+        job.id = format!("tools-{i:032x}");
+        s.begin(job, identity(), i, i, &p).unwrap();
+        s.active = None;
+    }
+    // A persisted pre-upgrade invocation still consumes the same allowance.
+    s.attempts[0].domain = format!("tools-{:032x}", 0);
+    let mut next = domain(Lifecycle::Terminate);
+    next.id = format!("tools-{:032x}", 2);
+    assert!(s.begin(next, identity(), 2, 2, &p).is_err());
+    assert_eq!(s.attempts.len(), 2);
+}
+
+#[test]
+fn a_healthy_replacement_must_be_observed_before_the_start_deadline() {
+    let p = policy();
+    for (observed, action) in [
+        (199, Action::Finished),
+        (200, Action::Trip),
+        (201, Action::Trip),
+    ] {
+        let mut s = state();
+        s.begin(domain(Lifecycle::Restart), identity(), 0, 0, &p)
+            .unwrap();
+        s.active.as_mut().unwrap().phase = Phase::Starting { deadline_ms: 200 };
+        assert_eq!(
+            s.advance(observed, Some(true), true, true, true, &p),
+            action
+        );
+        if action == Action::Trip {
+            assert!(matches!(s.active.as_ref().unwrap().phase, Phase::Tripped));
+        }
+    }
 }

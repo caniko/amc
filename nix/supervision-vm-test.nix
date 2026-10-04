@@ -49,11 +49,44 @@
         blocks.append(bytearray(1024 * 1024))
         time.sleep(1)
   '';
+  heartbeatProbe = pkgs.writeText "amc-supervision-heartbeat-test.py" (builtins.readFile ./supervision-heartbeat-test.py);
 in
   (pkgs.testers.runNixOSTest {
     name = "amc-supervision";
     nodes.machine = {
-      imports = [module];
+      imports = [module ./host-admission-module.nix];
+      services.amc.hostAdmission = {
+        enable = true;
+        inherit package;
+        healthFile = "/run/amc-supervision/health.json";
+        policy = {
+          version = 1;
+          budget_bytes = 256 * 1024 * 1024;
+          reserve_bytes = 64 * 1024 * 1024;
+          swap_reserve_bytes = 0;
+          max_memory_full_psi = 100.0;
+          max_io_full_psi = 100.0;
+          resume_ms = 250;
+          aging_ms = 1000;
+          queue_limit = 16;
+          domains = [
+            {
+              name = "heartbeat";
+              uid = 0;
+              cgroup = "/heartbeat-work.slice";
+              ceiling_bytes = 64 * 1024 * 1024;
+              swap_bytes = 0;
+              fair_share_bytes = 64 * 1024 * 1024;
+            }
+          ];
+        };
+      };
+      systemd.slices.heartbeat-work.sliceConfig = {
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+      };
+      systemd.services.amc-host-admission.requires = ["heartbeat-work.slice"];
+      systemd.services.amc-host-admission.after = ["heartbeat-work.slice"];
       virtualisation.memorySize = 2048;
       boot.kernel.sysctl."vm.panic_on_oom" = 0;
       environment.systemPackages = [package pkgs.python3];
@@ -133,6 +166,10 @@ in
           assert len(saved["attempts"]) == 2, saved
           machine.succeed("systemctl stop amc-supervision amc-backend")
 
+      with subtest("host admission denies inhibited and expired heartbeats"):
+          machine.wait_for_unit("amc-host-admission.service")
+          machine.succeed("python3 ${heartbeatProbe}")
+
       with subtest("shadow observations have no intervention authority"):
           p = status()["policy"]
           p["mode"] = "shadow"
@@ -159,7 +196,7 @@ in
           assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
           assert initial_oom["host_oom_kill"] == final_oom["host_oom_kill"] == 0, (initial_oom, final_oom)
           machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
-      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/evidence/")
+      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/evidence/")
       machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")
     '';
   }).overrideTestDerivation (previous:

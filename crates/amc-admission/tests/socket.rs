@@ -92,17 +92,16 @@ fn start(
     })
 }
 
-fn enqueue(socket: PathBuf) -> Entry {
-    call(
+fn enqueue(socket: PathBuf) -> (Entry, String) {
+    let response = call(
         &socket,
         Message::Enqueue {
             contract: "tool".into(),
             wait_ms: 5000,
         },
     )
-    .unwrap()
-    .entry
-    .unwrap()
+    .unwrap();
+    (response.entry.unwrap(), response.entry_key.unwrap())
 }
 
 #[test]
@@ -113,13 +112,13 @@ fn independent_socket_clients_and_restart_keep_live_reservations() {
     let terminated = Arc::new(AtomicBool::new(false));
     let server = start(&root, done.clone(), terminated.clone());
     wait(|| call(&socket, Message::Status).is_ok());
-    let a = thread::spawn({
+    let (a, a_key) = thread::spawn({
         let socket = socket.clone();
         move || enqueue(socket)
     })
     .join()
     .unwrap();
-    let b = thread::spawn({
+    let (b, _) = thread::spawn({
         let socket = socket.clone();
         move || enqueue(socket)
     })
@@ -141,8 +140,24 @@ fn independent_socket_clients_and_restart_keep_live_reservations() {
             .phase,
         Phase::Queued
     );
-    call(&socket, Message::Enter { id: a.id.clone() }).unwrap();
-    assert!(call(&socket, Message::Enter { id: a.id.clone() }).is_err());
+    call(
+        &socket,
+        Message::Enter {
+            id: a.id.clone(),
+            key: a_key.clone(),
+        },
+    )
+    .unwrap();
+    assert!(
+        call(
+            &socket,
+            Message::Enter {
+                id: a.id.clone(),
+                key: a_key
+            }
+        )
+        .is_err()
+    );
     call(&socket, Message::Cancel { id: a.id.clone() }).unwrap();
     assert_eq!(
         call(&socket, Message::Status)
@@ -261,8 +276,8 @@ fn supervisor_inhibition_denies_entry_without_releasing_live_or_reserved_capacit
         }
     });
     wait(|| call(&socket, Message::Status).is_ok());
-    let a = enqueue(socket.clone());
-    let b = enqueue(socket.clone());
+    let (a, a_key) = enqueue(socket.clone());
+    let (b, b_key) = enqueue(socket.clone());
     wait(|| {
         call(&socket, Message::Poll { id: b.id.clone() })
             .unwrap()
@@ -271,10 +286,26 @@ fn supervisor_inhibition_denies_entry_without_releasing_live_or_reserved_capacit
             .phase
             == Phase::Reserved
     });
-    call(&socket, Message::Enter { id: a.id.clone() }).unwrap();
+    call(
+        &socket,
+        Message::Enter {
+            id: a.id.clone(),
+            key: a_key,
+        },
+    )
+    .unwrap();
     health.inhibit = true;
     std::fs::write(&health_file, serde_json::to_vec(&health).unwrap()).unwrap();
-    assert!(call(&socket, Message::Enter { id: b.id.clone() }).is_err());
+    assert!(
+        call(
+            &socket,
+            Message::Enter {
+                id: b.id.clone(),
+                key: b_key
+            }
+        )
+        .is_err()
+    );
     let status = call(&socket, Message::Status).unwrap().status.unwrap();
     assert_eq!(status.committed_bytes, 1200);
     assert!(
@@ -292,4 +323,62 @@ fn supervisor_inhibition_denies_entry_without_releasing_live_or_reserved_capacit
     done.store(true, Ordering::SeqCst);
     server.join().unwrap().unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn public_ticket_status_does_not_authorize_entry() {
+    use amc_admission::protocol::{Request, Response, read_frame, write_frame};
+    use std::os::unix::net::UnixStream;
+    let root = std::env::temp_dir().join(format!("amc-entry-owner-{}", fresh_id().unwrap()));
+    let socket = root.join("run/admission.sock");
+    let done = Arc::new(AtomicBool::new(false));
+    let server = start(&root, done.clone(), Arc::new(AtomicBool::new(false)));
+    wait(|| call(&socket, Message::Status).is_ok());
+    let (entry, entry_key) = enqueue(socket.clone());
+    wait(|| {
+        call(
+            &socket,
+            Message::Poll {
+                id: entry.id.clone(),
+            },
+        )
+        .unwrap()
+        .entry
+        .unwrap()
+        .phase
+            == Phase::Reserved
+    });
+    let public = call(&socket, Message::Status).unwrap().status.unwrap();
+    let id = public.entries[0].id.clone();
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    write_frame(
+        &mut stream,
+        &Request {
+            version: 1,
+            message: Message::Enter {
+                id: id.clone(),
+                key: fresh_id().unwrap(),
+            },
+        },
+    )
+    .unwrap();
+    let unauthorized = read_frame::<Response>(&mut stream).map_or(true, |r| r.error.is_some());
+    let status = call(&socket, Message::Status).unwrap().status.unwrap();
+    assert!(!serde_json::to_string(&status).unwrap().contains(&entry_key));
+    assert!(
+        call(&socket, Message::Poll { id: id.clone() })
+            .unwrap()
+            .entry_key
+            .is_none()
+    );
+    call(&socket, Message::Enter { id, key: entry_key }).unwrap();
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        unauthorized,
+        "status ticket ID authorized a different entry client"
+    );
+    assert_eq!(status.committed_bytes, 600);
+    assert_eq!(status.entries[0].phase, Phase::Reserved);
 }

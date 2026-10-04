@@ -59,6 +59,25 @@ pub enum Action {
     Trip,
 }
 
+// Native invocations stay unique, but their recovery allowance belongs to
+// the enrolled pool. Normalize pre-upgrade per-entry history as well.
+fn budget_domain<'a>(id: &'a str, policy: &'a Policy) -> &'a str {
+    if policy.domains.iter().any(|domain| domain.id == id) {
+        return id;
+    }
+    policy
+        .job_pools
+        .iter()
+        .find(|pool| {
+            let prefix = format!("{}-", pool.id);
+            id == pool.id
+                || id.strip_prefix(prefix.as_str()).is_some_and(|entry| {
+                    entry.len() == 32 && entry.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
+        .map_or(id, |pool| pool.id.as_str())
+}
+
 impl State {
     pub fn new(boot_id: String) -> Self {
         Self {
@@ -147,6 +166,7 @@ impl State {
         self.last_unix_ms = unix_ms;
         // Never shorten the accounting window on policy reload.
         self.accounting_window_ms = self.accounting_window_ms.max(policy.recovery_window_ms);
+        let budget = budget_domain(&domain.id, policy).to_owned();
         self.attempts
             .retain(|a| unix_ms.saturating_sub(a.unix_ms) <= self.accounting_window_ms);
         ensure!(
@@ -154,13 +174,13 @@ impl State {
                 && self
                     .attempts
                     .iter()
-                    .filter(|a| a.domain == domain.id)
+                    .filter(|a| budget_domain(&a.domain, policy) == budget)
                     .count()
                     < policy.domain_recovery_limit,
             "recovery budget exhausted"
         );
         self.attempts.push_back(Attempt {
-            domain: domain.id.clone(),
+            domain: budget,
             unix_ms,
         });
         self.active = Some(Recovery {
@@ -230,13 +250,13 @@ impl State {
                 self.active = None;
                 return Action::Finished;
             }
-            Phase::Starting { .. } if started && healthy => {
-                self.active = None;
-                return Action::Finished;
-            }
             Phase::Starting { deadline_ms } if ms >= deadline_ms => {
                 active.phase = Phase::Tripped;
                 return Action::Trip;
+            }
+            Phase::Starting { .. } if started && healthy => {
+                self.active = None;
+                return Action::Finished;
             }
             _ => (),
         }
