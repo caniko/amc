@@ -30,6 +30,21 @@ pub struct Domain {
     pub swap_bytes: u64,
     /// Scheduling weight expressed as a soft share, never idle capacity withheld.
     pub fair_share_bytes: u64,
+    /// Host I/O PSI is optional diagnostic telemetry only for explicitly
+    /// selected domains. Existing policies retain enforced I/O admission.
+    #[serde(default)]
+    pub io_pressure: IoPressure,
+    /// Additional host RAM floor; ceiling-backed reservations still apply.
+    #[serde(default)]
+    pub min_available_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IoPressure {
+    #[default]
+    Enforce,
+    Diagnostic,
 }
 
 impl HostPolicy {
@@ -64,6 +79,7 @@ impl HostPolicy {
                 d.ceiling_bytes > 0
                     && d.ceiling_bytes <= self.budget_bytes
                     && d.swap_bytes <= i64::MAX as u64
+                    && d.min_available_bytes <= i64::MAX as u64
                     && d.fair_share_bytes > 0,
                 "host domain cannot fit budget"
             );
@@ -135,6 +151,7 @@ pub struct Capacity {
     pub available_bytes: u64,
     pub swap_free_bytes: u64,
     pub memory_full_psi: f64,
+    /// NaN denotes unavailable optional telemetry. Enforced domains fail closed.
     pub io_full_psi: f64,
 }
 
@@ -264,26 +281,28 @@ impl HostLedger {
         now: u64,
         policy: &HostPolicy,
         capacity: Option<Capacity>,
-        healthy_since: &mut Option<u64>,
+        healthy_since: &mut BTreeMap<String, u64>,
         mut ancestry: impl FnMut(&Reservation, &[Reservation]) -> Option<u64>,
     ) -> BTreeMap<String, WaitReason> {
         self.reservations
             .retain(|r| r.granted || now < r.deadline_ms);
-        let healthy = capacity.is_some_and(|c| {
-            c.available_bytes >= policy.reserve_bytes
-                && c.swap_free_bytes >= policy.swap_reserve_bytes
-                && c.memory_full_psi.is_finite()
-                && c.io_full_psi.is_finite()
-                && c.memory_full_psi < policy.max_memory_full_psi
-                && c.io_full_psi < policy.max_io_full_psi
-        });
-        if !healthy {
-            *healthy_since = None;
-        } else {
-            healthy_since.get_or_insert(now);
+        healthy_since.retain(|name, _| policy.domains.iter().any(|d| &d.name == name));
+        for domain in &policy.domains {
+            let healthy = capacity.is_some_and(|c| {
+                c.available_bytes >= policy.reserve_bytes.max(domain.min_available_bytes)
+                    && c.swap_free_bytes >= policy.swap_reserve_bytes
+                    && (0.0..=100.0).contains(&c.memory_full_psi)
+                    && c.memory_full_psi < policy.max_memory_full_psi
+                    && (domain.io_pressure == IoPressure::Diagnostic
+                        || ((0.0..=100.0).contains(&c.io_full_psi)
+                            && c.io_full_psi < policy.max_io_full_psi))
+            });
+            if healthy {
+                healthy_since.entry(domain.name.clone()).or_insert(now);
+            } else {
+                healthy_since.remove(&domain.name);
+            }
         }
-        let ready = healthy
-            && healthy_since.is_some_and(|since| now.saturating_sub(since) >= policy.resume_ms);
         let mut waiting = BTreeMap::new();
         let mut aged_block = false;
         let mut pending: Vec<_> = (0..self.reservations.len())
@@ -328,6 +347,9 @@ impl HostLedger {
                 continue;
             }
             let committed = self.committed();
+            let ready = healthy_since
+                .get(&r.domain)
+                .is_some_and(|since| now.saturating_sub(*since) >= policy.resume_ms);
             let reason = if capacity.is_none() {
                 Some(WaitReason::Unknown)
             } else if !ready {
@@ -367,7 +389,10 @@ impl HostLedger {
                 }
             };
             if let Some(reason) = reason {
-                aged_block |= now.saturating_sub(r.requested_ms) >= policy.aging_ms;
+                // An aged request whose own pressure gate is closed cannot
+                // veto healthy peers. Capacity/fairness waits still age-block.
+                aged_block |= reason != WaitReason::Pressure
+                    && now.saturating_sub(r.requested_ms) >= policy.aging_ms;
                 waiting.insert(r.id.clone(), reason);
             } else {
                 self.reservations[i].granted = true;
