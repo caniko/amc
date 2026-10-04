@@ -1,5 +1,6 @@
 """Retain source, inputs and exact native admission qualification results."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -42,9 +43,19 @@ def verify_native_report(path, required_cases=NATIVE_CASES):
 
 
 def verify_supervision_evidence(path):
-    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json", "heartbeat.json", "cold-status.json"):
+    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "replay-input.json", "oom.json", "heartbeat.json", "cold-status.json"):
         if not (path / name).is_file():
             raise RuntimeError(f"Native supervision report is missing {name}")
+    binding = json.loads((path / "replay-input.json").read_text())
+    trace = (path / "trace.jsonl").read_bytes()
+    replay = (path / "replay.json").read_bytes()
+    if binding != {
+        "schemaVersion": 1,
+        "traceSha256": hashlib.sha256(trace).hexdigest(),
+        "traceBytes": len(trace),
+        "replaySha256": hashlib.sha256(replay).hexdigest(),
+    }:
+        raise RuntimeError("Supervision replay evidence is not bound to the exported trace and summary")
     heartbeat = json.loads((path / "heartbeat.json").read_text())
     if heartbeat != [
         {"inhibit": True, "age_ms": 0, "granted": False},

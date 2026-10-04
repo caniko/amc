@@ -166,6 +166,9 @@ pidfd identity rejection, admission inhibition, recovery deadlines/budgets and
 replay segmentation. `nixosTests.x86_64-linux.supervision` defines closed-loop
 backend/descendant cleanup, once-only restart, in-flight supervisor restart,
 shadow authority and trace/replay cases. Hosted CI must retain its named JUnit
-cases and trace/recovery receipts. Defined tests are not passing VM evidence;
+cases and trace/recovery receipts. The VM stops the trace writer before replay
+and export; `replay-input.json` binds the complete trace's SHA-256 and byte count
+to the replay summary's SHA-256. Hosted verification rejects missing or stale
+bindings. Defined tests are not passing VM evidence;
 application thresholds still need chronological replay, shadow observation and
 controlled consumer qualification before enabling forecast recovery.

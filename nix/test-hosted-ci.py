@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -14,7 +15,7 @@ class NativeEvidenceTests(unittest.TestCase):
     def test_supervision_exports_are_complete_and_have_no_oom_events(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json", "heartbeat.json", "cold-status.json")
+            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "replay-input.json", "oom.json", "heartbeat.json", "cold-status.json")
             for name in names:
                 (path / name).write_text("{}")
             clean = {phase: {"oom": 0, "oom_kill": 0, "host_oom_kill": 0} for phase in ("initial", "final")}
@@ -27,7 +28,20 @@ class NativeEvidenceTests(unittest.TestCase):
             (path / "heartbeat.json").write_text(json.dumps(heartbeat))
             cold = {"recovery": {"active": None, "attempts": [{"domain": "cold-backend"}]}}
             (path / "cold-status.json").write_text(json.dumps(cold))
+            binding = {
+                "schemaVersion": 1,
+                "traceSha256": hashlib.sha256((path / "trace.jsonl").read_bytes()).hexdigest(),
+                "traceBytes": (path / "trace.jsonl").stat().st_size,
+                "replaySha256": hashlib.sha256((path / "replay.json").read_bytes()).hexdigest(),
+            }
+            (path / "replay-input.json").write_text(json.dumps(binding))
             hosted.verify_supervision_evidence(path)
+            for name in ("trace.jsonl", "replay.json"):
+                contents = (path / name).read_text()
+                (path / name).write_text(contents + "\n{}\n")
+                with self.subTest(stale_replay=name), self.assertRaises(RuntimeError):
+                    hosted.verify_supervision_evidence(path)
+                (path / name).write_text(contents)
             for name in names:
                 contents = (path / name).read_text()
                 (path / name).unlink()

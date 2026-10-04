@@ -162,13 +162,6 @@ in
           s = status()
           assert len(s["recovery"]["attempts"]) == 1, s
 
-      with subtest("chronological replay and public fail-closed heartbeat"):
-          machine.succeed(amc + " supervise replay --file /var/lib/amc-supervision/trace.jsonl > /var/lib/amc-fixture/replay.json")
-          replay = json.loads(machine.succeed("cat /var/lib/amc-fixture/replay.json"))
-          assert replay["backend"]["completed_windows"] > 0, replay
-          assert replay["backend"]["strong"] > 0, replay
-          assert machine.succeed("stat -c %a /run/amc-supervision/health.json").strip() == "644"
-
       with subtest("in-flight supervisor restart trips without replay or forgiven budget"):
           wait_for(lambda: status()["recovery"]["active"] is not None, 200)
           active = status()["recovery"]["active"]
@@ -183,6 +176,22 @@ in
           saved = json.loads(machine.succeed("cat /var/lib/amc-supervision/recovery.json"))
           assert len(saved["attempts"]) == 2, saved
           machine.succeed("systemctl stop amc-supervision amc-backend")
+
+      with subtest("chronological replay and public fail-closed heartbeat"):
+          # The main supervisor is stopped: replay and export now use the same
+          # complete, frozen trace, including the in-flight restart evidence.
+          machine.succeed(amc + " supervise replay --file /var/lib/amc-supervision/trace.jsonl > /var/lib/amc-fixture/replay.json")
+          replay = json.loads(machine.succeed("cat /var/lib/amc-fixture/replay.json"))
+          assert replay["backend"]["completed_windows"] > 0, replay
+          assert replay["backend"]["strong"] > 0, replay
+          binding = {
+              "schemaVersion": 1,
+              "traceSha256": machine.succeed("sha256sum /var/lib/amc-supervision/trace.jsonl").split()[0],
+              "traceBytes": int(machine.succeed("stat -c %s /var/lib/amc-supervision/trace.jsonl").strip()),
+              "replaySha256": machine.succeed("sha256sum /var/lib/amc-fixture/replay.json").split()[0],
+          }
+          machine.succeed("cat > /var/lib/amc-fixture/replay-input.json <<'EOF'\n" + json.dumps(binding) + "\nEOF")
+          assert machine.succeed("stat -c %a /run/amc-supervision/health.json").strip() == "644"
 
       with subtest("host admission denies inhibited and expired heartbeats"):
           machine.wait_for_unit("amc-host-admission.service")
@@ -243,7 +252,7 @@ in
           assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
           assert initial_oom["host_oom_kill"] == final_oom["host_oom_kill"] == 0, (initial_oom, final_oom)
           machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
-      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/cold-status.json /var/lib/amc-fixture/evidence/")
+      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/replay-input.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/cold-status.json /var/lib/amc-fixture/evidence/")
       machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")
     '';
   }).overrideTestDerivation (previous:
