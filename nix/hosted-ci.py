@@ -28,6 +28,8 @@ SUPERVISION_CASES = {
     "in-flight supervisor restart trips without replay or forgiven budget",
     "shadow observations have no intervention authority",
     "native recovery completes without OOM kills",
+    "host admission denies inhibited and expired heartbeats",
+    "cold failed backend recovers once with durable invocation accounting",
 }
 
 
@@ -40,9 +42,19 @@ def verify_native_report(path, required_cases=NATIVE_CASES):
 
 
 def verify_supervision_evidence(path):
-    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json"):
+    for name in ("trace.jsonl", "recovery.json", "status.json", "replay.json", "oom.json", "heartbeat.json", "cold-status.json"):
         if not (path / name).is_file():
             raise RuntimeError(f"Native supervision report is missing {name}")
+    heartbeat = json.loads((path / "heartbeat.json").read_text())
+    if heartbeat != [
+        {"inhibit": True, "age_ms": 0, "granted": False},
+        {"inhibit": False, "age_ms": 4000, "granted": False},
+        {"inhibit": False, "age_ms": 0, "granted": True},
+    ]:
+        raise RuntimeError("Host admission heartbeat evidence does not prove denial and recovery")
+    cold = json.loads((path / "cold-status.json").read_text()).get("recovery", {})
+    if cold.get("active", True) is not None or len(cold.get("attempts", [])) != 1 or cold["attempts"][0].get("domain") != "cold-backend":
+        raise RuntimeError("Cold failed backend evidence does not prove one accounted recovery")
     oom = json.loads((path / "oom.json").read_text())
     if any(oom[phase][counter] != 0 for phase in ("initial", "final") for counter in ("oom", "oom_kill", "host_oom_kill")):
         raise RuntimeError("Native supervision report contains OOM events")

@@ -49,11 +49,44 @@
         blocks.append(bytearray(1024 * 1024))
         time.sleep(1)
   '';
+  heartbeatProbe = pkgs.writeText "amc-supervision-heartbeat-test.py" (builtins.readFile ./supervision-heartbeat-test.py);
 in
   (pkgs.testers.runNixOSTest {
     name = "amc-supervision";
     nodes.machine = {
-      imports = [module];
+      imports = [module ./host-admission-module.nix];
+      services.amc.hostAdmission = {
+        enable = true;
+        inherit package;
+        healthFile = "/run/amc-supervision/health.json";
+        policy = {
+          version = 1;
+          budget_bytes = 256 * 1024 * 1024;
+          reserve_bytes = 64 * 1024 * 1024;
+          swap_reserve_bytes = 0;
+          max_memory_full_psi = 100.0;
+          max_io_full_psi = 100.0;
+          resume_ms = 250;
+          aging_ms = 1000;
+          queue_limit = 16;
+          domains = [
+            {
+              name = "heartbeat";
+              uid = 0;
+              cgroup = "/heartbeat.slice";
+              ceiling_bytes = 64 * 1024 * 1024;
+              swap_bytes = 0;
+              fair_share_bytes = 64 * 1024 * 1024;
+            }
+          ];
+        };
+      };
+      systemd.slices.heartbeat.sliceConfig = {
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+      };
+      systemd.services.amc-host-admission.requires = ["heartbeat.slice"];
+      systemd.services.amc-host-admission.after = ["heartbeat.slice"];
       virtualisation.memorySize = 2048;
       boot.kernel.sysctl."vm.panic_on_oom" = 0;
       environment.systemPackages = [package pkgs.python3];
@@ -72,6 +105,24 @@ in
           OOMPolicy = "kill";
           Restart = "no";
           TimeoutStopSec = "3s";
+        };
+      };
+      systemd.services.amc-cold-backend = {
+        script = ''
+          if [ ! -e /var/lib/amc-fixture/cold-started ]; then
+            touch /var/lib/amc-fixture/cold-started
+            exit 42
+          fi
+          exec ${pkgs.coreutils}/bin/sleep 600
+        '';
+        serviceConfig = {
+          MemoryMax = "64M";
+          MemorySwapMax = 0;
+          MemoryAccounting = true;
+          Restart = "no";
+          KillMode = "control-group";
+          OOMPolicy = "kill";
+          TimeoutStopSec = "2s";
         };
       };
     };
@@ -133,6 +184,39 @@ in
           assert len(saved["attempts"]) == 2, saved
           machine.succeed("systemctl stop amc-supervision amc-backend")
 
+      with subtest("host admission denies inhibited and expired heartbeats"):
+          machine.wait_for_unit("amc-host-admission.service")
+          assert machine.succeed("systemctl show heartbeat.slice -p ControlGroup --value").strip() == "/heartbeat.slice"
+          machine.succeed("python3 ${heartbeatProbe}")
+
+      with subtest("cold failed backend recovers once with durable invocation accounting"):
+          machine.execute("systemctl start amc-cold-backend")
+          wait_for(lambda: machine.succeed("systemctl show amc-cold-backend -p ActiveState --value").strip() == "failed", 10)
+          first = machine.succeed("systemctl show amc-cold-backend -p InvocationID --value").strip()
+          assert first
+          p = status()["policy"]
+          p["forecast_recovery"] = False
+          p["job_pools"] = []
+          p["domains"] = [{"id": "cold-backend", "uid": None, "unit": "amc-cold-backend.service", "lifecycle": "restart",
+                           "memory_max": 64 * 1024**2, "memory_swap_max": 0, "priority": 10}]
+          p["domain_recovery_limit"] = 1
+          p["host_recovery_limit"] = 1
+          machine.succeed("mkdir -p /run/amc-cold /var/lib/amc-cold; chmod 700 /var/lib/amc-cold")
+          machine.succeed("cat > /var/lib/amc-fixture/cold.json <<'EOF'\n" + json.dumps(p) + "\nEOF")
+          machine.succeed("systemd-run --unit=amc-cold " + amc + " supervise serve --policy /var/lib/amc-fixture/cold.json --runtime /run/amc-cold --state /var/lib/amc-cold")
+          wait_for(lambda: machine.succeed("systemctl show amc-cold-backend -p ActiveState --value").strip() == "active", 30)
+          def cold_status():
+              return json.loads(machine.succeed("cat /run/amc-cold/status.json"))
+          wait_for(lambda: len(cold_status()["recovery"]["attempts"]) == 1 and cold_status()["recovery"]["active"] is None, 30)
+          second = machine.succeed("systemctl show amc-cold-backend -p InvocationID --value").strip()
+          assert first != second, (first, second)
+          machine.succeed("systemctl restart amc-cold")
+          time.sleep(5)
+          assert machine.succeed("systemctl show amc-cold-backend -p InvocationID --value").strip() == second
+          assert len(cold_status()["recovery"]["attempts"]) == 1
+          machine.succeed("cp /run/amc-cold/status.json /var/lib/amc-fixture/cold-status.json")
+          machine.succeed("systemctl stop amc-cold amc-cold-backend")
+
       with subtest("shadow observations have no intervention authority"):
           p = status()["policy"]
           p["mode"] = "shadow"
@@ -159,7 +243,7 @@ in
           assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
           assert initial_oom["host_oom_kill"] == final_oom["host_oom_kill"] == 0, (initial_oom, final_oom)
           machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
-      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/evidence/")
+      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/cold-status.json /var/lib/amc-fixture/evidence/")
       machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")
     '';
   }).overrideTestDerivation (previous:
