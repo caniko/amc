@@ -560,7 +560,8 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
             environment: &environment,
             properties: &properties,
         };
-        assert_eq!(runner.run(request, || None).unwrap(), Outcome::Completed(0));
+        // The fake manager reports workload status 7 even when its client exits 0.
+        assert_eq!(runner.run(request, || None).unwrap(), Outcome::Completed(7));
         let calls = fs::read_to_string(fixture.0.join("systemd-run.calls")).unwrap();
         let lines: Vec<_> = calls.lines().collect();
         assert!(lines.contains(&format!("--unit={unit}").as_str()));
@@ -729,7 +730,7 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
                 cancelled.join().unwrap(),
                 Err(RunError::Cancelled(2))
             ));
-            assert_eq!(other.join().unwrap().unwrap(), Outcome::Completed(0));
+            assert_eq!(other.join().unwrap().unwrap(), Outcome::Completed(7));
         });
         assert_eq!(runner.committed_bytes(), 0);
     }
