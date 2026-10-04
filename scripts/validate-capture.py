@@ -24,9 +24,11 @@ verified as regular files via their descriptors without following symlinks,
 and only consumed metric fields are retained. Errors are sanitized
 (truncated, no raw input echoed). Behavior is identical under `python -O`.
 """
+import html
 import json
 import math
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -334,6 +336,41 @@ def marker_is_file(directory, name):
         return False
 
 
+def optional_bool(value, what):
+    if value is not None and type(value) is not bool:
+        raise InvalidArtifact(f"{what} is not a boolean")
+    return value
+
+
+def event_coverage(value):
+    """Project producer-reported interval evidence, without deriving new deltas."""
+    if value is None:
+        return None
+    req_dict(value, "eventDeltaCoverage")
+    result = {"kind": opt_str(value.get("kind"), "eventDeltaCoverage kind")}
+    for key in ("lifetimeComplete", "finalCountersAvailable"):
+        result[key] = optional_bool(value.get(key), f"eventDeltaCoverage {key}")
+    for endpoint in ("start", "end"):
+        nested = value.get(endpoint)
+        if nested is not None:
+            req_dict(nested, f"eventDeltaCoverage {endpoint}")
+        for field, suffix in (("elapsedMs", "ElapsedMs"), ("sequence", "Sequence")):
+            key = endpoint + suffix
+            flat = value.get(key)
+            marked = nested.get(field) if nested is not None else None
+            for number in (flat, marked):
+                if number is not None:
+                    req_int(number, f"eventDeltaCoverage {key}")
+            if flat is not None and marked is not None and flat != marked:
+                raise InvalidArtifact(f"eventDeltaCoverage {key} disagrees with nested endpoint")
+            result[key] = flat if flat is not None else marked
+    for suffix in ("ElapsedMs", "Sequence"):
+        start, end = result["start" + suffix], result["end" + suffix]
+        if start is not None and end is not None and start > end:
+            raise InvalidArtifact("eventDeltaCoverage endpoints out of order")
+    return result
+
+
 def validate(directory):
     directory = Path(directory)
     report: dict = {"directory": str(directory), "checks": [], "suppressed": []}
@@ -366,6 +403,7 @@ def validate(directory):
     pressure_points: dict = {}
     pressure_present: dict = {}
     target_max: dict = {}
+    target_known = {"memory.current": 0, "memory.swap.current": 0}
     lags, caps = [], []
     baseline_seen = False
     host_unknown_cells = 0
@@ -444,6 +482,7 @@ def validate(directory):
             if value is not None:
                 value = counter_value(value, f"{where} {key}")
                 target_max[key] = max(value, target_max.get(key, 0))
+                target_known[key] += 1
         mem_events = known_strict(files, "memory.events", where)
         cg_events = known_strict(files, "cgroup.events", where)
         if mem_events is not None:
@@ -519,6 +558,9 @@ def validate(directory):
         attempted = collection.get("attemptedSamples")
         if not isinstance(attempted, int) or isinstance(attempted, bool) or attempted < n:
             raise InvalidArtifact("summary attemptedSamples contradicts persisted lines")
+        if collection.get("missedIntervals") is not None:
+            req_int(collection["missedIntervals"], "summary missedIntervals")
+        optional_bool(collection.get("storageDurable"), "summary storageDurable")
         reconciled = True
 
     metrics: dict = {"samples": n}
@@ -582,6 +624,9 @@ def validate(directory):
                                     "p99": percentile_nearest_rank(caps, 99),
                                     "note": "read-path timing, not whole-observer CPU"}
     metrics["targetSampledMax"] = target_max
+    metrics["targetCoverage"] = {
+        key: {"knownPoints": count, "totalPoints": n} for key, count in target_known.items()
+    }
     metrics["hostUnknownCells"] = host_unknown_cells
     metrics["invocations"] = sorted(invocations)
 
@@ -598,6 +643,9 @@ def validate(directory):
     coverage = summary.get("coverage") or {}
     if not isinstance(coverage, dict):
         raise InvalidArtifact("summary coverage is not an object")
+    for key in ("attachedLate", "baselineDelayed", "validBaseline", "terminationObserved",
+                "finalCountersUnavailable", "incompletePersistence"):
+        optional_bool(coverage.get(key), f"summary coverage {key}")
     contradictions = []
     if summary.get("complete") is True:
         if n == 0:
@@ -621,11 +669,15 @@ def validate(directory):
     complete = summary.get("complete") is True and done_exists and not contradictions
     report["collection"] = {"reason": reason,
                             "complete": complete,
-                            "coverage": summary.get("coverage") if summary else None,
-                            "attemptedSamples": collection.get("attemptedSamples"),
-                            "persistedSamples": collection.get("persistedSamples"),
-                            "missedIntervals": collection.get("missedIntervals"),
-                            "eventDeltas": summary.get("eventDeltas") if summary else None}
+                             "coverage": summary.get("coverage") if summary else None,
+                             "attemptedSamples": collection.get("attemptedSamples"),
+                             "persistedSamples": collection.get("persistedSamples"),
+                             "missedIntervals": collection.get("missedIntervals"),
+                             "storageDurable": collection.get("storageDurable"),
+                             "eventDeltaCoverage": event_coverage(summary.get("eventDeltaCoverage")),
+                             "deltaUnsupportedReason": opt_str(summary.get("deltaUnsupportedReason"),
+                                                               "summary deltaUnsupportedReason"),
+                             "eventDeltas": summary.get("eventDeltas") if summary else None}
     report["identity"] = {"clockDomain": sorted(clock_domains)[0] if clock_domains else None,
                           "observationIds": sorted(obs_ids),
                           "invocations": sorted(invocations),
@@ -655,31 +707,94 @@ def format_percent(totals):
             f"windowMs={totals['windowMs']}")
 
 
+def markdown_text(value):
+    """Keep artifact-provided text on one line and inert in rendered HTML."""
+    if value is None:
+        return "unavailable"
+    text = json.dumps(value, ensure_ascii=False)[1:-1]
+    text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", html.escape(text, quote=True))
+
+
+def sampled_gib(values):
+    if values is None:
+        return "unavailable (see suppressed metrics below)"
+    gib = 1 << 30
+    return (f"first {values['first'] / gib:.2f} GiB; "
+            f"minimum {values['min'] / gib:.2f} GiB; "
+            f"last {values['last'] / gib:.2f} GiB "
+            f"({values['knownPoints']}/{values['totalPoints']} samples)")
+
+
 def as_markdown(report):
-    lines = [f"# Capture validation: {report['directory']}", ""]
+    lines = [f"# Capture validation: {markdown_text(report['directory'])}", ""]
+    lines.append(f"Target: {markdown_text(report['manifest']['target']['unit'])}")
     collection = report["collection"]
-    lines.append(f"Collection: reason={collection['reason']} complete={collection['complete']}")
+    lines.append(f"Collection: reason={markdown_text(collection['reason'])} complete={collection['complete']}")
+    def scalar(value):
+        return str(value) if type(value) in (int, bool) else "unavailable"
+
+    coverage = collection["coverage"] or {}
+    lines.append("Coverage: " + ", ".join(
+        f"{key}={scalar(coverage.get(key))}" for key in
+        ("attachedLate", "baselineDelayed", "validBaseline", "terminationObserved", "finalCountersUnavailable",
+         "incompletePersistence")))
+    lines.append("Sampling: " + ", ".join(
+        f"{key}={scalar(collection.get(key))}" for key in
+        ("attemptedSamples", "persistedSamples", "missedIntervals", "storageDurable")))
     identity = report["identity"]
-    lines.append(f"Identity: clock={identity['clockDomain']} observations={len(identity['observationIds'])} "
+    lines.append(f"Identity: clock={markdown_text(identity['clockDomain'])} observations={len(identity['observationIds'])} "
                  f"units={len(identity['units'])} invocations={len(identity['invocations'])} "
                  f"boots={len(identity['bootIds'])} inodes={len(identity['inodes'])}")
     metrics = report["metrics"]
     lines.append(f"Samples: {metrics['samples']} reconciled={report['integrity']['countsReconciled']}")
-    for label in ("memAvailableBytes", "swapFreeBytes"):
-        values = metrics[label]
-        lines.append(f"{label}: {values}" if values else f"{label}: unavailable")
+    lines.extend(["", "## Target cgroup (largest sampled values; not lifetime peaks)"])
+    for field in ("memory.current", "memory.swap.current"):
+        value = metrics["targetSampledMax"].get(field)
+        rendered = f"{value / (1 << 30):.2f} GiB" if value is not None else "unavailable"
+        coverage = metrics["targetCoverage"][field]
+        lines.append(f"{field}: {rendered} ({coverage['knownPoints']}/{coverage['totalPoints']} samples)")
+        if coverage["knownPoints"] != coverage["totalPoints"]:
+            lines.append(f"{field}: partial coverage; the maximum uses known readings only")
+    events = report["collection"]["eventDeltas"]
+    if isinstance(events, dict):
+        rendered = []
+        for key in ("high", "max", "oom", "oom_kill", "oom_group_kill"):
+            value = events.get(key)
+            rendered.append(f"{key}={value if type(value) is int and 0 <= value < 2**64 else 'unavailable'}")
+        lines.append("Memory events (summary-reported deltas): " + ", ".join(rendered))
+    else:
+        lines.append("Memory events (summary-reported deltas): unavailable")
+    interval = collection["eventDeltaCoverage"]
+    if interval is None:
+        lines.append("Event interval (summary-reported): unavailable")
+    else:
+        lines.append("Event interval (summary-reported): "
+                     f"kind={markdown_text(interval['kind'])}; "
+                     f"start={scalar(interval['startElapsedMs'])} ms (sequence {scalar(interval['startSequence'])}); "
+                     f"end={scalar(interval['endElapsedMs'])} ms (sequence {scalar(interval['endSequence'])}); "
+                     f"lifetimeComplete={scalar(interval['lifetimeComplete'])}; "
+                     f"finalCountersAvailable={scalar(interval['finalCountersAvailable'])}")
+    if collection["deltaUnsupportedReason"] is not None:
+        lines.append(f"Delta limitation: {markdown_text(collection['deltaUnsupportedReason'])}")
+    lines.extend(["", "## Host context (observer's /proc; not target attribution)"])
+    for field, label in (("memAvailableBytes", "MemAvailable"), ("swapFreeBytes", "SwapFree")):
+        lines.append(f"Host {label} (sampled): {sampled_gib(metrics[field])}")
     for label in ("swapPagesIn", "swapPagesOut", "majorFaults"):
         values = metrics[label]
         if values and values.get("windowMs"):
             lines.append(f"{label}: delta={values['delta']} perSecond={values['perSecond']:.3f} "
-                         f"windowMs={values['windowMs']} points={values['knownPoints']}/{values['totalPoints']}")
+                          f"windowMs={values['windowMs']} points={values['knownPoints']}/{values['totalPoints']}")
         else:
-            lines.append(f"{label}: {values}")
+            lines.append(f"{label}: unavailable (see suppressed metrics below)")
     for resource in ("Memory", "Cpu", "Io"):
         for row in ("some", "full"):
             lines.append(f"pressure.{resource.lower()}.{row}: "
                          f"{format_percent(report['metrics'][f'pressure{resource}'][row])}")
-    lines.append(f"timing: {metrics['scheduleLagMs']} {metrics['captureDurationUs']}")
+    lines.append(f"Schedule lag: p99={metrics['scheduleLagMs']['p99']} ms; "
+                 f"max={metrics['scheduleLagMs']['max']} ms")
+    lines.append(f"Capture read time: p99={metrics['captureDurationUs']['p99']} us; "
+                 f"max={metrics['captureDurationUs']['max']} us (not whole-observer CPU)")
     lines.append(f"unknown host cells: {metrics['hostUnknownCells']}")
     if report["suppressed"]:
         lines.append(f"suppressed: {', '.join(report['suppressed'])}")

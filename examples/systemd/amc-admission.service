@@ -1,0 +1,20 @@
+[Unit]
+Description=AMC per-user background admission
+Requires=amc-background.slice
+After=amc-background.slice
+
+[Service]
+ExecStart=%h/.cargo/bin/amc admission serve --policy %h/.config/amc/admission.json
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+MemoryAccounting=yes
+MemoryMax=128M
+MemorySwapMax=0
+TasksMax=32
+NoNewPrivileges=yes
+Slice=app.slice
+
+[Install]
+WantedBy=default.target

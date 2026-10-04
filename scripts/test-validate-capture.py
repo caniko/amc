@@ -114,6 +114,23 @@ with tempfile.TemporaryDirectory() as directory:
     assert report["metrics"]["hostUnknownCells"] == 0
     assert report["identity"]["clockDomain"] == "monotonic-clock"
     assert "nested" not in json.dumps(report)
+    hostile = {**report, "directory": "capture\n## Forged <script> ![img](https://example.invalid)",
+               "collection": {**report["collection"], "complete": False,
+                              "reason": "cancelled\nCollection: complete=True<script>"},
+               "identity": {**report["identity"], "clockDomain": None}}
+    markdown = validator.as_markdown(hostile)
+    assert "\n## Forged" not in markdown
+    assert "<script>" not in markdown
+    assert "Forged" in markdown and "\\n" in markdown
+    assert "&lt;script&gt;" in markdown
+    assert "![img](https://example.invalid)" not in markdown
+    assert "clock=unavailable" in markdown
+    # Legal JSON escapes can contain non-scalar Unicode. Markdown must still
+    # be printable as UTF-8 instead of crashing outside the invalid-input path.
+    escaped = {**report, "manifest": {**report["manifest"],
+               "target": {**TARGET, "unit": "bad\ud800.service"}}}
+    assert "ud800" in validator.as_markdown(escaped).encode("utf-8").decode("utf-8")
+    assert validator.markdown_text("服务-é.service") == "服务-é.service"
     write_capture(directory / "pct", lagged)
     assert validator.validate(directory / "pct")["metrics"]["scheduleLagMs"]["p99"] == 9
 
@@ -417,6 +434,42 @@ with tempfile.TemporaryDirectory() as directory:
     report = validator.validate(directory / "partial")
     assert report["metrics"]["majorFaults"] is None
     assert any("partial-coverage" in item for item in report["suppressed"])
+    # Target maxima retain their sampled meaning even with missing readings,
+    # and both formats must disclose exactly how much evidence is available.
+    target_partial = [sample(seq, seq * 1000) for seq in range(3)]
+    target_partial[0]["observation"]["files"]["memory.current"] = {"value": 1 << 30}
+    target_partial[1]["observation"]["files"]["memory.current"] = {"unknown": "missing"}
+    interval = {"kind": "baseline-to-last-readable", "lifetimeComplete": False,
+                "finalCountersAvailable": False, "startElapsedMs": 0, "endElapsedMs": 2000,
+                "startSequence": 0, "endSequence": 2}
+    write_capture(directory / "targetpartial", target_partial, summary_extra={
+        "eventDeltaCoverage": interval, "deltaUnsupportedReason": "endpoint unavailable",
+        "coverage": {"validBaseline": True, "incompletePersistence": False,
+                     "attachedLate": True, "baselineDelayed": False,
+                     "terminationObserved": False, "finalCountersUnavailable": True},
+        "collection": {"missedIntervals": 4}})
+    report = validator.validate(directory / "targetpartial")
+    assert report["collection"]["complete"] is True
+    assert report["metrics"]["targetSampledMax"]["memory.current"] == 1 << 30
+    assert report["metrics"]["targetCoverage"]["memory.current"] == {"knownPoints": 1, "totalPoints": 3}
+    assert report["collection"]["eventDeltaCoverage"] == interval
+    text = validator.as_markdown(report)
+    for required in ("memory.current: 1.00 GiB (1/3 samples)", "memory.current: partial coverage", "attachedLate=True",
+                     "baselineDelayed=False", "validBaseline=True", "finalCountersUnavailable=True",
+                     "missedIntervals=4", "storageDurable=True",
+                     "baseline-to-last-readable", "lifetimeComplete=False", "2000 ms",
+                     "endpoint unavailable"):
+        assert required in text, (required, text)
+    assert "Event interval (summary-reported): unavailable" in validator.as_markdown(
+        validator.validate(directory / "ok"))
+    for bad_interval in ({**interval, "endSequence": True},
+                         {**interval, "endElapsedMs": -1},
+                         {**interval, "lifetimeComplete": "false"},
+                         {**interval, "startElapsedMs": 3000},
+                         {**interval, "end": {"elapsedMs": 2001, "sequence": 2}}):
+        write_capture(directory / "badinterval", target_partial,
+                      summary_extra={"eventDeltaCoverage": bad_interval})
+        rejects(directory / "badinterval")
     # An unknown middle endpoint keeps the level but suppresses the rate.
     mid_unknown = [sample(0, 0, pgmajfault=100),
                    dict(sample(1, 1000, pgmajfault=130),
@@ -442,6 +495,11 @@ with tempfile.TemporaryDirectory() as directory:
     assert report["collection"]["reason"] == "no-summary"
     assert report["collection"]["complete"] is False
     assert report["integrity"]["countsReconciled"] is False
+    write_capture(directory / "runningempty", [], summary=False)
+    empty = validator.as_markdown(validator.validate(directory / "runningempty"))
+    assert "reason=no-summary complete=False" in empty
+    assert "Identity: clock=unavailable" in empty
+    assert "Host MemAvailable (sampled): unavailable" in empty
 
     # Aborted shape stays valid but incomplete.
     write_capture(directory / "aborted", samples[:2],

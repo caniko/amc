@@ -4,12 +4,49 @@ AMC provides embeddable memory admission (`amc-runner`) and passive workstation
 telemetry (`amc-telemetry` and the CLI). The CLI also contains local
 fixture/compatibility launch tools for systemd memory policy. RFC 0.4 in
 `docs/rfc-v0.4/` governs native integration. AMC is not a policy standard,
-resident policy daemon, sandbox, or transparent replacement for normal launching.
+sandbox or transparent replacement for normal launching. An optional
+[persistent per-user admission service](docs/persistent-admission.md) coordinates
+native managed jobs across independent processes with durable recovery.
 
-The [workstation adoption plan](docs/workstation-adoption-plan.md) records the
-modular product direction, explicit user-selected priorities, and gaming plus
-background work as the first evaluation target. General-adoption and performance
-claims remain gated on that evaluation; observation does not enable a policy.
+The [workstation guide](docs/workstation-policy.md) provides a standalone native
+setup for a stable, usable foreground gaming session with bounded useful
+background progress, including enrollment, deadlines and recovery. Consumers own
+the selected policy; observation alone does not enable it. The
+[adoption record](docs/workstation-adoption-plan.md) tracks implementation and
+rollout. The optional [CS2 guide](docs/gaming-comparison.md) retains demo recording,
+per-present logging and matched background-work diagnostics.
+
+## Install and first report
+
+Linux with systemd and cgroup v2 is the initial inspection/capture target.
+From a checkout, install the CLI with Nix (`nix profile install .#default`)
+or Rust (`cargo install --path . --locked`). `amc report` additionally needs
+Python 3.11 or newer on `PATH`; the Nix package includes it. Reporting is
+offline and needs neither systemd nor access to the observed machine.
+Source installation and the live inspect → capture → report workflow have also
+passed in a booted Ubuntu 24.04.5 guest with systemd 255 and cgroup v2, including
+cancelled captures and unavailable measurements. See the
+[Ubuntu validation record](docs/ubuntu-diagnostics-20260930.md) for the exact
+environment, reproduction command, and artifacts.
+
+```sh
+# Identify the actual service/scope that owns your workload first.
+systemctl --user list-units --type=service,scope --state=running --no-pager
+systemctl --user show actual-workload.service --property=ControlGroup --property=InvocationID
+
+# Replace actual-workload.service with the unit you found. Capture is passive.
+amc inspect actual-workload.service
+amc watch actual-workload.service --production --seconds 60 --output ./amc-session-01
+amc report ./amc-session-01
+amc report ./amc-session-01 --json
+```
+
+Choose a new output directory for every capture. The report checks the
+capture's identity, stored sample counts, and completion evidence before
+deriving available metrics. `complete` describes collection, not proof that
+the entire workload lifetime was observed. Unknown/partial measurements stay
+visible. See [telemetry](docs/telemetry.md) for interpretation and
+[admission](docs/admission-contract.md) for cooperative workloads.
 
 **Real applications stay with their existing native lifecycle owner.** For
 OpenCode, the discovered shared backend is `opencode.service`; wrapping an
@@ -24,6 +61,7 @@ amc inspect some-system-unit.service --system --json
 amc watch some-unit.service --seconds 10 --output /tmp/amc-watch-out
 amc watch some-unit.service --production --output /tmp/amc-production-out
 amc diff /tmp/amc-watch-out/before.json /tmp/amc-watch-out/after.json
+amc report /tmp/amc-production-out --json
 ./scripts/prove-local.sh opencode.service
 ```
 
@@ -96,8 +134,11 @@ disposable fixture a separate manager-enforced runtime bound. Detached launches
 remain running after successful acknowledgment.
 
 SIGINT/SIGTERM during submission triggers bounded cleanup of only that attempt.
-An absent/collected unit or unavailable manager leaves an explicit UNKNOWN
-outcome. There is no retry, unrestricted fallback, or promise of cleanup after
+An unavailable manager or an unobserved collected unit leaves an explicit UNKNOWN
+outcome. A waited unit observed at startup can complete after native collection
+only when a successful final manager query and its pinned workload-domain evidence
+establish termination beneath the original visible parent. There is no retry,
+unrestricted fallback, or promise of cleanup after
 SIGKILL or manager unavailability. Inspect the recorded identity before any
 manual retry; work may already have happened.
 

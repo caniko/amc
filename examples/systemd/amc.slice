@@ -1,0 +1,9 @@
+[Unit]
+Description=Bounded AMC background parent
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=2G
+MemorySwapMax=0
+CPUWeight=20
+IOWeight=20

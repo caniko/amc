@@ -620,17 +620,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn for_dir_observes_a_live_worker_domain() {
+    fn for_dir_observes_visible_worker_or_rejects_hidden_domain() {
         let placement = std::fs::read_to_string("/proc/self/cgroup").expect("cgroup v2 placement");
         let path = placement
             .lines()
             .find_map(|line| line.strip_prefix("0::"))
             .expect("cgroup v2 hierarchy");
         let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-        let stats = CgroupV2Provider::for_dir(dir).unwrap().stats().unwrap();
-        assert!(stats.total_bytes() > 0);
-        assert!(stats.available_bytes() <= stats.total_bytes());
-        assert!((0.0..=1.0).contains(&stats.used_fraction()));
+        let provider = CgroupV2Provider::for_dir(dir.clone());
+        if dir.is_dir() {
+            let stats = provider.unwrap().stats().unwrap();
+            assert!(stats.total_bytes() > 0);
+            assert!(stats.available_bytes() <= stats.total_bytes());
+            assert!((0.0..=1.0).contains(&stats.used_fraction()));
+        } else {
+            // Nix exposes /proc placement without mounting the host cgroup
+            // tree. That is unavailable evidence, not host-only admission.
+            assert!(provider.is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]

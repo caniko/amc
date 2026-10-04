@@ -36,6 +36,9 @@
             buildPhase = command;
             checkPhase = "true";
             installPhase = "touch $out";
+            # Checks produce a marker, not the installed CLI executable.
+            postInstall = "";
+            postFixup = "";
           });
       in {
         fmt = mkCargoCheck "fmt" [pkgs.rustfmt] "cargo fmt --all --check";
@@ -56,13 +59,14 @@
             RUSTDOCFLAGS="-D warnings" cargo doc -p amc-runner --no-deps --locked "''${flags[@]}"
           done
         '';
-        fixture-scripts = pkgs.runCommand "amc-fixture-scripts" {
-          nativeBuildInputs = [pkgs.python3 pkgs.bash];
-        } ''
-          python3 ${self}/scripts/check-fixtures.py
-          bash -n ${self}/scripts/prove-local.sh
-          touch $out
-        '';
+        fixture-scripts =
+          pkgs.runCommand "amc-fixture-scripts" {
+            nativeBuildInputs = [pkgs.python3 pkgs.bash];
+          } ''
+            python3 ${self}/scripts/check-fixtures.py
+            bash -n ${self}/scripts/prove-local.sh
+            touch $out
+          '';
       }
     );
 
@@ -89,6 +93,9 @@
     formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 
     nixosModules.default = import ./nix/module.nix;
+    nixosModules.host-admission = import ./nix/host-admission-module.nix;
+    lib.hostDomainPressureVersion = 1;
+    homeManagerModules.default = import ./nix/home-module.nix;
 
     # Deliberately excluded from checks: run explicitly with
     # nix build .#nixosTests.x86_64-linux.generic
@@ -96,6 +103,14 @@
       system: let
         pkgs = pkgsFor system;
       in {
+        shared-admission = import ./nix/host-admission-vm-test.nix {
+          inherit pkgs;
+          package = self.packages.${system}.default;
+        };
+        admission = import ./nix/admission-vm-test.nix {
+          inherit pkgs;
+          amcPackage = self.packages.${system}.default;
+        };
         generic = import ./nix/vm-test.nix {
           inherit pkgs;
           amcModule = self.nixosModules.default;
