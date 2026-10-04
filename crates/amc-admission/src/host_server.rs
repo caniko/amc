@@ -221,7 +221,7 @@ pub fn serve_supervised(
                 &policy,
                 capacity,
                 &mut healthy_since,
-                |r, entries| host_native::ancestor_headroom(&r.identity, entries),
+                host_native::ancestor_headroom,
             );
             if before != serde_json::to_vec(&ledger)? {
                 store.save_snapshot(&ledger)?;

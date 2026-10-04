@@ -742,12 +742,15 @@ if test "$state" = inactive; then printf 'ExecMainCode=1\nExecMainStatus=7\n'; f
         let launcher = fixture.launcher();
         let gate = runner.gate.clone();
         let argv = workload("exit 0");
-        runner
-            .run(
-                request(&launcher, &argv, "app-amc-drop@1.service", true),
-                || None,
-            )
-            .unwrap();
+        assert_eq!(
+            runner
+                .run(
+                    request(&launcher, &argv, "app-amc-drop@1.service", true),
+                    || None,
+                )
+                .unwrap(),
+            Outcome::Acknowledged
+        );
         drop(runner);
         assert_eq!(gate.committed_bytes(), 100);
     }

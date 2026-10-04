@@ -169,37 +169,68 @@ pub fn identify_pool(
     ))
 }
 
+/// RAM available to this reservation after accounting both native resources.
+/// A finite ancestor swap ceiling that cannot back the requested swap makes
+/// the reservation ineligible even when ancestor and host RAM are plentiful.
 pub fn ancestor_headroom(
-    identity: &Identity,
+    reservation: &crate::host::Reservation,
     reservations: &[crate::host::Reservation],
 ) -> Option<u64> {
-    let directory = crate::native::cgroup_directory(&identity.cgroup).ok()?;
+    ancestor_headroom_at(Path::new("/sys/fs/cgroup"), reservation, reservations)
+}
+
+fn ancestor_headroom_at(
+    root: &Path,
+    reservation: &crate::host::Reservation,
+    reservations: &[crate::host::Reservation],
+) -> Option<u64> {
+    let identity = &reservation.identity;
+    crate::native::cgroup_directory(&identity.cgroup).ok()?;
+    let directory = root.join(identity.cgroup.trim_start_matches('/'));
     if fs::metadata(&directory).ok()?.ino() != identity.inode {
         return None;
     }
     let mut available = u64::MAX;
-    for ancestor in directory
-        .ancestors()
-        .skip(1)
-        .take_while(|p| *p != Path::new("/sys/fs/cgroup"))
-    {
-        let max = fs::read_to_string(ancestor.join("memory.max")).ok()?;
-        if max.trim() == "max" {
-            continue;
-        }
-        let max: u64 = max.trim().parse().ok()?;
-        let prefix = format!(
-            "/{}/",
-            ancestor.strip_prefix("/sys/fs/cgroup").ok()?.display()
-        );
-        let committed = reservations
+    for ancestor in directory.ancestors().skip(1).take_while(|p| *p != root) {
+        let prefix = format!("/{}/", ancestor.strip_prefix(root).ok()?.display());
+        let (memory_committed, swap_committed) = reservations
             .iter()
-            .filter(|r| r.granted && r.identity.cgroup.starts_with(&prefix))
-            .fold(0u64, |sum, r| sum.saturating_add(r.memory_bytes));
-        available = available.min(
-            max.saturating_sub(number(ancestor, "memory.current").ok()?)
-                .saturating_sub(committed),
-        );
+            .filter(|r| {
+                r.granted
+                    && (r.identity.cgroup == prefix.trim_end_matches('/')
+                        || r.identity.cgroup.starts_with(&prefix))
+            })
+            .fold((0u64, 0u64), |(memory, swap), r| {
+                (
+                    memory.saturating_add(r.memory_bytes),
+                    swap.saturating_add(r.swap_bytes),
+                )
+            });
+        for (max_file, current_file, committed, swap) in [
+            ("memory.max", "memory.current", memory_committed, false),
+            (
+                "memory.swap.max",
+                "memory.swap.current",
+                swap_committed,
+                true,
+            ),
+        ] {
+            let max = fs::read_to_string(ancestor.join(max_file)).ok()?;
+            if max.trim() == "max" {
+                continue;
+            }
+            let max: u64 = max.trim().parse().ok()?;
+            let remaining = max
+                .saturating_sub(number(ancestor, current_file).ok()?)
+                .saturating_sub(committed);
+            if swap {
+                if reservation.swap_bytes > remaining {
+                    return Some(0);
+                }
+            } else {
+                available = available.min(remaining);
+            }
+        }
     }
     Some(available)
 }
@@ -257,6 +288,92 @@ fn psi(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_ancestor_swap_cannot_be_spent_twice_with_ample_host_swap() {
+        use crate::host::{HostLedger, HostPolicy, Reservation, WaitReason};
+        let root = std::env::temp_dir().join(format!(
+            "amc-ancestor-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("pool/first")).unwrap();
+        fs::create_dir_all(root.join("pool/second")).unwrap();
+        for (name, value) in [
+            ("memory.max", "1000"),
+            ("memory.current", "0"),
+            ("memory.swap.max", "50"),
+            ("memory.swap.current", "0"),
+        ] {
+            fs::write(root.join("pool").join(name), value).unwrap();
+        }
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version": 1, "budget_bytes": 1000, "reserve_bytes": 20, "swap_reserve_bytes": 20,
+            "max_memory_full_psi": 1.0, "max_io_full_psi": 20.0,
+            "resume_ms": 250, "aging_ms": 1000, "queue_limit": 32,
+            "domains": [{"name": "pool", "uid": 1000, "cgroup": "/pool", "ceiling_bytes": 1000,
+                         "swap_bytes": 100, "fair_share_bytes": 1000}]
+        }))
+        .unwrap();
+        policy.validate().unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        for name in ["first", "second"] {
+            ledger
+                .request(
+                    Reservation {
+                        id: name.into(),
+                        domain: "pool".into(),
+                        identity: Identity {
+                            cgroup: format!("/pool/{name}"),
+                            inode: fs::metadata(root.join("pool").join(name)).unwrap().ino(),
+                            uid: 1000,
+                            pid: 1,
+                            start_ticks: 1,
+                        },
+                        memory_bytes: 10,
+                        swap_bytes: 30,
+                        requested_ms: 0,
+                        deadline_ms: 10_000,
+                        granted: false,
+                        owners: vec![],
+                    },
+                    &policy,
+                )
+                .unwrap();
+        }
+        let mut since = std::collections::BTreeMap::from([("pool".into(), 0)]);
+        let capacity = Some(Capacity {
+            available_bytes: 1000,
+            swap_free_bytes: 1000,
+            memory_full_psi: 0.0,
+            io_full_psi: 0.0,
+        });
+        for memory_max in ["1000", "max"] {
+            fs::write(root.join("pool/memory.max"), memory_max).unwrap();
+            let mut observed = ledger.clone();
+            let waits = observed.advance(250, &policy, capacity, &mut since, |r, entries| {
+                ancestor_headroom_at(&root, r, entries)
+            });
+            assert_eq!(observed.committed(), 10);
+            assert_eq!(waits["second"], WaitReason::AncestorHeadroom);
+        }
+        fs::write(root.join("pool/memory.swap.current"), "25").unwrap();
+        let waits = ledger.advance(250, &policy, capacity, &mut since, |r, entries| {
+            ancestor_headroom_at(&root, r, entries)
+        });
+        assert_eq!(ledger.committed(), 0);
+        assert_eq!(waits["first"], WaitReason::AncestorHeadroom);
+        fs::remove_file(root.join("pool/memory.swap.current")).unwrap();
+        assert_eq!(
+            ancestor_headroom_at(&root, &ledger.reservations[0], &[]),
+            None
+        );
+        fs::write(root.join("pool/memory.swap.max"), "max").unwrap();
+        ledger.advance(500, &policy, capacity, &mut since, |r, entries| {
+            ancestor_headroom_at(&root, r, entries)
+        });
+        assert_eq!(ledger.committed(), 20);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn optional_io_failure_does_not_hide_required_memory_failure() {
