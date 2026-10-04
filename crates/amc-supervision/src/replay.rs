@@ -148,5 +148,11 @@ pub fn run(mut input: impl BufRead) -> Result<BTreeMap<String, Summary>> {
             }
         }
     }
+    // EOF ends every comparable segment, including windows whose future is
+    // absent from a cleanly truncated or rotated trace. Never omit those from
+    // the retained censorship counts or score invented future observations.
+    for stream in streams.values_mut() {
+        stream.censor();
+    }
     Ok(streams.into_iter().map(|(id, s)| (id, s.summary)).collect())
 }

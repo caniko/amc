@@ -33,6 +33,16 @@ const BOOT: &str = "a0e7b901-008c-479c-bf78-3fd6a6fb408d";
 const NEXT_BOOT: &str = "ed447a46-39ce-496e-b58c-c6e029e23768";
 
 #[test]
+fn end_of_trace_censors_forecasts_with_unobserved_future() {
+    let frames: Vec<_> = (0..15).map(|t| frame(BOOT, t * 1000, true)).collect();
+    let summary = replay::run(Cursor::new(trace(&frames))).unwrap();
+    assert_eq!(summary["backend"].observations, 15);
+    assert_eq!(summary["backend"].completed_windows, 5);
+    assert_eq!(summary["backend"].censored_windows, 10);
+    assert_eq!(summary["backend"].evaluated_windows, 0);
+}
+
+#[test]
 fn missing_domain_frames_censor_the_whole_window_even_with_a_short_gap() {
     let frames = [
         frame(BOOT, 0, true),
@@ -41,7 +51,7 @@ fn missing_domain_frames_censor_the_whole_window_even_with_a_short_gap() {
     ];
     let summary = replay::run(Cursor::new(trace(&frames))).unwrap();
     assert_eq!(summary["backend"].observations, 2);
-    assert_eq!(summary["backend"].censored_windows, 1);
+    assert_eq!(summary["backend"].censored_windows, 2);
 }
 
 #[test]
@@ -56,7 +66,7 @@ fn boot_and_policy_changes_preserve_all_completed_and_censored_window_counts() {
     let summary = replay::run(Cursor::new(trace(&frames))).unwrap();
     assert_eq!(summary["backend"].observations, 150);
     assert_eq!(summary["backend"].completed_windows, 120);
-    assert_eq!(summary["backend"].censored_windows, 20);
+    assert_eq!(summary["backend"].censored_windows, 30);
     assert_eq!(summary["backend"].evaluated_windows, 0);
 }
 
