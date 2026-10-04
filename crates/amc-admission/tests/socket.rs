@@ -236,6 +236,96 @@ fn invalid_protocol_never_allocates_capacity() {
 }
 
 #[test]
+fn supervisor_inhibition_denies_entry_without_releasing_live_or_reserved_capacity() {
+    use amc_admission::{clock::boot_ms, health::Health, native::Supervised};
+    let root = std::env::temp_dir().join(format!("amc-supervised-{}", fresh_id().unwrap()));
+    std::fs::create_dir_all(&root).unwrap();
+    let health_file = root.join("health.json");
+    let mut health = Health {
+        version: 1,
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .into(),
+        observed_boot_ms: boot_ms().unwrap(),
+        inhibit: false,
+        degraded: false,
+    };
+    std::fs::write(&health_file, serde_json::to_vec(&health).unwrap()).unwrap();
+    let socket = root.join("run/admission.sock");
+    let done = Arc::new(AtomicBool::new(false));
+    let server = thread::spawn({
+        let root = root.clone();
+        let done = done.clone();
+        let health_file = health_file.clone();
+        move || {
+            let mut p = policy();
+            p.budget_bytes = 2000;
+            serve(
+                p,
+                &root.join("run/admission.sock"),
+                &root.join("state"),
+                Supervised {
+                    native: Fake {
+                        terminated: Arc::new(AtomicBool::new(false)),
+                    },
+                    health_file: Some(health_file),
+                },
+                || done.load(Ordering::SeqCst),
+            )
+        }
+    });
+    wait(|| call(&socket, Message::Status).is_ok());
+    let (a, a_key) = enqueue(socket.clone());
+    let (b, b_key) = enqueue(socket.clone());
+    wait(|| {
+        call(&socket, Message::Poll { id: b.id.clone() })
+            .unwrap()
+            .entry
+            .unwrap()
+            .phase
+            == Phase::Reserved
+    });
+    call(
+        &socket,
+        Message::Enter {
+            id: a.id.clone(),
+            key: a_key,
+        },
+    )
+    .unwrap();
+    health.inhibit = true;
+    std::fs::write(&health_file, serde_json::to_vec(&health).unwrap()).unwrap();
+    assert!(
+        call(
+            &socket,
+            Message::Enter {
+                id: b.id.clone(),
+                key: b_key
+            }
+        )
+        .is_err()
+    );
+    let status = call(&socket, Message::Status).unwrap().status.unwrap();
+    assert_eq!(status.committed_bytes, 1200);
+    assert!(
+        status
+            .entries
+            .iter()
+            .any(|e| e.id == a.id && e.phase == Phase::Running)
+    );
+    assert!(
+        status
+            .entries
+            .iter()
+            .any(|e| e.id == b.id && e.phase == Phase::Reserved)
+    );
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn public_ticket_status_does_not_authorize_entry() {
     use amc_admission::protocol::{Request, Response, read_frame, write_frame};
     use std::os::unix::net::UnixStream;
