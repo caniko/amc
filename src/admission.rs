@@ -358,6 +358,17 @@ fn run(
         client.arg("--host-socket").arg(host_socket);
     }
     client.arg("--").args(argv);
+    // A reservation reply can arrive after the client's wait has expired.
+    // The coordinator's extra entry grace must not authorize a late submission.
+    if signals.cancelled().is_some() || Instant::now() >= deadline {
+        let _ = call(
+            socket,
+            Message::Cancel {
+                id: entry.id.clone(),
+            },
+        );
+        anyhow::bail!("admission cancelled or timed out before submission");
+    }
     let outcome = execute(
         &mut client,
         Path::new("systemctl"),

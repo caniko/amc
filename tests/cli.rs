@@ -263,6 +263,110 @@ fn admission_execution_deadline_rejects_invalid_values_before_contacting_server(
 }
 
 #[test]
+fn delayed_admission_grants_cannot_submit_after_the_client_deadline() {
+    use amc_admission::{
+        ledger::{Contract, Entry, Phase},
+        protocol::{Message, Request, Response, read_frame, write_frame},
+    };
+    use std::os::unix::net::UnixListener;
+
+    for delayed_reply in ["enqueue", "poll"] {
+        let f = Fixture::new();
+        let socket = f.0.join("admission.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let mut entry = Entry {
+                id: "deadline-ticket".into(),
+                name: "test".into(),
+                contract: Contract {
+                    slice: "app.slice".into(),
+                    memory_max: 1024,
+                    memory_swap_max: 0,
+                    max_running: 1,
+                    pause_file: None,
+                },
+                phase: Phase::Queued,
+                deadline_ms: amc_admission::server::now_ms().unwrap() + 30_000,
+                identity: None,
+                client: None,
+            };
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: Request = read_frame(&mut stream).unwrap();
+            assert!(matches!(
+                request.message,
+                Message::Enqueue { wait_ms: 1000, .. }
+            ));
+            if delayed_reply == "enqueue" {
+                thread::sleep(Duration::from_millis(1200));
+                entry.phase = Phase::Reserved;
+            }
+            write_frame(
+                &mut stream,
+                &Response {
+                    version: 1,
+                    entry_key: Some("private-key".into()),
+                    entry: Some(entry.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if delayed_reply == "poll" {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let request: Request = read_frame(&mut stream).unwrap();
+                assert!(matches!(request.message, Message::Poll { id } if id == entry.id));
+                thread::sleep(Duration::from_millis(1200));
+                entry.phase = Phase::Reserved;
+                write_frame(
+                    &mut stream,
+                    &Response {
+                        version: 1,
+                        entry: Some(entry.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: Request = read_frame(&mut stream).unwrap();
+            assert!(matches!(request.message, Message::Cancel { id } if id == entry.id));
+            write_frame(
+                &mut stream,
+                &Response {
+                    version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
+        let mut command = f.command("reject");
+        command
+            .args(["admission", "exec", "--socket"])
+            .arg(&socket)
+            .args(["--contract", "test", "--timeout", "1", "--", "true"]);
+        let output = bounded(command);
+        server.join().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !f.0.join("calls").exists(),
+            "late {delayed_reply} reply submitted native work"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cancelled or timed out before submission")
+        );
+    }
+}
+
+#[test]
 fn report_renders_a_complete_capture_offline_and_rejects_corruption() {
     let f = Fixture::new();
     let capture = f.0.join("capture");
