@@ -50,6 +50,8 @@
         time.sleep(1)
   '';
   heartbeatProbe = pkgs.writeText "amc-supervision-heartbeat-test.py" (builtins.readFile ./supervision-heartbeat-test.py);
+  admissionFailures = pkgs.writeText "amc-supervision-admission-failures.py" (builtins.readFile ./supervision-admission-failures.py);
+  failureWorkload = pkgs.writeText "amc-supervision-failure-workload.py" (builtins.readFile ./supervision-failure-workload.py);
 in
   (pkgs.testers.runNixOSTest {
     name = "amc-supervision";
@@ -69,24 +71,30 @@ in
           resume_ms = 250;
           aging_ms = 1000;
           queue_limit = 16;
-          domains = [
-            {
-              name = "heartbeat";
-              uid = 0;
-              cgroup = "/heartbeat.slice";
-              ceiling_bytes = 64 * 1024 * 1024;
-              swap_bytes = 0;
-              fair_share_bytes = 64 * 1024 * 1024;
-            }
-          ];
+          domains = map (name: {
+            inherit name;
+            uid = 0;
+            cgroup = "/${name}.slice";
+            ceiling_bytes = 64 * 1024 * 1024;
+            swap_bytes = 0;
+            fair_share_bytes = 64 * 1024 * 1024;
+          }) ["heartbeat" "retained" "telemetry"];
         };
       };
       systemd.slices.heartbeat.sliceConfig = {
         MemoryMax = "64M";
         MemorySwapMax = 0;
       };
-      systemd.services.amc-host-admission.requires = ["heartbeat.slice"];
-      systemd.services.amc-host-admission.after = ["heartbeat.slice"];
+      systemd.slices.retained.sliceConfig = {
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+      };
+      systemd.slices.telemetry.sliceConfig = {
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+      };
+      systemd.services.amc-host-admission.requires = ["heartbeat.slice" "retained.slice" "telemetry.slice"];
+      systemd.services.amc-host-admission.after = ["heartbeat.slice" "retained.slice" "telemetry.slice"];
       virtualisation.memorySize = 2048;
       boot.kernel.sysctl."vm.panic_on_oom" = 0;
       environment.systemPackages = [package pkgs.python3];
@@ -124,6 +132,16 @@ in
           OOMPolicy = "kill";
           TimeoutStopSec = "2s";
         };
+      };
+      systemd.services."amc-failure@".serviceConfig = {
+        ExecStart = "${pkgs.python3}/bin/python3 ${failureWorkload} %i";
+        Slice = "system.slice";
+        MemoryMax = "64M";
+        MemorySwapMax = 0;
+        Restart = "no";
+        KillMode = "control-group";
+        OOMPolicy = "kill";
+        TimeoutStopSec = "2s";
       };
     };
     testScript = ''
@@ -198,6 +216,9 @@ in
           assert machine.succeed("systemctl show heartbeat.slice -p ControlGroup --value").strip() == "/heartbeat.slice"
           machine.succeed("python3 ${heartbeatProbe}")
 
+      with subtest("invalid heartbeat and missing memory observations retain live grants"):
+          machine.succeed("python3 ${admissionFailures}")
+
       with subtest("cold failed backend recovers once with durable invocation accounting"):
           machine.execute("systemctl start amc-cold-backend")
           wait_for(lambda: machine.succeed("systemctl show amc-cold-backend -p ActiveState --value").strip() == "failed", 10)
@@ -246,13 +267,15 @@ in
           assert machine.succeed("systemctl show amc-backend -p InvocationID --value").strip() == third
           machine.succeed("systemctl stop amc-shadow amc-backend")
 
+      exec(${builtins.toJSON (builtins.readFile ./supervision-recovery-failures.py)})
+
       with subtest("native recovery completes without OOM kills"):
           final_oom = oom_events()
           assert initial_oom["oom_kill"] == final_oom["oom_kill"] == 0, (initial_oom, final_oom)
           assert initial_oom["oom"] == final_oom["oom"] == 0, (initial_oom, final_oom)
           assert initial_oom["host_oom_kill"] == final_oom["host_oom_kill"] == 0, (initial_oom, final_oom)
           machine.succeed("cat > /var/lib/amc-fixture/oom.json <<'EOF'\n" + json.dumps({"initial": initial_oom, "final": final_oom}) + "\nEOF")
-      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/replay-input.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/cold-status.json /var/lib/amc-fixture/evidence/")
+      machine.succeed("mkdir -p /var/lib/amc-fixture/evidence; cp /var/lib/amc-supervision/trace.jsonl /var/lib/amc-supervision/recovery.json /run/amc-supervision/status.json /var/lib/amc-fixture/replay.json /var/lib/amc-fixture/replay-input.json /var/lib/amc-fixture/oom.json /var/lib/amc-fixture/heartbeat.json /var/lib/amc-fixture/cold-status.json /var/lib/amc-fixture/admission-failures.json /var/lib/amc-fixture/admission-observations.json /var/lib/amc-fixture/replacement-status.json /var/lib/amc-fixture/domain-budget-status.json /var/lib/amc-fixture/host-budget-status.json /var/lib/amc-fixture/foreign-status.json /var/lib/amc-fixture/evidence/")
       machine.copy_from_machine("/var/lib/amc-fixture/evidence", "supervision")
     '';
   }).overrideTestDerivation (previous:

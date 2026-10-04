@@ -15,7 +15,7 @@ class NativeEvidenceTests(unittest.TestCase):
     def test_supervision_exports_are_complete_and_have_no_oom_events(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "replay-input.json", "oom.json", "heartbeat.json", "cold-status.json")
+            names = ("trace.jsonl", "recovery.json", "status.json", "replay.json", "replay-input.json", "oom.json", "heartbeat.json", "cold-status.json", "admission-failures.json", "admission-observations.json", "replacement-status.json", "domain-budget-status.json", "host-budget-status.json", "foreign-status.json")
             for name in names:
                 (path / name).write_text("{}")
             clean = {phase: {"oom": 0, "oom_kill": 0, "host_oom_kill": 0} for phase in ("initial", "final")}
@@ -26,6 +26,8 @@ class NativeEvidenceTests(unittest.TestCase):
                 {"inhibit": False, "age_ms": 0, "granted": True},
             ]
             (path / "heartbeat.json").write_text(json.dumps(heartbeat))
+            self.admission_evidence(path)
+            self.recovery_evidence(path)
             cold = {"recovery": {"active": None, "attempts": [{"domain": "cold-backend"}]}}
             (path / "cold-status.json").write_text(json.dumps(cold))
             binding = {
@@ -79,6 +81,89 @@ class NativeEvidenceTests(unittest.TestCase):
         path = Path(directory) / "junit.xml"
         ET.ElementTree(root).write(path)
         return path
+
+    def admission_evidence(self, path):
+        entries = []
+        def sample(case):
+            valid = case == "valid"
+            if valid:
+                entries.append({"id": str(len(entries)), "memory_bytes": 64 * 1024**2, "granted": True})
+            return {"case": case, "granted": valid, "samples": 20, "elapsedSeconds": 2.1,
+                    "committedBytes": sum(r["memory_bytes"] for r in entries), "retained": entries.copy(),
+                    "waiting": None if valid else "unknown"}
+        heartbeats = [sample(case) for case in ["valid", "missing", "malformed", "oversized", "writable", "foreign-owner", "symlink", "expired", "future", "changed-boot", "inhibit", "degraded", "valid"]]
+        memory = [sample(case) for case in ["missing-meminfo", "malformed-meminfo", "missing-memory-psi", "malformed-memory-psi", "valid"]]
+        (path / "admission-failures.json").write_text(json.dumps(heartbeats))
+        (path / "admission-observations.json").write_text(json.dumps(memory))
+        return heartbeats, memory
+
+    def test_native_denial_requires_retained_ceilings_multiple_ticks_and_restored_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            heartbeats, memory = self.admission_evidence(path)
+            hosted.verify_admission_failures(path)
+            for filename, original in [("admission-failures.json", heartbeats), ("admission-observations.json", memory)]:
+                for field, value in [("granted", True), ("samples", 1), ("elapsedSeconds", 0.1), ("committedBytes", 0), ("retained", []), ("waiting", None)]:
+                    broken = json.loads(json.dumps(original))
+                    index = 1 if filename == "admission-failures.json" else 0
+                    broken[index][field] = value
+                    (path / filename).write_text(json.dumps(broken))
+                    with self.subTest(file=filename, field=field), self.assertRaises(RuntimeError):
+                        hosted.verify_admission_failures(path)
+                broken = json.loads(json.dumps(original))
+                index = 1 if filename == "admission-failures.json" else 0
+                extra = dict(broken[index]["retained"][0], id="unexpected-async-grant")
+                broken[index]["retained"].append(extra)
+                broken[index]["committedBytes"] += extra["memory_bytes"]
+                (path / filename).write_text(json.dumps(broken))
+                with self.subTest(asynchronous_grant=filename), self.assertRaises(RuntimeError):
+                    hosted.verify_admission_failures(path)
+                (path / filename).write_text(json.dumps(original[:-1]))
+                with self.subTest(missing_recovery=filename), self.assertRaises(RuntimeError):
+                    hosted.verify_admission_failures(path)
+                (path / filename).write_text(json.dumps(original))
+
+    def recovery_evidence(self, path):
+        identity = {"invocation": "a" * 32}
+        original = {"identity": identity, "phase": {"phase": "cooling"}}
+        status = {"inhibit": True, "recovery": {"active": {"identity": identity, "phase": {"phase": "tripped"}}, "attempts": [{"domain": "replacement"}]}}
+        replacement = {"original": original, "replacementInvocation": "b" * 32, "status": status}
+        (path / "replacement-status.json").write_text(json.dumps(replacement))
+        for name, domains, domain_limit, host_limit in [("domain", ["budget-a", "budget-a"], 2, 4), ("host", ["budget-b", "budget-a"], 3, 2)]:
+            attempts = [{"domain": domain, "unix_ms": index} for index, domain in enumerate(domains)]
+            state = {"inhibit": True, "policy": {"domain_recovery_limit": domain_limit, "host_recovery_limit": host_limit},
+                     "recovery": {"active": {"identity": identity, "phase": {"phase": "tripped"}}, "attempts": attempts}}
+            receipt = {"beforeRestart": state, "afterRestart": state, "failedInvocation": identity["invocation"],
+                       "completedRecoveries": [{"recovery": {"active": None, "attempts": attempts[:index]}} for index in (1, 2)]}
+            (path / (name + "-budget-status.json")).write_text(json.dumps(receipt))
+        foreign = {"invocation": "c" * 32, "finalInvocation": "c" * 32, "starts": 1, "childAlive": True}
+        (path / "foreign-status.json").write_text(json.dumps(foreign))
+
+    def test_recovery_receipts_reject_replacement_budget_reset_and_foreign_disruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self.recovery_evidence(path)
+            hosted.verify_recovery_failures(path)
+            mutations = [
+                ("replacement-status.json", lambda r: r.update(replacementInvocation="a" * 32)),
+                ("replacement-status.json", lambda r: r["status"]["recovery"]["active"].update(identity={"invocation": "b" * 32})),
+                ("replacement-status.json", lambda r: r["status"].update(inhibit=False)),
+                ("domain-budget-status.json", lambda r: r["afterRestart"]["recovery"]["attempts"].pop()),
+                ("domain-budget-status.json", lambda r: r["afterRestart"]["policy"].update(domain_recovery_limit=3)),
+                ("host-budget-status.json", lambda r: r["afterRestart"]["recovery"]["attempts"][1].update(domain="budget-b")),
+                ("host-budget-status.json", lambda r: r["completedRecoveries"][0]["recovery"].update(active="cooling")),
+                ("host-budget-status.json", lambda r: r.update(failedInvocation="b" * 32)),
+                ("foreign-status.json", lambda r: r.update(finalInvocation="d" * 32)),
+                ("foreign-status.json", lambda r: r.update(childAlive=False)),
+            ]
+            for filename, mutate in mutations:
+                original = (path / filename).read_text()
+                broken = json.loads(original)
+                mutate(broken)
+                (path / filename).write_text(json.dumps(broken))
+                with self.subTest(file=filename, mutation=mutate), self.assertRaises(RuntimeError):
+                    hosted.verify_recovery_failures(path)
+                (path / filename).write_text(original)
 
     def test_complete_successful_native_execution_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
