@@ -73,7 +73,7 @@ in
             {
               name = "heartbeat";
               uid = 0;
-              cgroup = "/heartbeat-work.slice";
+              cgroup = "/heartbeat.slice";
               ceiling_bytes = 64 * 1024 * 1024;
               swap_bytes = 0;
               fair_share_bytes = 64 * 1024 * 1024;
@@ -81,12 +81,12 @@ in
           ];
         };
       };
-      systemd.slices.heartbeat-work.sliceConfig = {
+      systemd.slices.heartbeat.sliceConfig = {
         MemoryMax = "64M";
         MemorySwapMax = 0;
       };
-      systemd.services.amc-host-admission.requires = ["heartbeat-work.slice"];
-      systemd.services.amc-host-admission.after = ["heartbeat-work.slice"];
+      systemd.services.amc-host-admission.requires = ["heartbeat.slice"];
+      systemd.services.amc-host-admission.after = ["heartbeat.slice"];
       virtualisation.memorySize = 2048;
       boot.kernel.sysctl."vm.panic_on_oom" = 0;
       environment.systemPackages = [package pkgs.python3];
@@ -168,6 +168,7 @@ in
 
       with subtest("host admission denies inhibited and expired heartbeats"):
           machine.wait_for_unit("amc-host-admission.service")
+          assert machine.succeed("systemctl show heartbeat.slice -p ControlGroup --value").strip() == "/heartbeat.slice"
           machine.succeed("python3 ${heartbeatProbe}")
 
       with subtest("shadow observations have no intervention authority"):
