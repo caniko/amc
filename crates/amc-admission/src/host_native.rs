@@ -205,7 +205,11 @@ pub fn ancestor_headroom(
 }
 
 pub fn capacity() -> Result<Capacity> {
-    let memory = fs::read_to_string("/proc/meminfo")?;
+    capacity_at(Path::new("/proc"))
+}
+
+fn capacity_at(proc: &Path) -> Result<Capacity> {
+    let memory = fs::read_to_string(proc.join("meminfo"))?;
     let available = memory
         .lines()
         .find_map(|l| l.strip_prefix("MemAvailable:"))
@@ -225,13 +229,15 @@ pub fn capacity() -> Result<Capacity> {
         swap_free_bytes: swap_kib
             .checked_mul(1024)
             .context("swap accounting overflow")?,
-        memory_full_psi: psi("memory")?,
-        io_full_psi: psi("io")?,
+        memory_full_psi: psi(&proc.join("pressure/memory"))?,
+        // Keep memory observations fail-closed. Missing or malformed I/O is
+        // represented as unknown so only I/O-enforcing domains stop admission.
+        io_full_psi: psi(&proc.join("pressure/io")).unwrap_or(f64::NAN),
     })
 }
 
-fn psi(kind: &str) -> Result<f64> {
-    let text = fs::read_to_string(format!("/proc/pressure/{kind}"))?;
+fn psi(path: &Path) -> Result<f64> {
+    let text = fs::read_to_string(path)?;
     let full = text
         .lines()
         .find(|l| l.starts_with("full "))
@@ -251,6 +257,32 @@ fn psi(kind: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_io_failure_does_not_hide_required_memory_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "amc-host-capacity-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(path.join("pressure")).unwrap();
+        fs::write(
+            path.join("meminfo"),
+            "MemAvailable: 1048576 kB\nSwapFree: 1048576 kB\n",
+        )
+        .unwrap();
+        fs::write(path.join("pressure/memory"), "full avg10=0.00\n").unwrap();
+        assert!(capacity_at(&path).unwrap().io_full_psi.is_nan());
+        for malformed in ["some avg10=0.00\n", "full avg10=NaN\n", "full avg10=101\n"] {
+            fs::write(path.join("pressure/io"), malformed).unwrap();
+            assert!(capacity_at(&path).unwrap().io_full_psi.is_nan());
+            fs::write(path.join("pressure/memory"), malformed).unwrap();
+            assert!(capacity_at(&path).is_err());
+            fs::write(path.join("pressure/memory"), "full avg10=0.00\n").unwrap();
+        }
+        fs::write(path.join("meminfo"), "SwapFree: 1048576 kB\n").unwrap();
+        assert!(capacity_at(&path).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn surviving_descendants_unknown_events_and_replaced_cgroups_hold_capacity() {

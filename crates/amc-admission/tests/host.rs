@@ -1,5 +1,106 @@
 use amc_admission::host::*;
 
+#[test]
+fn legacy_policies_keep_enforced_io_and_unknown_modes_are_rejected() {
+    let mut json = serde_json::to_value(policy()).unwrap();
+    for domain in json["domains"].as_array_mut().unwrap() {
+        domain.as_object_mut().unwrap().remove("io_pressure");
+        domain
+            .as_object_mut()
+            .unwrap()
+            .remove("min_available_bytes");
+    }
+    let p: HostPolicy = serde_json::from_value(json.clone()).unwrap();
+    assert!(
+        p.domains
+            .iter()
+            .all(|d| d.io_pressure == IoPressure::Enforce && d.min_available_bytes == 0)
+    );
+    json["domains"][0]["io_pressure"] = serde_json::json!("disabled");
+    assert!(serde_json::from_value::<HostPolicy>(json).is_err());
+}
+
+#[test]
+fn diagnostic_io_domains_progress_without_bypassing_memory_or_peer_io_hysteresis() {
+    let mut json = serde_json::to_value(policy()).unwrap();
+    json["domains"][1]["io_pressure"] = serde_json::json!("diagnostic");
+    json["domains"][1]["min_available_bytes"] = serde_json::json!(60);
+    let p: HostPolicy = serde_json::from_value(json).unwrap();
+    p.validate().unwrap();
+    let mut l = HostLedger::new("boot".into());
+    l.request(job("builder", 1000, 10), &p).unwrap();
+    l.request(job("evaluation", 1001, 10), &p).unwrap();
+    let mut since = Default::default();
+    let high_io = Some(Capacity {
+        io_full_psi: 60.72,
+        ..capacity().unwrap()
+    });
+    l.advance(0, &p, high_io, &mut since, |_, _| Some(200));
+    let waits = l.advance(1500, &p, high_io, &mut since, |_, _| Some(200));
+    assert_eq!(waits["builder"], WaitReason::Pressure);
+    assert!(!waits.contains_key("evaluation"));
+    assert_eq!(l.committed(), 10);
+    // The enforced peer needs its own full recovery window, even though the
+    // diagnostic domain has been healthy throughout the I/O spike.
+    l.advance(1750, &p, capacity(), &mut since, |_, _| Some(200));
+    assert_eq!(l.committed(), 10);
+    l.advance(2000, &p, capacity(), &mut since, |_, _| Some(200));
+    assert_eq!(l.committed(), 20);
+
+    for c in [
+        Capacity {
+            memory_full_psi: 1.0,
+            ..capacity().unwrap()
+        },
+        Capacity {
+            memory_full_psi: f64::NAN,
+            ..capacity().unwrap()
+        },
+        Capacity {
+            available_bytes: 59,
+            ..capacity().unwrap()
+        },
+    ] {
+        let mut l = HostLedger::new("boot".into());
+        let mut since = Default::default();
+        l.request(job("evaluation", 1001, 10), &p).unwrap();
+        l.advance(0, &p, Some(c), &mut since, |_, _| Some(200));
+        assert_eq!(
+            l.advance(250, &p, Some(c), &mut since, |_, _| Some(200))["evaluation"],
+            WaitReason::Pressure
+        );
+        assert_eq!(l.committed(), 0);
+    }
+}
+
+#[test]
+fn unavailable_io_telemetry_blocks_only_enforced_domains() {
+    let mut json = serde_json::to_value(policy()).unwrap();
+    json["domains"][1]["io_pressure"] = serde_json::json!("diagnostic");
+    let p: HostPolicy = serde_json::from_value(json).unwrap();
+    for io in [f64::NAN, -1.0, 101.0] {
+        let mut l = HostLedger::new("boot".into());
+        let mut since = Default::default();
+        l.request(job("builder", 1000, 10), &p).unwrap();
+        l.request(job("evaluation", 1001, 10), &p).unwrap();
+        let c = Some(Capacity {
+            io_full_psi: io,
+            ..capacity().unwrap()
+        });
+        l.advance(0, &p, c, &mut since, |_, _| Some(200));
+        let waits = l.advance(250, &p, c, &mut since, |_, _| Some(200));
+        assert_eq!(waits["builder"], WaitReason::Pressure);
+        assert!(!waits.contains_key("evaluation"));
+        assert_eq!(l.committed(), 10);
+        l.request(job("missing-memory", 1001, 10), &p).unwrap();
+        assert_eq!(
+            l.advance(500, &p, None, &mut since, |_, _| Some(200))["missing-memory"],
+            WaitReason::Unknown
+        );
+        assert_eq!(l.committed(), 10);
+    }
+}
+
 fn policy() -> HostPolicy {
     HostPolicy {
         version: 1,
@@ -19,6 +120,8 @@ fn policy() -> HostPolicy {
                 ceiling_bytes: 80,
                 swap_bytes: 40,
                 fair_share_bytes: 40,
+                io_pressure: IoPressure::Enforce,
+                min_available_bytes: 0,
             })
             .collect(),
     }
@@ -51,11 +154,15 @@ fn capacity() -> Option<Capacity> {
     })
 }
 
+fn healthy_since() -> std::collections::BTreeMap<String, u64> {
+    policy().domains.into_iter().map(|d| (d.name, 0)).collect()
+}
+
 #[test]
 fn swap_never_extends_ram_capacity_and_future_swap_growth_is_reserved() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     let mut r = job("work", 1000, 50);
     r.swap_bytes = 40;
     l.request(r, &p).unwrap();
@@ -82,7 +189,7 @@ fn swap_never_extends_ram_capacity_and_future_swap_growth_is_reserved() {
 fn shared_ancestor_accounts_grants_made_earlier_in_the_same_tick() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("first", 1000, 30), &p).unwrap();
     l.request(job("second", 1001, 30), &p).unwrap();
     let waits = l.advance(250, &p, capacity(), &mut since, |_, entries| {
@@ -103,7 +210,7 @@ fn idle_shares_are_lent_but_a_busy_participant_cannot_outrank_an_idle_peer() {
     let p = policy();
     p.validate().unwrap();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("first", 1000, 40), &p).unwrap();
     l.advance(250, &p, capacity(), &mut since, |_, _| Some(200));
     l.request(job("borrow", 1000, 40), &p).unwrap();
@@ -137,7 +244,7 @@ fn idle_shares_are_lent_but_a_busy_participant_cannot_outrank_an_idle_peer() {
 fn policy_reduction_preserves_live_grants_and_forbids_more() {
     let mut p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("first", 1000, 60), &p).unwrap();
     l.advance(250, &p, capacity(), &mut since, |_, _| Some(200));
     p.budget_bytes = 50;
@@ -169,7 +276,7 @@ fn duplicate_native_requests_do_not_allocate_twice_or_change_the_ceiling() {
 fn expired_ungranted_work_cannot_claim_capacity() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("first", 1000, 40), &p).unwrap();
     l.advance(10_000, &p, capacity(), &mut since, |_, _| Some(200));
     assert!(l.reservations.is_empty());
@@ -185,6 +292,8 @@ fn independent_root_handlers_join_one_bounded_pool_without_releasing_each_other(
         ceiling_bytes: 40,
         swap_bytes: 0,
         fair_share_bytes: 40,
+        io_pressure: IoPressure::Enforce,
+        min_available_bytes: 0,
     });
     p.validate().unwrap();
     let mut l = HostLedger::new("boot".into());
@@ -193,7 +302,8 @@ fn independent_root_handlers_join_one_bounded_pool_without_releasing_each_other(
     r.identity.uid = 0;
     r.identity.cgroup = "/builders".into();
     l.request(r.clone(), &p).unwrap();
-    let mut since = Some(0);
+    let mut since = healthy_since();
+    since.insert("builders".into(), 0);
     l.advance(250, &p, capacity(), &mut since, |_, _| Some(200));
     r.id = "second".into();
     r.identity.pid = 1001;
@@ -216,7 +326,7 @@ fn exhausted_host_swap_inhibits_even_a_zero_swap_contract_and_recovery_is_deboun
     let p = policy();
     let mut l = HostLedger::new("boot".into());
     l.request(job("no-swap", 1000, 10), &p).unwrap();
-    let mut since = Some(0);
+    let mut since = healthy_since();
     let mut c = capacity().unwrap();
     c.swap_free_bytes = p.swap_reserve_bytes - 1;
     assert_eq!(
@@ -234,7 +344,7 @@ fn exhausted_host_swap_inhibits_even_a_zero_swap_contract_and_recovery_is_deboun
 fn simultaneous_users_cannot_spend_the_same_capacity() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("can", 1000, 50), &p).unwrap();
     l.request(job("dejana", 1001, 50), &p).unwrap();
     let waits = l.advance(250, &p, capacity(), &mut since, |_, _| Some(100));
@@ -249,7 +359,7 @@ fn simultaneous_users_cannot_spend_the_same_capacity() {
 fn lost_clients_unknown_cleanup_and_deadlines_never_release_running_work() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("work", 1000, 50), &p).unwrap();
     l.advance(250, &p, capacity(), &mut since, |_, _| Some(100));
     l.reconcile(|_| None);
@@ -265,7 +375,7 @@ fn lost_clients_unknown_cleanup_and_deadlines_never_release_running_work() {
 fn small_jobs_backfill_until_an_older_large_request_ages() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("running", 1000, 50), &p).unwrap();
     l.advance(250, &p, capacity(), &mut since, |_, _| Some(100));
     l.request(job("large", 1001, 40), &p).unwrap();
@@ -281,7 +391,7 @@ fn small_jobs_backfill_until_an_older_large_request_ages() {
 fn pressure_inhibits_immediately_and_recovery_is_debounced() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
-    let mut since = Some(0);
+    let mut since = healthy_since();
     l.request(job("work", 1000, 50), &p).unwrap();
     let c = Some(Capacity {
         memory_full_psi: 1.0,

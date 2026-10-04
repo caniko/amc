@@ -174,7 +174,7 @@ pub fn serve(
     listener.set_nonblocking(true)?;
     store.save_snapshot(&ledger)?;
     let mut tick = Instant::now();
-    let mut healthy_since = None;
+    let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
     while !stopping() {
         if tick.elapsed() >= Duration::from_millis(250) {

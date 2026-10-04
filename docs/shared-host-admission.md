@@ -42,3 +42,16 @@ entry, overlapping users, broker restart, automatic resumption, changed native
 enforcement, entry attempts omitting the host handshake, cancellation, root pool
 owner retention and per-user status isolation. Native VM/package qualification
 is required before deployment.
+
+## Domain pressure policy
+
+Host domains may explicitly set `io_pressure = "diagnostic"` and
+`min_available_bytes` for evaluation workloads. Missing fields preserve the
+original policy: enforced host I/O PSI and no additional RAM floor. The flake
+exports `lib.hostDomainPressureVersion = 1` for consumers that need this schema.
+
+Diagnostic I/O never bypasses memory/swap observations, the domain RAM floor,
+ceiling-backed host/ancestor accounting, fairness, native identity validation or
+cleanup. Missing or malformed I/O telemetry stops only enforced domains. Each
+domain retains its own recovery window; an aged pressure-inhibited domain does
+not block healthy peers, while capacity-inhibited requests retain aging priority.
