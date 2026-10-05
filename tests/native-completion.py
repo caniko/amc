@@ -25,9 +25,15 @@ def check(amc, admission=False):
             "$literal; --unit=foreign.service", str(code)],
             input="stdin\n", capture_output=True, text=True, timeout=40, check=False,
             env=dict(os.environ, AMC_COMPLETION_VALUE="environment"))
-        assert (run.returncode, run.stdout, run.stderr) == (
+        # The first host acquisition can wait for the next broker tick. Its
+        # existing one-time diagnostic precedes the payload's stderr; retain
+        # that evidence separately while checking the payload bytes exactly.
+        diagnostic = "waiting for host capacity: None\n"
+        host_wait = admission and run.stderr.startswith(diagnostic)
+        stderr = run.stderr.removeprefix(diagnostic) if host_wait else run.stderr
+        assert (run.returncode, run.stdout, stderr) == (
             code, "$literal; --unit=foreign.service\nenvironment\nstdin\n", "stderr\n"), run
-        results.append({"exit": code, "streams": "preserved"})
+        results.append({"exit": code, "streams": "preserved", "host_wait_diagnostic": host_wait})
     return results
 
 
