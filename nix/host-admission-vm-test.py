@@ -239,6 +239,7 @@ Path("/tmp/amc-normal-user.json").write_text(json.dumps(user))
         machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/normal.sock")
     for index, uid in enumerate([1000, 1001, 1000, 1001, 1000, 1001]):
         machine.succeed(f"systemd-run --unit=sized-{index}-client --uid={uid} "
+                        "--setenv=PATH=/run/current-system/sw/bin "
                         f"--setenv=XDG_RUNTIME_DIR=/run/user/{uid} -- "
                         f"amc admission exec --socket /run/user/{uid}/amc/normal.sock --contract tool "
                         "--max-ram-usage 32MiB --runtime-max-sec 120 --timeout 30 -- /bin/sh -c " + shlex.quote(
@@ -300,6 +301,7 @@ with test_section("explicit burst cancellation confirms descendant cleanup"):
 with test_section("an aged ordinary request receives a native burst quiet window"):
     machine.sleep(10)
     machine.succeed("systemd-run --unit=quiet-base-client --uid=1000 "
+                    "--setenv=PATH=/run/current-system/sw/bin "
                     "--setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
                     "amc admission exec --contract tool --max-ram-usage 64MiB --timeout 30 -- /bin/sh -c " + shlex.quote(
                         "touch /tmp/quiet-base-entered; sleep 120"))

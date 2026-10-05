@@ -23,6 +23,11 @@ NATIVE_CASES = {
     "simultaneous users, restart persistence, and automatic lending",
     "changed native enforcement inhibits a fitting smaller job",
     "cancelled pending work never executes after native cleanup",
+    "short native bursts exceed the normal budget and retain restart accounting",
+    "sized ordinary calls use the normal budget with bursts disabled",
+    "burst client loss and private restart retain grants until cleanup is observable",
+    "explicit burst cancellation confirms descendant cleanup",
+    "an aged ordinary request receives a native burst quiet window",
 }
 SUPERVISION_CASES = {
     "identity-bound recovery waits for descendant cleanup and starts once",
