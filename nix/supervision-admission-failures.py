@@ -27,6 +27,21 @@ def call(domain=None):
     return reply
 
 
+def restart_broker():
+    subprocess.run(["systemctl", "restart", "amc-host-admission"], check=True)
+    # Type=simple start completion precedes bind(). Only a successful status
+    # exchange establishes readiness; an absent socket is not a denial sample.
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            call()
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def write_health(case):
     health = dict(original, observed_boot_ms=int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1000), inhibit=False, degraded=False)
     if case == "expired":
@@ -104,13 +119,13 @@ try:
         override.write_text(f"[Service]\nBindReadOnlyPaths={fixture}:{target}\n")
         write_health("valid")
         subprocess.run(["systemctl", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "restart", "amc-host-admission"], check=True)
+        restart_broker()
         result = probe("valid", "telemetry", False)
         result["case"] = name
         observations.append(result)
 finally:
     override.unlink(missing_ok=True)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "restart", "amc-host-admission"], check=True)
+    restart_broker()
 observations.append(probe("valid", "telemetry", True))
 (evidence_path / "admission-observations.json").write_text(json.dumps(observations))
