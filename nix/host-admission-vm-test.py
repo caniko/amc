@@ -191,4 +191,113 @@ with test_section("short native bursts exceed the normal budget and retain resta
     machine.succeed("systemctl stop full-a-client full-b-client full-c-client")
     wait_committed(0)
 
+with test_section("sized ordinary calls use the normal budget with bursts disabled"):
+    # Isolated endpoints use the same native domains, with both policy layers
+    # explicitly stripped of burst capacity. No jobs overlap the primary broker.
+    machine.succeed("python3 -c " + shlex.quote('''
+from pathlib import Path
+import json
+host = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
+host.pop("burst")
+host["domains"] = [d for d in host["domains"] if not d.get("burst")]
+user = json.loads(Path("/etc/amc-test-user-policy.json").read_text())
+user.pop("burst_budget_bytes")
+user["contracts"].pop("tool-burst")
+Path("/tmp/amc-normal-host.json").write_text(json.dumps(host))
+Path("/tmp/amc-normal-user.json").write_text(json.dumps(user))
+'''))
+    machine.succeed("systemd-run --unit=normal-host -- amc admission host-serve "
+                    "--policy /tmp/amc-normal-host.json --socket /run/amc-normal/admission.sock --state /var/lib/amc-normal")
+    machine.wait_until_succeeds("test -S /run/amc-normal/admission.sock")
+    for user, uid in [("alice", 1000), ("bob", 1001)]:
+        machine.succeed(f"systemd-run --unit=normal-private-{uid} --uid={uid} "
+                        f"--setenv=HOME=/home/{user} --setenv=XDG_RUNTIME_DIR=/run/user/{uid} -- "
+                        "amc admission serve --policy /tmp/amc-normal-user.json "
+                        f"--socket /run/user/{uid}/amc/normal.sock --state /home/{user}/.local/state/amc-normal "
+                        "--host-socket /run/amc-normal/admission.sock")
+        machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/normal.sock")
+    for index, uid in enumerate([1000, 1001, 1000, 1001, 1000, 1001]):
+        machine.succeed(f"systemd-run --unit=sized-{index}-client --uid={uid} "
+                        f"--setenv=XDG_RUNTIME_DIR=/run/user/{uid} -- "
+                        f"amc admission exec --socket /run/user/{uid}/amc/normal.sock --contract tool "
+                        "--max-ram-usage 32MiB --runtime-max-sec 120 --timeout 30 -- /bin/sh -c " + shlex.quote(
+                            f"touch /tmp/sized-{index}-entered; sleep 120"))
+        if index < 5:
+            wait_entered(f"sized-{index}")
+    machine.sleep(1)
+    machine.fail("test -e /tmp/sized-5-entered")
+    normal = json.loads(machine.succeed("amc admission host-status --socket /run/amc-normal/admission.sock"))
+    assert normal["committed_bytes"] == normal["budget_bytes"] == 160 * 1048576, normal
+    assert normal["burst_budget_bytes"] == normal["burst_committed_bytes"] == 0, normal
+    assert sum(r["granted"] for r in normal["reservations"]) == 5, normal
+    assert all(r["memory_bytes"] == 32 * 1048576 and not r.get("burst") for r in normal["reservations"]), normal
+    for r in normal["reservations"]:
+        machine.succeed(f"test $(cat /sys/fs/cgroup{r['identity']['cgroup']}/memory.max) = 33554432")
+    machine.succeed("systemctl stop sized-0-client")
+    wait_entered("sized-5")
+    machine.succeed("systemctl stop sized-1-client sized-2-client sized-3-client sized-4-client sized-5-client")
+    machine.wait_until_succeeds("amc admission host-status --socket /run/amc-normal/admission.sock | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == 0'), timeout=30)
+    machine.succeed("systemctl stop normal-private-1000 normal-private-1001 normal-host")
+
+with test_section("burst client loss and private restart retain grants until cleanup is observable"):
+    # Previous bursts deliberately persisted their cooldowns.
+    machine.sleep(10)
+    burst("burst-loss", 1000, "touch /tmp/burst-loss-entered; trap '' TERM; sleep 120 & wait")
+    wait_entered("burst-loss")
+    grant = next(r for r in status()["reservations"] if r.get("burst"))
+    group = "/sys/fs/cgroup" + grant["identity"]["cgroup"]
+    machine.succeed(f"grep -q '^populated 1$' {group}/cgroup.events")
+    machine.succeed("systemctl --user --machine=1000@.host restart amc-admission")
+    private = "runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 amc admission status --json"
+    restored = json.loads(machine.succeed(private))
+    assert restored["committed_bytes"] == 32 * 1048576, restored
+    assert any(e["phase"] == "running" and e["contract"]["burst"] for e in restored["entries"]), restored
+    machine.succeed("touch /tmp/amc-observation-unavailable")
+    machine.succeed("systemctl kill --kill-whom=main --signal=KILL burst-loss-client")
+    # Real systemd deadlines clean the entire cgroup while the private broker
+    # lacks evidence. Neither client death, restart nor expiry may free its grant.
+    wait_committed(0)
+    machine.wait_until_succeeds(private + " | python3 -c " + shlex.quote(
+        'import sys,json; s=json.load(sys.stdin); assert s["committed_bytes"] == 33554432 and s["unreconciled"]'), timeout=10)
+    machine.succeed(f"test ! -e {group} || grep -q '^populated 0$' {group}/cgroup.events")
+    machine.succeed("rm /tmp/amc-observation-unavailable")
+    machine.wait_until_succeeds(private + " | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == 0'), timeout=10)
+
+with test_section("explicit burst cancellation confirms descendant cleanup"):
+    burst("burst-cancel", 1001, "touch /tmp/burst-cancel-entered; trap '' TERM; sleep 120 & wait")
+    wait_entered("burst-cancel")
+    grant = next(r for r in status()["reservations"] if r.get("burst"))
+    group = "/sys/fs/cgroup" + grant["identity"]["cgroup"]
+    machine.succeed("systemctl stop burst-cancel-client")
+    wait_committed(0)
+    machine.succeed(f"test ! -e {group} || grep -q '^populated 0$' {group}/cgroup.events")
+    machine.wait_until_succeeds("runuser -u bob -- env XDG_RUNTIME_DIR=/run/user/1001 amc admission status --json | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == 0'), timeout=10)
+
+with test_section("an aged ordinary request receives a native burst quiet window"):
+    machine.sleep(10)
+    machine.succeed("systemd-run --unit=quiet-base-client --uid=1000 "
+                    "--setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+                    "amc admission exec --contract tool --max-ram-usage 64MiB --timeout 30 -- /bin/sh -c " + shlex.quote(
+                        "touch /tmp/quiet-base-entered; sleep 120"))
+    wait_entered("quiet-base")
+    burst("quiet-first", 1000, "touch /tmp/quiet-first-entered; trap '' TERM; sleep 120 & wait")
+    wait_entered("quiet-first")
+    launch("quiet-bulk", 1001, "tool", "touch /tmp/quiet-bulk-entered; sleep 120")
+    machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
+        'import sys,json; assert any(not r["granted"] and r["memory_bytes"] == 100663296 for r in json.load(sys.stdin)["reservations"])'), timeout=10)
+    # 64 MiB ordinary + 96 MiB bulk fits only after the first burst drains.
+    # A second 32 MiB burst would fit physically and within its allowance, but
+    # must not backfill past the one-second aging threshold.
+    machine.sleep(1.25)
+    burst("quiet-late", 1001, "touch /tmp/quiet-late-entered; sleep 120")
+    machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
+        'import sys,json; assert any(r.get("burst") and r["identity"]["uid"] == 1001 and not r["granted"] for r in json.load(sys.stdin)["reservations"])'), timeout=3)
+    machine.fail("test -e /tmp/quiet-late-entered")
+    wait_entered("quiet-bulk")
+    machine.succeed("systemctl stop quiet-base-client quiet-bulk-client quiet-late-client")
+    wait_committed(0)
+
 machine.succeed("test $(awk '$1 == \"oom_kill\" {print $2}' /proc/vmstat) = 0")

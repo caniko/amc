@@ -35,10 +35,17 @@
       };
     };
   });
+  observer = pkgs.writeShellScript "amc-fixture-systemctl" ''
+    # Simulate loss of manager observations without changing native enforcement.
+    if test -e /tmp/amc-observation-unavailable; then
+      exit 1
+    fi
+    exec ${pkgs.systemd}/bin/systemctl "$@"
+  '';
 in
   (pkgs.testers.runNixOSTest {
     name = "amc-shared-host-admission";
-    nodes.machine = {
+    nodes.machine = {config, ...}: {
       imports = [./host-admission-module.nix];
       services.amc.hostAdmission = {
         enable = true;
@@ -117,12 +124,14 @@ in
         requires = ["agent-tools.slice" "agent-burst.slice"];
         after = ["agent-tools.slice" "agent-burst.slice"];
         serviceConfig = {
-          ExecStart = "${package}/bin/amc admission serve --policy ${userPolicy} --host-socket /run/amc-host/admission.sock";
+          ExecStart = "${package}/bin/amc admission serve --policy ${userPolicy} --systemctl ${observer} --host-socket /run/amc-host/admission.sock";
           Restart = "on-failure";
         };
         path = [pkgs.systemd];
       };
       environment.systemPackages = [package pkgs.python3];
+      environment.etc."amc-test-user-policy.json".source = userPolicy;
+      environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
       virtualisation.memorySize = 2048;
       virtualisation.cores = 2;
     };
