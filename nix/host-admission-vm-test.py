@@ -31,10 +31,23 @@ def launch(name, uid, contract, command):
                     f"amc admission exec --contract {contract} --timeout 60 -- /bin/sh -c " + shlex.quote(command))
 
 
-def wait_entered(name):
+def wait_entered(name, host_socket=None):
     try:
         machine.wait_until_succeeds(f"test -f /tmp/{name}-entered", timeout=30)
-    except Exception:
+    except Exception as error:
+        if host_socket is not None:
+            queries = {
+                "host": "amc admission host-status --socket " + shlex.quote(host_socket),
+                "client": f"journalctl -b --no-pager -o cat -u {name}-client -n 12",
+                "brokers": "journalctl -b --no-pager -o cat -u normal-host -u normal-private-1000 -u normal-private-1001 -n 12",
+            }
+            for uid in [1000, 1001]:
+                queries[str(uid)] = (f"runuser -u {'alice' if uid == 1000 else 'bob'} -- "
+                                    f"env XDG_RUNTIME_DIR=/run/user/{uid} amc admission status --json "
+                                    f"--socket /run/user/{uid}/amc/normal.sock")
+            evidence = {key: machine.execute(command) for key, command in queries.items()}
+            # Keep the relevant endpoints and client in the final Nix log tail.
+            raise AssertionError(json.dumps({"payload": name, "evidence": evidence})) from error
         print(machine.succeed("journalctl -b --no-pager -n 100"))
         print(machine.succeed("amc admission host-status"))
         raise
@@ -231,7 +244,7 @@ Path("/tmp/amc-normal-user.json").write_text(json.dumps(user))
                         "--max-ram-usage 32MiB --runtime-max-sec 120 --timeout 30 -- /bin/sh -c " + shlex.quote(
                             f"touch /tmp/sized-{index}-entered; sleep 120"))
         if index < 5:
-            wait_entered(f"sized-{index}")
+            wait_entered(f"sized-{index}", "/run/amc-normal/admission.sock")
     machine.sleep(1)
     machine.fail("test -e /tmp/sized-5-entered")
     normal = json.loads(machine.succeed("amc admission host-status --socket /run/amc-normal/admission.sock"))
@@ -242,7 +255,7 @@ Path("/tmp/amc-normal-user.json").write_text(json.dumps(user))
     for r in normal["reservations"]:
         machine.succeed(f"test $(cat /sys/fs/cgroup{r['identity']['cgroup']}/memory.max) = 33554432")
     machine.succeed("systemctl stop sized-0-client")
-    wait_entered("sized-5")
+    wait_entered("sized-5", "/run/amc-normal/admission.sock")
     machine.succeed("systemctl stop sized-1-client sized-2-client sized-3-client sized-4-client sized-5-client")
     machine.wait_until_succeeds("amc admission host-status --socket /run/amc-normal/admission.sock | python3 -c " + shlex.quote(
         'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == 0'), timeout=30)
