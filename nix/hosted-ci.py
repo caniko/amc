@@ -17,6 +17,7 @@ ALLOWED = {
     ".#nixosTests.x86_64-linux.supervision",
 }
 NATIVE_CASES = {
+    "rapid native and admitted jobs preserve completion and fail closed on startup loss",
     "durable root pool tracks every potential execution owner",
     "helper cannot omit host capacity before private entry",
     "simultaneous users, restart persistence, and automatic lending",

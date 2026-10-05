@@ -384,8 +384,8 @@ fn run(
             client.arg(format!("--setenv={name}"));
         }
     }
+    let record = crate::native_start::wrap(&mut client)?;
     client
-        .arg("--")
         .arg(std::env::current_exe()?)
         .args(["admission", "enter", "--socket"])
         .arg(socket)
@@ -412,7 +412,7 @@ fn run(
         false,
         true,
         || signals.cancelled(),
-        &Default::default(),
+        &record,
     );
     // Cancel only this owned attempt. The server retains an entered workload's
     // reservation until native termination, including on ambiguous outcomes.

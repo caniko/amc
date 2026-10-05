@@ -147,6 +147,17 @@ unrestricted fallback, or promise of cleanup after
 SIGKILL or manager unavailability. Inspect the recorded identity before any
 manual retry; work may already have happened.
 
+The waited `amc exec` and `amc admission exec` paths synchronize startup before
+executing the payload. An exec-only helper waits on a one-attempt Unix socket
+until the runner has pinned the native invocation and cgroup. Both peers verify
+PID/UID; the runner also checks the helper's MainPID and native placement. A
+failed exchange, disconnect, cancellation or 30-second startup timeout prevents
+payload execution. Exec preserves the PID, argv and streams, and admitted entry
+still performs all existing broker checks. The native runtime ceiling covers
+the helper as well as the payload. The acknowledgment is startup evidence;
+completion still requires the independent final manager query and empty pinned
+domain. Detached and library callers retain their existing acknowledgment rules.
+
 Helper self-checks observe settings at helper entry, before allocation. They
 do **not** prove arbitrary loader/constructor ordering or fail-closed launch
 under every controller failure. That stronger strict-launch guarantee remains

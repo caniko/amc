@@ -124,7 +124,8 @@ pub fn execute(arguments: ExecArgs) -> Result<i32> {
             client.arg(format!("--setenv={name}"));
         }
     }
-    client.arg("--").args(arguments.command);
+    let record = crate::native_start::wrap(&mut client)?;
+    client.args(arguments.command);
     let signals = crate::control::Signals::install()?;
     match amc_runner::systemd::execute(
         &mut client,
@@ -133,7 +134,7 @@ pub fn execute(arguments: ExecArgs) -> Result<i32> {
         false,
         false,
         || signals.cancelled(),
-        &Default::default(),
+        &record,
     ) {
         Outcome::Completed(code) => Ok(code),
         Outcome::Cancelled { signal, .. }

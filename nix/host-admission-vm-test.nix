@@ -132,6 +132,7 @@ in
       environment.systemPackages = [package pkgs.python3];
       environment.etc."amc-test-user-policy.json".source = userPolicy;
       environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
+      environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
       virtualisation.memorySize = 2048;
       virtualisation.cores = 2;
     };

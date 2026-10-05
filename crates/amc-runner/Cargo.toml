@@ -12,11 +12,12 @@ default = ["sync", "async", "sysinfo"]
 sync = []
 async = ["dep:tokio"]
 sysinfo = ["dep:sysinfo"]
-systemd = ["sync", "dep:anyhow"]
+systemd = ["sync", "dep:anyhow", "dep:nix"]
 
 [dependencies]
 amc-telemetry = { path = "../amc-telemetry" }
 anyhow = { version = "1", optional = true }
+nix = { version = "0.30", optional = true, features = ["socket", "user"] }
 tracing = "0.1"
 tokio = { version = "1", features = [
   "sync",

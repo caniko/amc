@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod helpers;
 mod native_exec;
+mod native_start;
 mod supervision;
 mod systemd;
 mod telemetry;
@@ -38,6 +39,8 @@ struct Cli {
 enum Command {
     /// Execute a bounded command, optionally requesting short-call burst admission.
     Exec(native_exec::ExecArgs),
+    #[command(hide = true)]
+    NativeStart(native_start::NativeStartArgs),
     /// Coordinate production workload reservations across local processes.
     Admission {
         #[command(subcommand)]
@@ -247,6 +250,7 @@ fn main() {
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Exec(arguments) => native_exec::execute(arguments),
+        Command::NativeStart(arguments) => native_start::execute(arguments),
         Command::Admission { command } => admission::execute(command),
         Command::Supervise { command } => supervision::execute(command),
         Command::Doctor { json } => {

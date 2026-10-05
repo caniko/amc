@@ -40,6 +40,14 @@ def wait_entered(name):
         raise
 
 
+with test_section("rapid native and admitted jobs preserve completion and fail closed on startup loss"):
+    user = "runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 "
+    for mode in ["", " --admission"]:
+        receipt = json.loads(machine.succeed(user + "python3 /etc/amc-native-completion.py amc" + mode, timeout=180))
+        assert [r["exit"] for r in receipt["rapid_jobs"]] == [0, 42, 0, 42], receipt
+        assert receipt["startup_loss"] == {"disconnect": "no-exec", "invalid-ack": "no-exec"}, receipt
+    wait_committed(0)
+
 with test_section("durable root pool tracks every potential execution owner"):
     # Owners are outside this empty bounded slice, just like Nix's handlers.
     write_file("/tmp/pool-owner.py", '''import json, socket, sys, time
