@@ -623,8 +623,9 @@ with test_section("prepared helper loss cancels the intent without executing pay
 with test_section(
     "prepared scope preserves a game-only filesystem namespace and surviving descendants"
 ):
-    # A read-only root bind needs an existing mountpoint. Only the marker is
-    # namespace-private; a service-mode launch through the manager loses it.
+    # A read-only root bind needs an existing mountpoint. The user namespace
+    # also needs its own usable /dev/null for the diagnostic client's stdio.
+    # Only the marker is namespace-private; a manager payload would lose it.
     machine.succeed("mkdir /amc-game-only")
     write_file("/tmp/namespace-marker", "namespace-only\n")
     machine.fail("test -e /amc-game-only/marker")
@@ -635,7 +636,7 @@ with test_section(
     machine.succeed(
         "systemd-run --unit=namespace-game-client --uid=1000 "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
-        "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / --tmpfs /amc-game-only "
+        "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / --dev /dev --tmpfs /amc-game-only "
         "--ro-bind /tmp/namespace-marker /amc-game-only/marker "
         "--bind /run/user/1000 /run/user/1000 --bind /tmp /tmp -- amc prepare --profile game -- /bin/sh -c "
         + shlex.quote(command)
@@ -662,7 +663,7 @@ with test_section("prepared host helper preserves private PID and user namespace
     machine.succeed(
         "systemd-run --unit=pid-game-client --uid=1000 "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
-        "bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --ro-bind / / --proc /proc "
+        "bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --ro-bind / / --dev /dev --proc /proc "
         "--bind /run/user/1000 /run/user/1000 --bind /tmp /tmp -- "
         "amc prepare --profile game --payload-env GAME_PAYLOAD=after -- /bin/sh -c "
         + shlex.quote(command)
