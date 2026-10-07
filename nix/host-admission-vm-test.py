@@ -582,18 +582,25 @@ with test_section("nested exec handoff reconciles an emptied parent before consu
 with test_section(
     "prepared scope preserves a game-only filesystem namespace and surviving descendants"
 ):
+    # A read-only root bind needs an existing mountpoint. Only the marker is
+    # namespace-private; a service-mode launch through the manager loses it.
+    machine.succeed("mkdir /amc-game-only")
+    write_file("/tmp/namespace-marker", "namespace-only\n")
+    machine.fail("test -e /amc-game-only/marker")
     command = (
-        "test -d /amc-game-only && { sleep 120 & touch /tmp/namespace-game-entered; }"
+        'test "$(cat /amc-game-only/marker)" = namespace-only '
+        "&& { sleep 120 & touch /tmp/namespace-game-entered; }"
     )
     machine.succeed(
         "systemd-run --unit=namespace-game-client --uid=1000 "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
         "bwrap --ro-bind / / --tmpfs /amc-game-only "
+        "--ro-bind /tmp/namespace-marker /amc-game-only/marker "
         "--bind /tmp /tmp -- amc prepare --profile game -- /bin/sh -c "
         + shlex.quote(command)
     )
     wait_entered("namespace-game")
-    machine.fail("test -d /amc-game-only")
+    machine.fail("test -e /amc-game-only/marker")
     machine.wait_until_succeeds(
         "systemctl show namespace-game-client --property=ActiveState --value | grep -qE 'inactive|failed'"
     )
@@ -602,6 +609,7 @@ with test_section(
     wait_committed(64 * 1048576)
     stop_prepared()
     wait_committed(0)
+    machine.succeed("rmdir /amc-game-only")
 
 with test_section(
     "bounded page return makes real swap progress without disabling swap"
