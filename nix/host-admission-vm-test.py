@@ -547,7 +547,9 @@ with test_section(
 with test_section(
     "a launch from an already-running client owns a separate native game lifetime"
 ):
-    command = "amc prepare --profile game -- /bin/sh -c 'touch /tmp/warm-game-entered; sleep 120'"
+    # Keep the parent alive as a persistent Steam client would be. A last-command
+    # shell exec instead migrates its sole process and leaves no parent lifetime.
+    command = "amc prepare --profile game -- /bin/sh -c 'touch /tmp/warm-game-entered; sleep 120'; sleep 120"
     machine.succeed(
         "systemd-run --unit=warm-steam-client --uid=1000 "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
@@ -559,6 +561,21 @@ with test_section(
     assert len(games) == 2 and all(r["granted"] for r in games), state
     assert len({r["identity"]["inode"] for r in games}) == 2, games
     machine.succeed("systemctl stop warm-steam-client")
+    stop_prepared()
+    wait_committed(0)
+
+with test_section("nested exec handoff reconciles an emptied parent before consume"):
+    command = "exec amc prepare --profile game -- /bin/sh -c 'touch /tmp/exec-game-entered; sleep 120'"
+    machine.succeed(
+        "systemd-run --unit=exec-steam-client --uid=1000 "
+        "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+        "amc prepare --profile game -- /bin/sh -c " + shlex.quote(command)
+    )
+    wait_entered("exec-game", client_unit="exec-steam-client")
+    wait_committed(64 * 1048576)
+    games = [r for r in status()["reservations"] if r["domain"] == "foreground-1000"]
+    assert len(games) == 1 and games[0]["granted"], games
+    machine.succeed("systemctl stop exec-steam-client")
     stop_prepared()
     wait_committed(0)
 

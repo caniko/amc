@@ -30,6 +30,7 @@ NATIVE_CASES = {
     "an aged ordinary request receives a native burst quiet window",
     "advance game intent drains existing work and gates ordinary and burst entry",
     "a launch from an already-running client owns a separate native game lifetime",
+    "nested exec handoff reconciles an emptied parent before consume",
     "prepared scope preserves a game-only filesystem namespace and surviving descendants",
     "bounded page return makes real swap progress without disabling swap",
     "explicit whole-device recovery restores swap on success and interrupted cleanup",

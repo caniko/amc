@@ -313,8 +313,6 @@ pub fn serve_supervised(
                     }
                 }
             }
-            ledger.reconcile(host_native::empty_reservation);
-            ledger.retain_pool_operations();
             reconcile_recovery(&mut ledger);
             let capacity = observe(&mut ledger, &policy, health_file);
             waiting = ledger.advance(
@@ -640,6 +638,13 @@ fn observe(
     policy: &HostPolicy,
     health_file: Option<&Path>,
 ) -> Option<crate::host::Capacity> {
+    // A nested scope can move the last process out of its previous boundary
+    // between readiness and Consume. Settle positively empty native owners
+    // before validating the remaining grants, rather than mistaking an already
+    // collected scope for damaged enforcement until the next periodic tick.
+    // Unknown cleanup and surviving descendants retain their claims.
+    ledger.reconcile(host_native::empty_reservation);
+    ledger.retain_pool_operations();
     if ledger.recovery.is_none()
         && policy.swap_recovery.as_ref().is_some_and(|p| {
             p.targets
