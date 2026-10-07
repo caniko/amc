@@ -57,9 +57,12 @@ jobs:
           sudo chmod a+rw /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
       - name: Project setup 1
-        run: python3 -B nix/test-hosted-ci.py
+        run: python3 -c 'from pathlib import Path; p = Path.home() / ".config/nix/nix.conf"; p.parent.mkdir(parents=True, exist_ok=True); p.open("a").write("\nlog-lines = 1000\n")'
 
       - name: Project setup 2
+        run: python3 -B nix/test-hosted-ci.py
+
+      - name: Project setup 3
         run: nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff
 
       - name: Build ${{ matrix.installable }}

@@ -64,7 +64,7 @@ def launch(name, uid, contract, command):
     )
 
 
-def wait_entered(name, host_socket=None):
+def wait_entered(name, host_socket=None, client_unit=None):
     try:
         machine.wait_until_succeeds(f"test -f /tmp/{name}-entered", timeout=30)
     except Exception as error:
@@ -88,9 +88,21 @@ def wait_entered(name, host_socket=None):
             raise AssertionError(
                 json.dumps({"payload": name, "evidence": evidence})
             ) from error
-        print(machine.succeed("journalctl -b --no-pager -n 100"))
-        print(machine.succeed("amc admission host-status"))
-        raise
+        queries = {
+            "host": "amc admission host-status",
+            "client": "journalctl -b --no-pager -o cat -u "
+            + shlex.quote(client_unit or f"{name}-client")
+            + " -n 30",
+            "user": "journalctl -b --no-pager -o cat _UID=1000 -n 30",
+        }
+        observations = {
+            key: machine.execute(command) for key, command in queries.items()
+        }
+        # Keep the actual launch refusal in one final line. Pretty-printed host
+        # status otherwise displaces the client journal from Nix's failure tail.
+        raise AssertionError(
+            json.dumps({"payload": name, "evidence": observations})
+        ) from error
 
 
 with test_section(
@@ -541,7 +553,7 @@ with test_section(
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
         "amc prepare --profile game -- /bin/sh -c " + shlex.quote(command)
     )
-    wait_entered("warm-game")
+    wait_entered("warm-game", client_unit="warm-steam-client")
     state = status()
     games = [r for r in state["reservations"] if r["domain"] == "foreground-1000"]
     assert len(games) == 2 and all(r["granted"] for r in games), state
