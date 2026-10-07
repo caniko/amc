@@ -241,6 +241,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
         } => {
             // Authorization is persisted before this reply. If the reply is
             // lost, nothing executes and native reconciliation retires us.
+            let mut continuation = None;
             if let Some(host_socket) = host_socket {
                 let signals = crate::control::Signals::install()?;
                 let remaining = call(&socket, Message::Poll { id: ticket.clone() })?
@@ -249,7 +250,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                     .deadline_ms
                     .saturating_sub(server::now_ms()?)
                     .saturating_sub(1000);
-                amc_admission::host_server::acquire(
+                continuation = amc_admission::host_server::acquire(
                     &host_socket,
                     Duration::from_millis(remaining),
                     || signals.cancelled().is_some(),
@@ -262,7 +263,14 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                     key: entry_key,
                 },
             )?;
-            Err(Command::new(&command[0]).args(&command[1..]).exec())
+            let mut payload = Command::new(&command[0]);
+            payload.args(&command[1..]);
+            if let Some(continuation) = continuation {
+                payload.env("AMC_CONTINUATION", serde_json::to_string(&continuation)?);
+            } else {
+                payload.env_remove("AMC_CONTINUATION");
+            }
+            Err(payload.exec())
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
     }

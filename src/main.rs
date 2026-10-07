@@ -4,7 +4,9 @@ mod control;
 mod helpers;
 mod native_exec;
 mod native_start;
+mod preparation;
 mod supervision;
+mod swap_recovery;
 mod systemd;
 mod telemetry;
 mod watch;
@@ -39,6 +41,12 @@ struct Cli {
 enum Command {
     /// Execute a bounded command, optionally requesting short-call burst admission.
     Exec(native_exec::ExecArgs),
+    /// Reserve foreground capacity in advance, draining finite operations first.
+    Prepare(preparation::PrepareArgs),
+    #[command(hide = true)]
+    PreparedEnter(preparation::EnterArgs),
+    /// Root-only bounded page return or explicit whole-device swap recovery.
+    RecoverSwap(swap_recovery::RecoveryArgs),
     #[command(hide = true)]
     NativeStart(native_start::NativeStartArgs),
     /// Coordinate production workload reservations across local processes.
@@ -250,6 +258,9 @@ fn main() {
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Exec(arguments) => native_exec::execute(arguments),
+        Command::Prepare(arguments) => preparation::execute(arguments),
+        Command::PreparedEnter(arguments) => preparation::enter(arguments),
+        Command::RecoverSwap(arguments) => swap_recovery::execute(arguments),
         Command::NativeStart(arguments) => native_start::execute(arguments),
         Command::Admission { command } => admission::execute(command),
         Command::Supervise { command } => supervision::execute(command),
