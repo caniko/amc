@@ -60,6 +60,24 @@ in
           resume_ms = 250;
           aging_ms = 1000;
           queue_limit = 16;
+          reserve_swap_return = true;
+          swap_recovery = {
+            cgroup = "/system.slice/page-return.service";
+            helper_bytes = 128 * mib;
+            minimum_bytes = mib;
+            batch_bytes = 2 * mib;
+            targets = [];
+            page_cgroups = ["/system.slice/page-target.service"];
+          };
+          preparations = map (uid: {
+            name = "game";
+            domain = "foreground-${toString uid}";
+            memory_bytes = 64 * mib;
+            swap_bytes = 0;
+            drain_domains = ["tools-1000" "tools-1001" "builders" "burst-1000" "burst-1001"];
+            wait_ms = 60000;
+            ready_ms = 15000;
+          }) [1000 1001];
           burst = {
             budget_bytes = 64 * mib;
             max_job_bytes = 32 * mib;
@@ -94,7 +112,16 @@ in
                 swap_bytes = 0;
                 fair_share_bytes = 80 * mib;
               }
-            ];
+            ]
+            ++ map (uid: {
+              name = "foreground-${toString uid}";
+              inherit uid;
+              cgroup = "/user.slice/user-${toString uid}.slice/user@${toString uid}.service/app.slice/app-amcforeground.slice";
+              ceiling_bytes = 64 * mib;
+              swap_bytes = 0;
+              fair_share_bytes = 80 * mib;
+              io_pressure = "diagnostic";
+            }) [1000 1001];
         };
       };
       users.users.alice = {
@@ -113,6 +140,13 @@ in
         MemoryMax = "64M";
         MemorySwapMax = 0;
       };
+      systemd.user.slices.app-amcforeground = {
+        wantedBy = ["default.target"];
+        sliceConfig = {
+          MemoryMax = "256M";
+          MemorySwapMax = 0;
+        };
+      };
       systemd.slices.builders.sliceConfig = {
         MemoryMax = "96M";
         MemorySwapMax = 0;
@@ -129,11 +163,13 @@ in
         };
         path = [pkgs.systemd];
       };
-      environment.systemPackages = [package pkgs.python3];
+      environment.systemPackages = [package pkgs.python3 pkgs.bubblewrap pkgs.util-linux];
+      environment.etc."page-return-target.py".source = ./page-return-target.py;
       environment.etc."amc-test-user-policy.json".source = userPolicy;
       environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
       environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
       virtualisation.memorySize = 2048;
+      virtualisation.emptyDiskImages = [512];
       virtualisation.cores = 2;
     };
     testScript = builtins.readFile ./host-admission-vm-test.py;

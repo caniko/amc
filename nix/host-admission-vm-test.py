@@ -5,6 +5,7 @@ import shlex
 machine = globals()["machine"]
 test_section = globals()["subtest"]
 globals()["start_all"]()
+evidence = {}
 machine.wait_for_unit("amc-host-admission.service")
 for user, uid in [("alice", 1000), ("bob", 1001)]:
     machine.succeed(f"loginctl enable-linger {user}; systemctl start user@{uid}.service")
@@ -22,6 +23,14 @@ def status():
 def wait_committed(amount):
     machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
         f'import sys,json; assert json.load(sys.stdin)["committed_bytes"] == {amount}'), timeout=30)
+
+
+def stop_prepared():
+    for grant in status()["reservations"]:
+        if grant["domain"].startswith("foreground-"):
+            unit = grant["identity"]["cgroup"].rsplit("/", 1)[1]
+            uid = grant["identity"]["uid"]
+            machine.succeed(f"systemctl --user --machine={uid}@.host stop {unit}")
 
 
 def launch(name, uid, contract, command):
@@ -68,7 +77,7 @@ while True:
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(2)
         s.connect("/run/amc-host/admission.sock")
-        s.sendall(b'{"op":"acquire_pool","version":1,"wait_ms":60000,"domain":"builders"}\\n')
+        s.sendall(b'{"op":"acquire_pool","version":1,"wait_ms":60000,"domain":"builders","operation":1}\\n')
         r = json.loads(s.makefile().readline())
     assert not r["error"], r
     if r["granted"]:
@@ -220,6 +229,7 @@ from pathlib import Path
 import json
 host = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
 host.pop("burst")
+host.pop("preparations")
 host["domains"] = [d for d in host["domains"] if not d.get("burst")]
 user = json.loads(Path("/etc/amc-test-user-policy.json").read_text())
 user.pop("burst_budget_bytes")
@@ -323,4 +333,165 @@ with test_section("an aged ordinary request receives a native burst quiet window
     machine.succeed("systemctl stop quiet-base-client quiet-bulk-client quiet-late-client")
     wait_committed(0)
 
+with test_section("advance game intent drains existing work and gates ordinary and burst entry"):
+    launch("drain-old", 1000, "small", "touch /tmp/drain-old-entered; while ! test -e /tmp/drain-old-finish; do sleep .1; done")
+    wait_entered("drain-old")
+    machine.succeed("systemd-run --unit=prepared-game-client --uid=1000 "
+                    "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+                    "amc prepare --profile game -- /bin/sh -c " + shlex.quote("touch /tmp/prepared-game-entered; sleep 120"))
+    machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
+        'import sys,json; s=json.load(sys.stdin); assert s["preparation_barrier"] and s["preparations"][0]["phase"] == "draining"'))
+    launch("drain-new", 1001, "small", "touch /tmp/drain-new-entered; sleep 120")
+    burst("drain-burst", 1001, "touch /tmp/drain-burst-entered; sleep 120")
+    machine.sleep(1)
+    machine.fail("test -e /tmp/prepared-game-entered")
+    machine.fail("test -e /tmp/drain-new-entered")
+    machine.fail("test -e /tmp/drain-burst-entered")
+    machine.succeed("systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    assert status()["preparation_barrier"]
+    machine.succeed("touch /tmp/drain-old-finish")
+    wait_entered("prepared-game")
+    grant = next(r for r in status()["reservations"] if r["domain"] == "foreground-1000")
+    assert grant["granted"] and grant["memory_bytes"] == 64 * 1048576
+    assert "/app.slice/app-amcforeground.slice/" in grant["identity"]["cgroup"]
+    machine.succeed("systemctl stop prepared-game-client drain-new-client drain-burst-client")
+    stop_prepared()
+    wait_committed(0)
+
+with test_section("a launch from an already-running client owns a separate native game lifetime"):
+    command = "amc prepare --profile game -- /bin/sh -c 'touch /tmp/warm-game-entered; sleep 120'"
+    machine.succeed("systemd-run --unit=warm-steam-client --uid=1000 "
+                    "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+                    "amc prepare --profile game -- /bin/sh -c " + shlex.quote(command))
+    wait_entered("warm-game")
+    state = status()
+    games = [r for r in state["reservations"] if r["domain"] == "foreground-1000"]
+    assert len(games) == 2 and all(r["granted"] for r in games), state
+    assert len({r["identity"]["inode"] for r in games}) == 2, games
+    machine.succeed("systemctl stop warm-steam-client")
+    stop_prepared()
+    wait_committed(0)
+
+with test_section("prepared scope preserves a game-only filesystem namespace and surviving descendants"):
+    command = "test -d /amc-game-only && { sleep 120 & touch /tmp/namespace-game-entered; }"
+    machine.succeed("systemd-run --unit=namespace-game-client --uid=1000 "
+                    "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+                    "bwrap --ro-bind / / --tmpfs /amc-game-only "
+                    "--bind /tmp /tmp -- amc prepare --profile game -- /bin/sh -c " + shlex.quote(command))
+    wait_entered("namespace-game")
+    machine.fail("test -d /amc-game-only")
+    machine.wait_until_succeeds("systemctl show namespace-game-client --property=ActiveState --value | grep -qE 'inactive|failed'")
+    # The leader and submission client have exited, but the native descendant
+    # keeps the scope charged until separately observed cleanup.
+    wait_committed(64 * 1048576)
+    stop_prepared()
+    wait_committed(0)
+
+with test_section("bounded page return makes real swap progress without disabling swap"):
+    machine.succeed("mkswap /dev/vdb; swapon /dev/vdb")
+    machine.succeed("systemd-run --unit=page-target --property=MemoryMax=128M --property=MemorySwapMax=128M -- python3 /etc/page-return-target.py")
+    machine.wait_until_succeeds("test -e /tmp/page-target-ready")
+    group = "/sys/fs/cgroup/system.slice/page-target.service"
+    machine.wait_until_succeeds(f"test $(cat {group}/memory.swap.current) -ge 33554432")
+    before = int(machine.succeed(f"cat {group}/memory.swap.current"))
+    # The recovery helper's 128 MiB reservation cannot fit behind this live
+    # 64 MiB operation in the 160 MiB broker budget. A wait is not success.
+    machine.succeed("systemd-run --unit=page-budget-client --uid=1000 "
+                    "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+                    "amc admission exec --contract tool --max-ram-usage 64MiB --timeout 30 -- /bin/sh -c " + shlex.quote(
+                        "touch /tmp/page-budget-entered; sleep 120"))
+    wait_entered("page-budget")
+    machine.fail("systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- amc recover-swap")
+    machine.succeed("test $(systemctl show page-return --property=ExecMainStatus --value) = 75; grep -q '^/dev/vdb' /proc/swaps")
+    machine.succeed("systemctl stop page-budget-client; systemctl reset-failed page-return")
+    wait_committed(0)
+
+    # A cancelled campaign that has acquired, but has not read, a batch retains
+    # its claim across broker restart until the helper's native group is empty.
+    interrupted = """import json, os, socket, time
+target = json.load(open('/tmp/page-target-range.json'))
+stat = open('/proc/%s/stat' % target['pid']).read().rsplit(') ', 1)[1].split()
+request = {'op':'acquire_page_return','version':1,'pid':target['pid'],'start_ticks':int(stat[19]),'address':target['address'],'bytes':2097152}
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect('/run/amc-host/admission.sock')
+    connection.sendall((json.dumps(request)+'\\n').encode())
+    response = json.loads(connection.makefile().readline())
+assert response['granted'] and response['error'] is None, response
+open('/tmp/page-return-held','w').close()
+time.sleep(120)
+"""
+    write_file("/tmp/page-return-interrupt.py", interrupted)
+    machine.succeed("systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/page-return-interrupt.py")
+    machine.wait_until_succeeds("test -e /tmp/page-return-held")
+    machine.succeed("systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    assert status()["recovery"]["return_bytes"] == 2097152
+    machine.succeed("systemctl stop page-return")
+    machine.wait_until_succeeds("amc admission host-status | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin).get("recovery") is None'))
+    machine.succeed("grep -q '^/dev/vdb' /proc/swaps")
+
+    machine.succeed("systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- amc recover-swap")
+    after = int(machine.succeed(f"cat {group}/memory.swap.current"))
+    assert before > after and after == 0, (before, after)
+    evidence["pageReturn"] = {"beforeSwapBytes": before, "afterSwapBytes": after, "waitExitCode": 75, "interruptedBatchBytes": 2097152}
+    machine.succeed("grep -q '^/dev/vdb' /proc/swaps; systemctl is-active page-target.service")
+    machine.succeed("touch /tmp/page-target-probe")
+    machine.wait_until_succeeds("test -e /tmp/page-target-intact")
+    machine.succeed("systemctl stop page-target.service")
+    wait_committed(0)
+
+with test_section("explicit whole-device recovery restores swap on success and interrupted cleanup"):
+    device_policy = json.loads(machine.succeed("cat /etc/amc-test-host-policy.json"))
+    device_policy["swap_recovery"]["targets"] = [{"name": "vm", "path": "/dev/vdb", "priority": 10}]
+    write_file("/tmp/page-device-policy.json", json.dumps(device_policy))
+    machine.succeed("systemd-run --unit=device-host -- amc admission host-serve --policy /tmp/page-device-policy.json "
+                    "--socket /run/amc-device/admission.sock --state /var/lib/amc-device")
+    machine.wait_until_succeeds("test -S /run/amc-device/admission.sock")
+    machine.succeed("rm /tmp/page-target-ready /tmp/page-target-probe /tmp/page-target-intact; "
+                    "systemd-run --unit=page-target --property=MemoryMax=128M --property=MemorySwapMax=128M -- python3 /etc/page-return-target.py")
+    machine.wait_until_succeeds("test -e /tmp/page-target-ready")
+    machine.wait_until_succeeds("test $(awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps) -ge 32768")
+    before_device = int(machine.succeed("awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps"))
+    machine.succeed("systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- "
+                    "amc recover-swap --whole-device --socket /run/amc-device/admission.sock")
+    after_device = int(machine.succeed("awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps"))
+    assert 0 <= after_device < before_device, (before_device, after_device)
+    machine.succeed("touch /tmp/page-target-probe")
+    machine.wait_until_succeeds("test -e /tmp/page-target-intact")
+    machine.succeed("systemctl stop page-target")
+    machine.wait_until_succeeds("amc admission host-status --socket /run/amc-device/admission.sock | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin).get("recovery") is None'))
+
+    interrupted = """import json, socket, subprocess, time
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect('/run/amc-device/admission.sock')
+    connection.sendall(b'{"op":"acquire_recovery","version":1,"target":"vm"}\\n')
+    response = json.loads(connection.makefile().readline())
+assert response['granted'] and response['error'] is None, response
+subprocess.run(['swapoff','/dev/vdb'],check=True)
+open('/tmp/device-return-off','w').close()
+time.sleep(120)
+"""
+    write_file("/tmp/device-return-interrupt.py", interrupted)
+    machine.succeed("rm /tmp/page-target-ready /tmp/page-target-probe /tmp/page-target-intact; "
+                    "systemd-run --unit=page-target --property=MemoryMax=128M --property=MemorySwapMax=128M -- python3 /etc/page-return-target.py")
+    machine.wait_until_succeeds("test -e /tmp/page-target-ready")
+    machine.wait_until_succeeds("test $(awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps) -ge 32768")
+    machine.succeed("systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 "
+                    "--property='ExecStopPost=amc recover-swap --restore --socket /run/amc-device/admission.sock' -- "
+                    "python3 /tmp/device-return-interrupt.py")
+    machine.wait_until_succeeds("test -e /tmp/device-return-off")
+    machine.fail("grep -q '^/dev/vdb' /proc/swaps")
+    machine.succeed("systemctl stop page-return")
+    machine.succeed("test $(awk '$1 == \"/dev/vdb\" {print $5}' /proc/swaps) = 10; touch /tmp/page-target-probe")
+    machine.wait_until_succeeds("test -e /tmp/page-target-intact")
+    machine.wait_until_succeeds("amc admission host-status --socket /run/amc-device/admission.sock | python3 -c " + shlex.quote(
+        'import sys,json; assert json.load(sys.stdin).get("recovery") is None'))
+    evidence["deviceReturn"] = {"beforeUsedKiB": before_device, "afterUsedKiB": after_device, "restoredPriority": 10, "interruptedRestored": True}
+    machine.succeed("systemctl stop page-target device-host")
+
 machine.succeed("test $(awk '$1 == \"oom_kill\" {print $2}' /proc/vmstat) = 0")
+write_file("/tmp/amc-foreground-evidence.json", json.dumps(evidence))
+machine.copy_from_machine("/tmp/amc-foreground-evidence.json", "shared-admission")

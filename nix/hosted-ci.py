@@ -28,6 +28,11 @@ NATIVE_CASES = {
     "burst client loss and private restart retain grants until cleanup is observable",
     "explicit burst cancellation confirms descendant cleanup",
     "an aged ordinary request receives a native burst quiet window",
+    "advance game intent drains existing work and gates ordinary and burst entry",
+    "a launch from an already-running client owns a separate native game lifetime",
+    "prepared scope preserves a game-only filesystem namespace and surviving descendants",
+    "bounded page return makes real swap progress without disabling swap",
+    "explicit whole-device recovery restores swap on success and interrupted cleanup",
 }
 SUPERVISION_CASES = {
     "identity-bound recovery waits for descendant cleanup and starts once",
@@ -160,6 +165,8 @@ def retain():
         required = SUPERVISION_CASES if installable.endswith(".supervision") else NATIVE_CASES
         verify_native_report(output / "junit.xml", required)
         shutil.copyfile(output / "junit.xml", evidence / "junit.xml")
+        if installable.endswith(".shared-admission"):
+            shutil.copytree(output / "shared-admission", evidence / "shared-admission")
         if installable.endswith(".supervision"):
             # The VM explicitly exports these mechanism receipts. Keeping just
             # a driver PASS would lose calibration and bounded recovery evidence.
