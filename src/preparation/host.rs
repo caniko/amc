@@ -228,7 +228,8 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
         // Pin the original host PID/start pair around native registration. The
         // waiting process stays alive and cannot execute its command before ack.
         host_native::prepared_origin(&origin, peer.uid())?;
-        crate::control::capture(&mut scope_command(&reply, &intent.id, origin.pid)?)?;
+        crate::control::capture(&mut scope_command(&reply, &intent.id, origin.pid)?)
+            .context("register prepared scope through the host user bus")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let suffix = format!("/app-amc-prepared-{}.scope", intent.id);
         loop {
@@ -286,11 +287,10 @@ pub(super) fn scope_command(reply: &Response, id: &str, pid: i32) -> Result<Comm
         "invalid prepared native registration"
     );
     let mut command = Command::new("busctl");
+    // busctl uses the D-Bus bus-client protocol (including Hello). The manager's
+    // systemd/private socket is a peer endpoint and rejects those requests.
     command
-        .arg(format!(
-            "--address=unix:path=/run/user/{}/systemd/private",
-            geteuid()
-        ))
+        .arg(format!("--address=unix:path=/run/user/{}/bus", geteuid()))
         .args([
             "--timeout=5s",
             "call",

@@ -209,6 +209,10 @@ mod tests {
             args.contains(&"app-amc-prepared-intent.scope".into()),
             "{args:?}"
         );
+        assert!(args.contains(&format!(
+            "--address=unix:path=/run/user/{}/bus",
+            nix::unistd::geteuid()
+        )));
         assert!(
             args.windows(3)
                 .any(|parts| parts == ["MemoryMax", "t", "64"])
