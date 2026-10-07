@@ -7,6 +7,9 @@ fixture/compatibility launch tools for systemd memory policy. RFC 0.4 in
 sandbox or transparent replacement for normal launching. An optional
 [persistent per-user admission service](docs/persistent-admission.md) coordinates
 native managed jobs across independent processes with durable recovery.
+The [shared host broker](docs/shared-host-admission.md) additionally supports
+advance foreground preparation, finite completion rights for existing work,
+and bounded swap-return recovery before new memory growth.
 
 An optional [native memory supervisor](docs/supervision.md) adds per-invocation
 whole-window forecasting, admission inhibition and identity-bound recovery for

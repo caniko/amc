@@ -23,7 +23,12 @@ grant before permitting execution. Native lifecycle checks still require
 `acquire_pool` is reserved for root execution owners such as Nix. It enrolls a
 policy-defined, hard-bounded aggregate pool once across multiple handler PIDs.
 Socket disconnect, timeout and restart cannot release a grant. The pool remains
-charged until its descendants and all potential execution owners terminate.
+charged until its descendants are empty and all potential execution owners have
+terminated or positively finished their finite operations. When preparations
+are configured, each root worker supplies a distinct nonzero `operation` serial.
+`release_pool` settles only that root peer's matching serial, not native capacity.
+Nested workers and other peers keep their ownership; a lost release retains
+backing, and a newer serial cannot retry with the old worker's admission rights.
 
 Native observations are conservative: unknown or replaced cgroups retain
 capacity, changed granted ceilings inhibit new admission, swap never extends
@@ -32,7 +37,9 @@ These guarantees cover cooperative enrolled execution, not arbitrary services
 outside the configured domains or a privileged caller changing enforcement.
 
 `amc admission host-status` returns versioned JSON; unprivileged callers see only
-their reservation identities. There is no client-controlled release API.
+their reservation identities. User callers have no capacity-release authority.
+Root execution owners may settle finite operations; users cannot release a
+running grant by cancelling a socket or a preparation.
 
 Regression coverage includes native empty/inode evidence, duplicate requests,
 cross-user races, borrowed shares, aging, policy reduction, missing observations,
@@ -104,3 +111,79 @@ disablement. New model turns have no release authority. Host-status JSON exposes
 verified ceiling/class/runtime. The native shared-admission VM includes above-
 budget execution, restart, cross-user bursts, ignored-SIGTERM descendants and
 cooldown deferral. Passing Rust fixtures alone does not qualify native rollout.
+
+## Advance foreground preparation
+
+Optional `preparations` profiles specify a non-root slice domain, native
+memory/swap ceilings, `drain_domains`, a bounded `wait_ms` and a short `ready_ms`.
+The flake and package export `admissionPreparationVersion = 1`.
+
+```sh
+amc prepare --profile game -- game-command args
+```
+
+An intent immediately closes ordinary and burst admission. Existing grants
+continue; the broker waits for the selected finite operations and their admitted
+completion children to finish. Intentions are FIFO, survive broker restart, and
+expire or cancel without revoking running work. A ready intent owns a real
+host/native-ancestor claim. The hidden entry helper authenticates an atomic,
+once-only transfer into a native scope before executing the payload. Replaying a
+lost reply is permitted only for that same native peer. After transfer, only
+observed cgroup cleanup can release the claim, including surviving descendants.
+
+Prepared scopes preserve the caller's environment, working directory, stdio and
+filesystem namespace. This permits warm Steam/pressure-vessel launch commands
+whose paths exist only inside their runtime. `--payload-env NAME=VALUE` applies
+loader and GameMode settings after admission, so the waiting helper does not
+quiesce the old work it needs to drain. Prepared execution needs a reachable
+local user manager and a cgroup-v2 view whose paths agree with the host broker.
+Namespace configurations that cannot register their native scope fail before
+the payload; they do not fall back to uncontained execution.
+
+Domains can give small parents finite `continuation` contracts: allowed child
+domains, parent/child ceilings, and at most 64 distinct calls. Admission backs
+one completion lane per child domain in advance, at both host and native
+ancestors. A child transfers that lane's backing and propagates the authenticated
+capability to further calls. Same-domain children serialize; separate domains can
+finish nested operations. Already-queued children retain their obligation after
+parent exit. Call/UID/domain/ceiling bounds continue to apply during draining.
+Completion rights do not grow on policy reload or authorize arbitrary new work.
+Root Nix clients bind these rights to the original socket peer's kernel identity.
+
+## Swap-return priority and recovery
+
+`reserve_swap_return = true` charges observed host swap occupancy not already
+covered by native grants before allowing new memory growth. Unknown return
+accounting blocks admission. The capability is
+`lib.swapReturnReservationVersion = 1` (also exported on the package).
+
+A root-only `swap_recovery` policy selects a finite maintenance unit, helper
+ceiling, nonoverlapping `page_cgroups`, `batch_bytes` (4 KiB–16 MiB), and optional
+device `targets`. The default recovery faults bounded private readable page
+ranges through a pinned `/proc/<pid>/mem` descriptor, with process identity and
+leaf/ancestor headroom checks. It never writes target memory or reports payload
+bytes. A batch is backed before reads; target `memory.swap.current` reduction,
+rather than a successful advice call or bytes read, establishes progress.
+
+```sh
+amc recover-swap                 # bounded incremental return, devices stay on
+amc recover-swap --whole-device  # explicit conservative swapoff/restore
+amc recover-swap --restore       # restore declared devices after interruption
+```
+
+Recovery can enter below the ordinary free-swap floor, but retains the host RAM
+reserve, pressure gates, helper backing and native ancestor checks. Bounded
+batches can start even when the entire return debt cannot fit. Other admission
+waits while a campaign owns recovery; cancellation, read failure and broker
+restart retain the claim until native cleanup. Exit 75 means waiting, stalled or
+incomplete return, including partial progress or unreadable pages. Exit 0 for
+page recovery requires zero remaining swap in the selected subtrees, not a claim
+about all swap on the host. Whole-device recovery needs backing for the full
+device and all affected native domains, and restores it before reporting success.
+Consumers should install `--restore` as maintenance-unit `ExecStopPost` and keep
+device restoration separate from admission release.
+
+The shared-admission VM contains drain/restart, warm nested launch,
+namespace-preservation, surviving-descendant, real pageout/return, safe-wait and
+interrupted-campaign scenarios. These are qualification gates, not evidence of
+live Steam/Proton containment or successful recovery on a deployed workstation.

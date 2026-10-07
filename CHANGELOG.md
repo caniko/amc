@@ -4,6 +4,12 @@
 
 ### Added
 
+- Advance foreground preparation with durable drain barriers and once-only
+  transfer into native scopes that preserve the caller's filesystem namespace.
+- Finite, up-front-backed completion lanes and per-operation root worker
+  ownership so existing work can finish while newer calls wait.
+- Bounded incremental swap return with observed progress, explicit whole-device
+  recovery/restoration, and native interruption and safe-wait qualification.
 - Opt-in, bounded production observation for native services and scopes with
   aggregate host memory, swap, fault, and pressure context.
 - Offline capture validation and an optional transient observer runner that
