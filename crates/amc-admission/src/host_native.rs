@@ -16,6 +16,18 @@ pub fn process_start(pid: i32) -> Result<u64> {
         .parse()?)
 }
 
+/// A host-native user helper can transfer its own preparation to a consenting
+/// peer. PID/start-time and the real host UID are rechecked by the root broker;
+/// a namespace-local PID or a different user's process has no authority here.
+pub fn prepared_origin(origin: &crate::ledger::ClientIdentity, uid: u32) -> Result<i32> {
+    ensure!(
+        fs::metadata(format!("/proc/{}", origin.pid))?.uid() == uid
+            && process_start(origin.pid)? == origin.start_ticks,
+        "prepared origin identity or UID changed"
+    );
+    Ok(origin.pid)
+}
+
 fn number(path: &Path, name: &str) -> Result<u64> {
     Ok(fs::read_to_string(path.join(name))?.trim().parse()?)
 }

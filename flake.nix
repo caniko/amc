@@ -97,7 +97,7 @@
     lib.hostDomainPressureVersion = 1;
     lib.admissionSizingVersion = 1;
     lib.admissionBurstVersion = 1;
-    lib.admissionPreparationVersion = 1;
+    lib.admissionPreparationVersion = 2;
     lib.swapReturnReservationVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;

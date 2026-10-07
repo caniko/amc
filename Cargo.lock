@@ -12,6 +12,7 @@ dependencies = [
  "amc-telemetry",
  "anyhow",
  "clap",
+ "nix",
  "serde",
  "serde_json",
  "toml",

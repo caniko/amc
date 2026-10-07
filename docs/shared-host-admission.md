@@ -132,11 +132,21 @@ lost reply is permitted only for that same native peer. After transfer, only
 observed cgroup cleanup can release the claim, including surviving descendants.
 
 Prepared scopes preserve the caller's environment, working directory, stdio and
-filesystem namespace. This permits warm Steam/pressure-vessel launch commands
+filesystem, user and PID namespaces. A bounded host-native helper, launched by
+the local user manager, authenticates the root broker and registers the waiting
+process's kernel-authenticated host PID in the ready-backed scope. The broker
+rechecks the nominated PID/start-time and host UID before the once-only consume;
+only then does the waiting process exec its payload in place. User namespace
+overflow UIDs never authenticate the root broker. A private per-attempt runtime
+socket and token bind the acknowledgement to the waiting process; helper loss,
+caller cancellation and failed registration never execute the payload.
+
+This permits warm Steam/pressure-vessel launch commands
 whose paths exist only inside their runtime. `--payload-env NAME=VALUE` applies
 loader and GameMode settings after admission, so the waiting helper does not
 quiesce the old work it needs to drain. Prepared execution needs a reachable
-local user manager and a cgroup-v2 view whose paths agree with the host broker.
+local user manager and a writable, host-shared `XDG_RUNTIME_DIR` rendezvous.
+The helper uses the host cgroup-v2 view, so the payload need not see host PIDs.
 Namespace configurations that cannot register their native scope fail before
 the payload; they do not fall back to uncontained execution.
 

@@ -45,6 +45,8 @@ enum Command {
     Prepare(preparation::PrepareArgs),
     #[command(hide = true)]
     PreparedEnter(preparation::EnterArgs),
+    #[command(hide = true)]
+    PreparedHost(preparation::HostArgs),
     /// Root-only bounded page return or explicit whole-device swap recovery.
     RecoverSwap(swap_recovery::RecoveryArgs),
     #[command(hide = true)]
@@ -260,6 +262,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Exec(arguments) => native_exec::execute(arguments),
         Command::Prepare(arguments) => preparation::execute(arguments),
         Command::PreparedEnter(arguments) => preparation::enter(arguments),
+        Command::PreparedHost(arguments) => preparation::host(arguments),
         Command::RecoverSwap(arguments) => swap_recovery::execute(arguments),
         Command::NativeStart(arguments) => native_start::execute(arguments),
         Command::Admission { command } => admission::execute(command),

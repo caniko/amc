@@ -38,7 +38,7 @@ rustPlatform.buildRustPackage {
   strictDeps = true;
   passthru.nativeExecVersion = 1;
   passthru.admissionSizingVersion = 1;
-  passthru.admissionPreparationVersion = 1;
+  passthru.admissionPreparationVersion = 2;
   passthru.swapReturnReservationVersion = 1;
   nativeBuildInputs = [makeWrapper python3];
   postInstall = ''

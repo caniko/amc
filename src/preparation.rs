@@ -1,4 +1,7 @@
 //! Gate payload creation before native launch, then transfer once inside it.
+mod host;
+pub use host::HostArgs;
+
 use amc_admission::host_server::{Request, Response, call, transient_transport};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -58,12 +61,19 @@ impl Drop for Intent {
 }
 
 pub fn execute(args: PrepareArgs) -> Result<i32> {
-    let signals = crate::control::Signals::install()?;
-    let intent = Intent {
-        socket: args.socket,
-        id: amc_admission::store::fresh_id()?,
-        key: amc_admission::store::fresh_id()?,
-    };
+    host::execute(args)
+}
+
+pub fn host(args: HostArgs) -> Result<i32> {
+    host::serve(args)
+}
+
+fn prepare_ready(
+    intent: &Intent,
+    profile: String,
+    signals: &crate::control::Signals,
+    mut pulse: impl FnMut() -> Result<()>,
+) -> Result<Response> {
     let mut deadline = Instant::now() + Duration::from_secs(30);
     let mut reply = broker_call(
         &intent.socket,
@@ -71,7 +81,7 @@ pub fn execute(args: PrepareArgs) -> Result<i32> {
             version: 1,
             id: intent.id.clone(),
             key: intent.key.clone(),
-            profile: args.profile,
+            profile,
         },
         deadline,
         || signals.cancelled().is_some(),
@@ -85,9 +95,8 @@ pub fn execute(args: PrepareArgs) -> Result<i32> {
     }
     let mut previous = None;
     while !reply.granted {
-        if let Some(signal) = signals.cancelled() {
-            return Ok(128 + signal);
-        }
+        ensure!(signals.cancelled().is_none(), "preparation cancelled");
+        pulse()?;
         if previous != reply.waiting {
             eprintln!("preparing foreground capacity: {:?}", reply.waiting);
             previous = reply.waiting;
@@ -104,64 +113,8 @@ pub fn execute(args: PrepareArgs) -> Result<i32> {
             || signals.cancelled().is_some(),
         )?;
     }
-    if let Some(signal) = signals.cancelled() {
-        return Ok(128 + signal);
-    }
-    let unit = format!("app-amc-prepared-{}.scope", intent.id);
-    let mut client = launch_client(&reply, &unit)?;
-    client
-        .arg("--")
-        .arg(std::env::current_exe()?)
-        .args(["prepared-enter", "--socket"])
-        .arg(&intent.socket)
-        .args(["--ticket", &intent.id, "--key", &intent.key]);
-    for env in args.payload_env {
-        client.args(["--payload-env", &env]);
-    }
-    client.arg("--").args(args.command);
-    // Scope mode executes locally after the manager has installed the native
-    // envelope. It preserves Steam's mount/PID namespaces and stdio. The entry
-    // helper then authenticates Consume before exec; only the broker's native
-    // cgroup reconciliation can release transferred capacity or surviving children.
-    Err(client.exec()).context("exec prepared native scope")
-}
-
-fn launch_client(reply: &Response, unit: &str) -> Result<Command> {
-    let p = reply
-        .preparation
-        .as_ref()
-        .context("broker omitted ready envelope")?;
-    let slice = reply
-        .launch_slice
-        .as_ref()
-        .context("broker omitted launch slice")?;
-    ensure!(
-        slice
-            .strip_suffix(".slice")
-            .is_some_and(amc_admission::ledger::valid_name),
-        "invalid prepared slice"
-    );
-    let mut client = Command::new("systemd-run");
-    client
-        .args([
-            "--user",
-            "--quiet",
-            "--collect",
-            "--scope",
-            "--expand-environment=no",
-        ])
-        .arg(format!("--unit={unit}"));
-    for property in [
-        format!("Slice={slice}"),
-        format!("MemoryMax={}", p.memory_bytes),
-        format!("MemorySwapMax={}", p.swap_bytes),
-        "MemoryAccounting=yes".into(),
-        "OOMPolicy=kill".into(),
-        "TimeoutStopSec=15s".into(),
-    ] {
-        client.arg(format!("--property={property}"));
-    }
-    Ok(client)
+    ensure!(signals.cancelled().is_none(), "preparation cancelled");
+    Ok(reply)
 }
 
 pub fn enter(args: EnterArgs) -> Result<i32> {
@@ -171,15 +124,20 @@ pub fn enter(args: EnterArgs) -> Result<i32> {
             version: 1,
             id: args.ticket,
             key: args.key,
+            origin: None,
         },
         Instant::now() + Duration::from_secs(30),
         || false,
     )?;
     ensure!(reply.granted, "broker did not transfer prepared capacity");
-    let mut payload = Command::new(&args.command[0]);
-    payload.args(&args.command[1..]);
+    exec_payload(args.command, args.payload_env)
+}
+
+fn exec_payload(command: Vec<OsString>, payload_env: Vec<String>) -> Result<i32> {
+    let mut payload = Command::new(&command[0]);
+    payload.args(&command[1..]);
     payload.env_remove("AMC_CONTINUATION");
-    for entry in args.payload_env {
+    for entry in payload_env {
         let (name, value) = entry
             .split_once('=')
             .context("invalid payload environment")?;
@@ -235,25 +193,33 @@ fn payload_environment(value: &str) -> std::result::Result<String, String> {
 mod tests {
     use super::*;
     #[test]
-    fn foreground_launch_preserves_the_callers_namespace_and_native_scope_envelope() {
+    fn native_registration_uses_the_waiting_host_pid_and_only_the_broker_envelope() {
         let reply: Response = serde_json::from_value(serde_json::json!({
             "version":1,"granted":true,"ticket":"intent","waiting":null,"committed_bytes":64,"reservations":null,"error":null,
             "launch_slice":"app-amcforeground.slice",
             "preparation":{"id":"intent","key":"","uid":1000,"profile":"game","domain":"foreground",
                 "memory_bytes":64,"swap_bytes":0,"requested_ms":0,"expires_ms":1000,"ready_ms":1000,"phase":"ready","drain":[],"waiting":null}
         })).unwrap();
-        let command = launch_client(&reply, "app-amc-prepared-intent.scope").unwrap();
+        let command = host::scope_command(&reply, "intent", 42).unwrap();
         let args: Vec<_> = command
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        assert!(args.contains(&"--scope".into()), "{args:?}");
-        assert!(args.contains(&"--property=MemoryMax=64".into()));
-        assert!(!args.iter().any(|s| s == "--wait"
-            || s == "--pipe"
-            || s.starts_with("--service-type")
-            || s.contains("Restart=")
-            || s.contains("ExitType=")));
+        assert!(
+            args.contains(&"app-amc-prepared-intent.scope".into()),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|parts| parts == ["MemoryMax", "t", "64"])
+        );
+        assert!(
+            args.windows(4)
+                .any(|parts| parts == ["PIDs", "au", "1", "42"])
+        );
+        assert!(!args.iter().any(|s| s == "ExecStart" || s == "Environment"));
+        assert!(host::scope_command(&reply, "intent", 0).is_err());
+        assert!(host::scope_command(&reply, "bad/name", 42).is_err());
     }
     #[test]
     fn gamemode_environment_is_payload_only_and_cannot_replace_native_authority() {

@@ -61,6 +61,8 @@ pub enum Request {
         version: u32,
         id: String,
         key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::ledger::ClientIdentity>,
     },
     RecoveryTargets {
         version: u32,
@@ -728,8 +730,18 @@ fn handle_advance_request(
             ensure!(version == 1, "unsupported host protocol");
             ledger.cancel_preparation(&id, &key, uid)?;
         }
-        Request::Consume { version, id, key } => {
+        Request::Consume {
+            version,
+            id,
+            key,
+            origin,
+        } => {
             ensure!(version == 1, "unsupported host protocol");
+            let pid = if let Some(origin) = &origin {
+                host_native::prepared_origin(origin, uid)?
+            } else {
+                pid
+            };
             let p = ledger
                 .preparations
                 .iter()
@@ -738,6 +750,13 @@ fn handle_advance_request(
                 .clone();
             let (domain, identity, memory_bytes, swap_bytes) =
                 host_native::identify_prepared(pid, uid, &policy.domains)?;
+            if let Some(origin) = &origin {
+                ensure!(
+                    identity.start_ticks == origin.start_ticks,
+                    "prepared origin replaced"
+                );
+                host_native::prepared_origin(origin, uid)?;
+            }
             let native = Reservation {
                 id: id.clone(),
                 domain,

@@ -579,6 +579,47 @@ with test_section("nested exec handoff reconciles an emptied parent before consu
     stop_prepared()
     wait_committed(0)
 
+with test_section("prepared helper loss cancels the intent without executing payload"):
+    launch(
+        "helper-loss-old",
+        1000,
+        "small",
+        "touch /tmp/helper-loss-old-entered; sleep 120",
+    )
+    wait_entered("helper-loss-old")
+    machine.succeed(
+        "systemd-run --unit=helper-loss-client --uid=1000 "
+        "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+        "amc prepare --profile game -- /bin/sh -c 'touch /tmp/helper-loss-entered'"
+    )
+    machine.wait_until_succeeds(
+        "amc admission host-status | python3 -c "
+        + shlex.quote(
+            'import sys,json; assert json.load(sys.stdin)["preparation_barrier"]'
+        ),
+        timeout=10,
+    )
+    helpers = machine.succeed(
+        "systemctl --user --machine=1000@.host list-units --type=service --state=running "
+        "--no-legend --plain 'app-amc-prepare-helper-*'"
+    ).splitlines()
+    assert len(helpers) == 1, helpers
+    machine.succeed(
+        "systemctl --user --machine=1000@.host stop "
+        + shlex.quote(helpers[0].split()[0])
+    )
+    machine.wait_until_succeeds(
+        "amc admission host-status | python3 -c "
+        + shlex.quote(
+            'import sys,json; s=json.load(sys.stdin); assert not s["preparation_barrier"] and not s["preparations"]'
+        ),
+        timeout=10,
+    )
+    machine.fail("test -e /tmp/helper-loss-entered")
+    wait_committed(32 * 1048576)
+    machine.succeed("systemctl stop helper-loss-client helper-loss-old-client")
+    wait_committed(0)
+
 with test_section(
     "prepared scope preserves a game-only filesystem namespace and surviving descendants"
 ):
@@ -594,9 +635,9 @@ with test_section(
     machine.succeed(
         "systemd-run --unit=namespace-game-client --uid=1000 "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
-        "bwrap --ro-bind / / --tmpfs /amc-game-only "
+        "bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / --tmpfs /amc-game-only "
         "--ro-bind /tmp/namespace-marker /amc-game-only/marker "
-        "--bind /tmp /tmp -- amc prepare --profile game -- /bin/sh -c "
+        "--bind /run/user/1000 /run/user/1000 --bind /tmp /tmp -- amc prepare --profile game -- /bin/sh -c "
         + shlex.quote(command)
     )
     wait_entered("namespace-game")
@@ -610,6 +651,37 @@ with test_section(
     stop_prepared()
     wait_committed(0)
     machine.succeed("rmdir /amc-game-only")
+
+with test_section("prepared host helper preserves private PID and user namespaces"):
+    host_pid_namespace = machine.succeed("readlink /proc/1/ns/pid").strip()
+    command = (
+        'test "$(id -u)" = 0 && test "$GAME_PAYLOAD" = after '
+        f'&& test "$(readlink /proc/self/ns/pid)" != {shlex.quote(host_pid_namespace)} '
+        "&& { touch /tmp/pid-game-entered; sleep 120; }"
+    )
+    machine.succeed(
+        "systemd-run --unit=pid-game-client --uid=1000 "
+        "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+        "bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --ro-bind / / --proc /proc "
+        "--bind /run/user/1000 /run/user/1000 --bind /tmp /tmp -- "
+        "amc prepare --profile game --payload-env GAME_PAYLOAD=after -- /bin/sh -c "
+        + shlex.quote(command)
+    )
+    wait_entered("pid-game")
+    wait_committed(64 * 1048576)
+    grant = next(
+        r for r in status()["reservations"] if r["domain"] == "foreground-1000"
+    )
+    assert grant["granted"] and grant["identity"]["uid"] == 1000, grant
+    namespace_pids = machine.succeed(
+        f"grep '^NSpid:' /proc/{grant['identity']['pid']}/status"
+    ).split()[1:]
+    assert len(namespace_pids) == 2 and namespace_pids[0] != namespace_pids[1], (
+        namespace_pids
+    )
+    machine.succeed("systemctl stop pid-game-client")
+    stop_prepared()
+    wait_committed(0)
 
 with test_section(
     "bounded page return makes real swap progress without disabling swap"
