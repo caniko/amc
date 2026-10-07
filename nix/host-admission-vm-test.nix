@@ -172,7 +172,7 @@ in
       virtualisation.emptyDiskImages = [512];
       virtualisation.cores = 2;
     };
-    testScript = builtins.readFile ./host-admission-vm-test.py;
+    testScript = builtins.readFile ./host-admission-vm-test.py + "\n" + builtins.readFile ./completion-vm-test.py;
   }).overrideTestDerivation (previous:
     assert pkgs.lib.hasInfix "-o $out" previous.buildCommand; {
       buildCommand = builtins.replaceStrings ["-o $out"] ["-o $out --junit-xml junit.xml"] previous.buildCommand;
