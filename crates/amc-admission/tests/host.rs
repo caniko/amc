@@ -103,6 +103,9 @@ fn unavailable_io_telemetry_blocks_only_enforced_domains() {
 
 fn policy() -> HostPolicy {
     HostPolicy {
+        preparations: vec![],
+        reserve_swap_return: false,
+        swap_recovery: None,
         version: 1,
         budget_bytes: 80,
         reserve_bytes: 20,
@@ -123,6 +126,7 @@ fn policy() -> HostPolicy {
                 fair_share_bytes: 40,
                 io_pressure: IoPressure::Enforce,
                 min_available_bytes: 0,
+                continuation: None,
                 burst: false,
             })
             .collect(),
@@ -147,6 +151,8 @@ fn job(id: &str, uid: u32, bytes: u64) -> Reservation {
         owners: vec![],
         burst: false,
         runtime_max_ms: None,
+        continuation: None,
+        owners_finished: false,
     }
 }
 fn capacity() -> Option<Capacity> {
@@ -298,6 +304,7 @@ fn independent_root_handlers_join_one_bounded_pool_without_releasing_each_other(
         fair_share_bytes: 40,
         io_pressure: IoPressure::Enforce,
         min_available_bytes: 0,
+        continuation: None,
         burst: false,
     });
     p.validate().unwrap();

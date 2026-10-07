@@ -22,6 +22,25 @@ fn number(path: &Path, name: &str) -> Result<u64> {
 
 /// Only a helper already inside its native boundary may request capacity.
 pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Identity, u64, u64)> {
+    identify_entry(pid, uid, domains, false)
+}
+
+/// Prepared scopes retain the submitting application's filesystem namespace.
+/// Only authenticated Consume, never ordinary Acquire, accepts this entry kind.
+pub fn identify_prepared(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+) -> Result<(String, Identity, u64, u64)> {
+    identify_entry(pid, uid, domains, true)
+}
+
+fn identify_entry(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
     let start_ticks = process_start(pid)?;
     let process = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
     let cgroup = process
@@ -43,7 +62,11 @@ pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Ident
         .and_then(|n| n.to_str())
         .context("invalid workload group")?;
     ensure!(
-        name.starts_with("app-amc-job-") && name.ends_with(".service"),
+        if prepared {
+            name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
+        } else {
+            name.starts_with("app-amc-job-") && name.ends_with(".service")
+        },
         "host admission requires a native AMC entry helper"
     );
     let directory = crate::native::cgroup_directory(cgroup)?;
@@ -102,7 +125,7 @@ pub fn empty_reservation(r: &crate::host::Reservation) -> Option<bool> {
         return Some(true);
     }
     if r.owners.is_empty() {
-        return None;
+        return r.owners_finished.then_some(true);
     }
     for owner in &r.owners {
         match fs::metadata(format!("/proc/{}", owner.pid)) {
@@ -232,11 +255,16 @@ fn ancestor_headroom_at(
     let identity = &reservation.identity;
     crate::native::cgroup_directory(&identity.cgroup).ok()?;
     let directory = root.join(identity.cgroup.trim_start_matches('/'));
-    if fs::metadata(&directory).ok()?.ino() != identity.inode {
+    let envelope = identity.inode == 0 && identity.pid == 0;
+    if !envelope && fs::metadata(&directory).ok()?.ino() != identity.inode {
         return None;
     }
     let mut available = u64::MAX;
-    for ancestor in directory.ancestors().skip(1).take_while(|p| *p != root) {
+    for ancestor in directory
+        .ancestors()
+        .skip(usize::from(!envelope))
+        .take_while(|p| *p != root)
+    {
         let prefix = format!("/{}/", ancestor.strip_prefix(root).ok()?.display());
         let (memory_committed, swap_committed) = reservations
             .iter()
@@ -414,6 +442,8 @@ mod tests {
                         owners: vec![],
                         burst: false,
                         runtime_max_ms: None,
+                        continuation: None,
+                        owners_finished: false,
                     },
                     &policy,
                 )
@@ -531,6 +561,8 @@ mod tests {
             }],
             burst: false,
             runtime_max_ms: None,
+            continuation: None,
+            owners_finished: false,
         };
         assert_eq!(empty_reservation(&r), Some(false));
         r.owners.insert(
@@ -545,5 +577,7 @@ mod tests {
         assert_eq!(empty_reservation(&r), Some(true));
         r.owners.clear();
         assert_eq!(empty_reservation(&r), None);
+        r.owners_finished = true;
+        assert_eq!(empty_reservation(&r), Some(true));
     }
 }

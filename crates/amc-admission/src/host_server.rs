@@ -26,14 +26,63 @@ pub enum Request {
     Acquire {
         version: u32,
         wait_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<crate::continuation::ContinuationCapability>,
     },
     AcquirePool {
         version: u32,
         wait_ms: u64,
         domain: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::ledger::ClientIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<u64>,
     },
     Status {
         version: u32,
+    },
+    Prepare {
+        version: u32,
+        id: String,
+        key: String,
+        profile: String,
+    },
+    Preparation {
+        version: u32,
+        id: String,
+        key: String,
+    },
+    CancelPreparation {
+        version: u32,
+        id: String,
+        key: String,
+    },
+    Consume {
+        version: u32,
+        id: String,
+        key: String,
+    },
+    RecoveryTargets {
+        version: u32,
+    },
+    AcquireRecovery {
+        version: u32,
+        target: String,
+    },
+    AcquirePageReturn {
+        version: u32,
+        pid: i32,
+        start_ticks: u64,
+        address: u64,
+        bytes: u64,
+    },
+    FinishPageReturn {
+        version: u32,
+    },
+    ReleasePool {
+        version: u32,
+        domain: String,
+        operation: u64,
     },
 }
 
@@ -52,6 +101,26 @@ pub struct Response {
     pub burst_committed_bytes: u64,
     pub reservations: Option<Vec<Reservation>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub preparation: Option<crate::preparation::Preparation>,
+    #[serde(default)]
+    pub preparations: Option<Vec<crate::preparation::Preparation>>,
+    #[serde(default)]
+    pub launch_slice: Option<String>,
+    #[serde(default)]
+    pub swap_return_bytes: Option<u64>,
+    #[serde(default)]
+    pub preparation_barrier: bool,
+    #[serde(default)]
+    pub recovery_targets: Option<Vec<crate::recovery::RecoveryTarget>>,
+    #[serde(default)]
+    pub recovery_policy: Option<crate::recovery::RecoveryPolicy>,
+    #[serde(default)]
+    pub recovery: Option<crate::recovery::RecoveryLease>,
+    #[serde(default)]
+    pub continuation: Option<crate::continuation::ContinuationCapability>,
+    #[serde(default)]
+    pub returned_bytes: Option<u64>,
 }
 
 pub fn call(socket: &Path, request: &Request) -> Result<Response> {
@@ -76,8 +145,37 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response> {
     Ok(response)
 }
 
+/// Protocol failures and broker refusals are terminal; only transport loss
+/// can be retried with the original idempotent capability and native identity.
+pub fn transient_transport(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            )
+        }) || cause
+            .downcast_ref::<nix::errno::Errno>()
+            .is_some_and(|e| matches!(e, nix::errno::Errno::ECONNRESET | nix::errno::Errno::EPIPE))
+            || matches!(
+                cause.to_string().as_str(),
+                "incomplete admission frame" | "admission frame deadline exceeded"
+            )
+    })
+}
+
 /// Helper calls this before its private coordinator's native entry handshake.
-pub fn acquire(socket: &Path, wait: Duration, stopping: impl Fn() -> bool) -> Result<()> {
+pub fn acquire(
+    socket: &Path,
+    wait: Duration,
+    stopping: impl Fn() -> bool,
+) -> Result<Option<crate::continuation::ContinuationCapability>> {
     let deadline = Instant::now() + wait;
     let mut explained = false;
     loop {
@@ -94,10 +192,14 @@ pub fn acquire(socket: &Path, wait: Duration, stopping: impl Fn() -> bool) -> Re
             &Request::Acquire {
                 version: 1,
                 wait_ms: left.max(1),
+                continuation: std::env::var("AMC_CONTINUATION")
+                    .ok()
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
             },
         )?;
         if reply.granted {
-            return Ok(());
+            return Ok(reply.continuation);
         }
         if !explained {
             eprintln!("waiting for host capacity: {:?}", reply.waiting);
@@ -163,6 +265,7 @@ pub fn serve_supervised(
     );
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
+    ledger.swap_return_bytes = None;
     let parent = socket
         .parent()
         .ok_or_else(|| anyhow::anyhow!("socket has no parent"))?;
@@ -202,31 +305,18 @@ pub fn serve_supervised(
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
                 if r.identity.uid == 0 {
+                    let had_owners = !r.owners.is_empty();
                     r.owners
                         .retain(|o| host_native::owner_alive(o) != Some(false));
-                    // Keep a sentinel if all owners died until the populated
-                    // subtree is empty; validation must never discard capacity.
-                    if r.owners.is_empty() {
-                        r.owners.push(crate::ledger::ClientIdentity {
-                            pid: r.identity.pid,
-                            start_ticks: r.identity.start_ticks,
-                        });
+                    if had_owners && r.owners.is_empty() {
+                        r.owners_finished = true;
                     }
                 }
             }
             ledger.reconcile(host_native::empty_reservation);
-            let capacity = if ledger
-                .reservations
-                .iter()
-                .filter(|r| r.granted)
-                .all(|r| host_native::enforcement(r).is_some())
-            {
-                host_native::capacity().ok().filter(|_| {
-                    health_file.is_none_or(|path| crate::health::permits(path).unwrap_or(false))
-                })
-            } else {
-                None
-            };
+            ledger.retain_pool_operations();
+            reconcile_recovery(&mut ledger);
+            let capacity = observe(&mut ledger, &policy, health_file);
             waiting = ledger.advance(
                 crate::clock::boot_ms()?,
                 &policy,
@@ -255,6 +345,8 @@ pub fn serve_supervised(
                         budget_bytes: policy.budget_bytes,
                         burst_budget_bytes: policy.burst.as_ref().map_or(0, |b| b.budget_bytes),
                         burst_committed_bytes: ledger.burst_committed(),
+                        swap_return_bytes: ledger.swap_return_bytes,
+                        preparation_barrier: ledger.preparation_barrier(),
                         ..Default::default()
                     };
                     match request {
@@ -271,8 +363,21 @@ pub fn serve_supervised(
                                     .cloned()
                                     .collect(),
                             );
+                            reply.preparations = Some(
+                                ledger
+                                    .preparations
+                                    .iter()
+                                    .filter(|p| {
+                                        credentials.uid() == 0 || p.uid == credentials.uid()
+                                    })
+                                    .map(public_preparation)
+                                    .collect(),
+                            );
+                            reply.recovery = ledger.recovery.clone();
                         }
-                        Request::Acquire { version, wait_ms }
+                        Request::Acquire {
+                            version, wait_ms, ..
+                        }
                         | Request::AcquirePool {
                             version, wait_ms, ..
                         } => {
@@ -296,6 +401,119 @@ pub fn serve_supervised(
                                     )?
                                 };
                             let now = crate::clock::boot_ms()?;
+                            let owner_key =
+                                format!("owner-{}-{}", identity.pid, identity.start_ticks);
+                            let operation = match &request {
+                                Request::AcquirePool { operation, .. } => *operation,
+                                _ => None,
+                            };
+                            if credentials.uid() == 0 && !policy.preparations.is_empty() {
+                                ensure!(
+                                    operation.is_some(),
+                                    "root pool requires a finite worker operation"
+                                );
+                            }
+                            let existing = ledger.reservations.iter().find(|r| {
+                                r.identity.cgroup == identity.cgroup
+                                    && r.identity.inode == identity.inode
+                            });
+                            let request_id =
+                                existing.map_or_else(fresh_id, |r| Ok(r.id.clone()))?;
+                            let pool_granted = existing.is_some_and(|r| r.granted);
+                            let old_owner =
+                                ledger.owns_pool_operation(&domain, &identity, operation);
+                            let mut continuation = if credentials.uid() == 0 && old_owner {
+                                None
+                            } else {
+                                match &request {
+                                    Request::Acquire { continuation, .. } => continuation.clone(),
+                                    Request::AcquirePool {
+                                        origin: Some(origin),
+                                        ..
+                                    } => {
+                                        ensure!(
+                                            credentials.uid() == 0,
+                                            "only root execution owners can nominate an origin"
+                                        );
+                                        origin_continuation(origin, &ledger)?
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            let call_id = if credentials.uid() == 0 {
+                                operation.map_or_else(
+                                    || owner_key.clone(),
+                                    |op| format!("{owner_key}-{op}"),
+                                )
+                            } else {
+                                request_id.clone()
+                            };
+                            let continuation_parent = if let Some(capability) = continuation.take()
+                            {
+                                let owner_uid = ledger
+                                    .continuations
+                                    .iter()
+                                    .find(|c| c.capability.parent == capability.parent)
+                                    .map_or(credentials.uid(), |c| c.uid);
+                                Some(ledger.authorize_continuation(
+                                    &capability,
+                                    if credentials.uid() == 0 {
+                                        owner_uid
+                                    } else {
+                                        credentials.uid()
+                                    },
+                                    &domain,
+                                    memory_bytes,
+                                    swap_bytes,
+                                    &call_id,
+                                )?)
+                            } else {
+                                None
+                            };
+                            if continuation_parent.is_none()
+                                && (if credentials.uid() == 0 {
+                                    !old_owner
+                                        && (ledger.preparation_barrier()
+                                            || ledger.recovery.is_some())
+                                } else {
+                                    !ledger.may_join(&identity)
+                                })
+                                && ledger.reservations.iter().any(|r| {
+                                    r.identity.cgroup == identity.cgroup
+                                        && r.identity.inode == identity.inode
+                                })
+                            {
+                                reply.waiting = Some(if ledger.recovery.is_some() {
+                                    WaitReason::Recovery
+                                } else {
+                                    WaitReason::Preparation
+                                });
+                                return Ok(reply);
+                            }
+                            if credentials.uid() == 0
+                                && pool_granted
+                                && !old_owner
+                                && continuation_parent.is_none()
+                            {
+                                let capacity = observe(&mut ledger, &policy, health_file);
+                                let d = policy
+                                    .domains
+                                    .iter()
+                                    .find(|d| d.name == domain)
+                                    .ok_or_else(|| anyhow::anyhow!("domain disappeared"))?;
+                                reply.waiting = pool_join_wait(
+                                    &ledger,
+                                    &policy,
+                                    d,
+                                    capacity,
+                                    healthy_since.get(&domain).is_some_and(|since| {
+                                        now.saturating_sub(*since) >= policy.resume_ms
+                                    }),
+                                );
+                                if reply.waiting.is_some() {
+                                    return Ok(reply);
+                                }
+                            }
                             let burst = policy
                                 .domains
                                 .iter()
@@ -306,9 +524,12 @@ pub fn serve_supervised(
                             } else {
                                 None
                             };
+                            if let Some(operation) = operation {
+                                ledger.bind_pool_operation(&domain, &identity, operation)?;
+                            }
                             let id = ledger.request(
                                 Reservation {
-                                    id: fresh_id()?,
+                                    id: request_id.clone(),
                                     domain,
                                     identity,
                                     memory_bytes,
@@ -317,8 +538,10 @@ pub fn serve_supervised(
                                     deadline_ms: now.saturating_add(wait_ms),
                                     granted: false,
                                     owners: vec![],
+                                    owners_finished: false,
                                     burst,
                                     runtime_max_ms,
+                                    continuation: continuation_parent.clone(),
                                 },
                                 &policy,
                             )?;
@@ -330,6 +553,23 @@ pub fn serve_supervised(
                             reply.granted = r.granted;
                             reply.waiting = waiting.get(&id).copied();
                             reply.ticket = Some(id);
+                            if r.granted {
+                                reply.continuation = ledger.continuation_capability(
+                                    reply.ticket.as_deref().unwrap_or_default(),
+                                    &policy,
+                                )?;
+                            }
+                        }
+                        other => {
+                            handle_advance_request(
+                                other,
+                                credentials.pid(),
+                                credentials.uid(),
+                                &policy,
+                                &mut ledger,
+                                health_file,
+                                &mut reply,
+                            )?;
                         }
                     }
                     Ok(reply)
@@ -351,5 +591,460 @@ pub fn serve_supervised(
         }
     }
     fs::remove_file(socket)?;
+    Ok(())
+}
+
+fn public_preparation(p: &crate::preparation::Preparation) -> crate::preparation::Preparation {
+    let mut public = p.clone();
+    public.key.clear();
+    public
+}
+
+fn origin_continuation(
+    origin: &crate::ledger::ClientIdentity,
+    ledger: &HostLedger,
+) -> Result<Option<crate::continuation::ContinuationCapability>> {
+    ensure!(
+        host_native::process_start(origin.pid)? == origin.start_ticks,
+        "Nix client origin identity changed"
+    );
+    let uid = fs::metadata(format!("/proc/{}", origin.pid))?.uid();
+    let group = fs::read_to_string(format!("/proc/{}/cgroup", origin.pid))?;
+    let group = group
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| anyhow::anyhow!("missing Nix origin placement"))?;
+    let reservation = ledger.reservations.iter().find(|r| {
+        r.granted
+            && r.identity.uid == uid
+            && (r.identity.cgroup == group || group.starts_with(&format!("{}/", r.identity.cgroup)))
+    });
+    let Some(r) = reservation else {
+        return Ok(None);
+    };
+    ensure!(
+        host_native::enforcement(r).is_some()
+            && host_native::process_start(origin.pid)? == origin.start_ticks,
+        "Nix origin native boundary changed"
+    );
+    let parent = r.continuation.as_deref().unwrap_or(&r.id);
+    Ok(ledger
+        .continuations
+        .iter()
+        .find(|c| c.capability.parent == parent)
+        .map(|c| c.capability.clone()))
+}
+
+fn observe(
+    ledger: &mut HostLedger,
+    policy: &HostPolicy,
+    health_file: Option<&Path>,
+) -> Option<crate::host::Capacity> {
+    if ledger.recovery.is_none()
+        && policy.swap_recovery.as_ref().is_some_and(|p| {
+            p.targets
+                .iter()
+                .any(|t| !matches!(crate::swap::device(t), Ok(Some(_))))
+        })
+    {
+        return None;
+    }
+    if policy.reserve_swap_return {
+        ledger.swap_return_bytes = crate::swap::return_bytes(ledger).ok();
+    }
+    if ledger
+        .reservations
+        .iter()
+        .filter(|r| r.granted)
+        .all(|r| host_native::enforcement(r).is_some())
+    {
+        host_native::capacity().ok().filter(|_| {
+            health_file.is_none_or(|path| crate::health::permits(path).unwrap_or(false))
+        })
+    } else {
+        None
+    }
+}
+
+fn reconcile_recovery(ledger: &mut HostLedger) {
+    let Some(lease) = &ledger.recovery else {
+        return;
+    };
+    let reservation = Reservation {
+        id: "swap-recovery".into(),
+        domain: "swap-recovery".into(),
+        identity: lease.identity.clone(),
+        memory_bytes: lease.helper_bytes,
+        swap_bytes: 0,
+        requested_ms: 0,
+        deadline_ms: u64::MAX,
+        granted: true,
+        owners: vec![crate::ledger::ClientIdentity {
+            pid: lease.identity.pid,
+            start_ticks: lease.identity.start_ticks,
+        }],
+        burst: false,
+        runtime_max_ms: None,
+        continuation: None,
+        owners_finished: false,
+    };
+    if host_native::empty_reservation(&reservation) == Some(true) {
+        ledger.recovery = None;
+    }
+}
+
+fn handle_advance_request(
+    request: Request,
+    pid: i32,
+    uid: u32,
+    policy: &HostPolicy,
+    ledger: &mut HostLedger,
+    health_file: Option<&Path>,
+    reply: &mut Response,
+) -> Result<()> {
+    use crate::preparation::PreparationPhase;
+    let now = crate::clock::boot_ms()?;
+    match request {
+        Request::Prepare {
+            version,
+            id,
+            key,
+            profile,
+        } => {
+            ensure!(version == 1, "unsupported host protocol");
+            ledger.prepare(id.clone(), key.clone(), uid, &profile, now, policy)?;
+            preparation_reply(ledger, policy, &id, &key, uid, reply)?;
+        }
+        Request::Preparation { version, id, key } => {
+            ensure!(version == 1, "unsupported host protocol");
+            preparation_reply(ledger, policy, &id, &key, uid, reply)?;
+        }
+        Request::CancelPreparation { version, id, key } => {
+            ensure!(version == 1, "unsupported host protocol");
+            ledger.cancel_preparation(&id, &key, uid)?;
+        }
+        Request::Consume { version, id, key } => {
+            ensure!(version == 1, "unsupported host protocol");
+            let p = ledger
+                .preparations
+                .iter()
+                .find(|p| p.id == id && p.uid == uid && p.key == key)
+                .ok_or_else(|| anyhow::anyhow!("unknown preparation capability"))?
+                .clone();
+            let (domain, identity, memory_bytes, swap_bytes) =
+                host_native::identify_prepared(pid, uid, &policy.domains)?;
+            let native = Reservation {
+                id: id.clone(),
+                domain,
+                identity,
+                memory_bytes,
+                swap_bytes,
+                requested_ms: now,
+                deadline_ms: now.saturating_add(1000),
+                granted: false,
+                owners: vec![],
+                burst: false,
+                runtime_max_ms: None,
+                continuation: None,
+                owners_finished: false,
+            };
+            if p.phase == PreparationPhase::Ready {
+                ensure!(
+                    policy.preparations.iter().any(|spec| spec.name == p.profile
+                        && spec.domain == p.domain
+                        && spec.memory_bytes == p.memory_bytes
+                        && spec.swap_bytes == p.swap_bytes),
+                    "preparation policy changed"
+                );
+                let capacity = observe(ledger, policy, health_file)
+                    .ok_or_else(|| anyhow::anyhow!("fresh host evidence unavailable"))?;
+                ensure!(
+                    ledger.recovery.is_none()
+                        && ledger.committed() <= policy.budget_bytes
+                        && (0.0..policy.max_memory_full_psi).contains(&capacity.memory_full_psi)
+                        && capacity.swap_free_bytes
+                            >= policy
+                                .swap_reserve_bytes
+                                .saturating_add(ledger.swap_committed())
+                        && capacity.available_bytes
+                            >= policy
+                                .reserve_bytes
+                                .saturating_add(ledger.committed())
+                                .saturating_add(ledger.return_claim(policy)),
+                    "prepared capacity is no longer available"
+                );
+                let d = policy
+                    .domains
+                    .iter()
+                    .find(|d| d.name == native.domain)
+                    .ok_or_else(|| anyhow::anyhow!("domain disappeared"))?;
+                ensure!(
+                    capacity.available_bytes >= d.min_available_bytes
+                        && (d.io_pressure == crate::host::IoPressure::Diagnostic
+                            || (0.0..policy.max_io_full_psi).contains(&capacity.io_full_psi))
+                        && ledger
+                            .native_claims(policy, Some(&native))
+                            .and_then(|claims| host_native::ancestor_headroom(&native, &claims))
+                            .is_some_and(|bytes| bytes >= memory_bytes),
+                    "prepared ancestor or pressure headroom changed"
+                );
+            }
+            ledger.consume(&id, &key, uid, native, now)?;
+            reply.granted = true;
+            reply.ticket = Some(id);
+        }
+        Request::RecoveryTargets { version } => {
+            ensure!(version == 1 && uid == 0, "recovery requires root");
+            reply.recovery_targets = Some(
+                policy
+                    .swap_recovery
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?
+                    .targets
+                    .clone(),
+            );
+            reply.recovery_policy = policy.swap_recovery.clone();
+        }
+        Request::AcquireRecovery { version, target } => {
+            ensure!(version == 1 && uid == 0, "recovery requires root");
+            let spec = policy
+                .swap_recovery
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
+            let target = spec
+                .targets
+                .iter()
+                .find(|t| t.name == target)
+                .ok_or_else(|| anyhow::anyhow!("unknown recovery target"))?;
+            let identity = crate::swap::helper(pid, spec)?;
+            if let Some(lease) = &ledger.recovery {
+                ensure!(
+                    lease.identity == identity
+                        && matches!(&lease.action, crate::recovery::RecoveryAction::Device {target:t,..} if t.name == target.name),
+                    "another native recovery owns capacity"
+                );
+                reply.granted = true;
+                reply.recovery = ledger.recovery.clone();
+                return Ok(());
+            }
+            let device = crate::swap::device(target)?
+                .ok_or_else(|| anyhow::anyhow!("swap target is inactive; restore first"))?;
+            if device.used_bytes < spec.minimum_bytes {
+                reply.waiting = Some(WaitReason::SwapReturn);
+                return Ok(());
+            }
+            let capacity = observe(ledger, policy, health_file);
+            let native_safe = crate::swap::native_return_safe(ledger)?;
+            reply.waiting = ledger.recovery_wait(
+                policy,
+                capacity,
+                device.size_bytes,
+                spec.helper_bytes,
+                native_safe,
+            );
+            if reply.waiting.is_none() {
+                let mut target = target.clone();
+                target.path = device.path.to_string_lossy().into_owned();
+                ledger.recovery = Some(crate::recovery::RecoveryLease {
+                    identity,
+                    action: crate::recovery::RecoveryAction::Device {
+                        target,
+                        before_used_bytes: device.used_bytes,
+                    },
+                    return_bytes: device.size_bytes,
+                    helper_bytes: spec.helper_bytes,
+                });
+                reply.granted = true;
+                reply.recovery = ledger.recovery.clone();
+            }
+        }
+        Request::AcquirePageReturn {
+            version,
+            pid: target_pid,
+            start_ticks,
+            address,
+            bytes,
+        } => {
+            ensure!(version == 1 && uid == 0, "page return requires root");
+            let spec = policy
+                .swap_recovery
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
+            let helper = crate::swap::helper(pid, spec)?;
+            let target = crate::page_return::identity(target_pid, start_ticks, spec)?;
+            let page = crate::page_return::page_size()?;
+            ensure!(
+                bytes > 0
+                    && bytes <= spec.batch_bytes
+                    && bytes.is_multiple_of(page)
+                    && address.is_multiple_of(page)
+                    && address.checked_add(bytes).is_some(),
+                "page return exceeds bounded batch"
+            );
+            if let Some(lease) = &ledger.recovery {
+                ensure!(
+                    lease.identity == helper,
+                    "another native recovery owns capacity"
+                );
+                if !matches!(
+                    &lease.action,
+                    crate::recovery::RecoveryAction::Pages { settled: true, .. }
+                ) {
+                    ensure!(
+                        matches!(&lease.action,crate::recovery::RecoveryAction::Pages {target:t,address:a,bytes:b,..}
+                        if t == &target && *a == address && *b == bytes),
+                        "previous page return is not settled"
+                    );
+                    reply.granted = true;
+                    reply.recovery = ledger.recovery.clone();
+                    return Ok(());
+                }
+            }
+            let before_swap_bytes = crate::page_return::target_swap(&target)?;
+            if before_swap_bytes == 0 {
+                reply.waiting = Some(WaitReason::SwapReturn);
+                return Ok(());
+            }
+            let capacity = observe(ledger, policy, health_file);
+            let claims = ledger
+                .native_claims(policy, None)
+                .ok_or_else(|| anyhow::anyhow!("completion native backing unavailable"))?;
+            let native_safe = crate::page_return::native_headroom(&target, &claims, bytes)?;
+            let mut eligibility = ledger.clone();
+            eligibility.recovery = None;
+            reply.waiting = eligibility.page_return_wait(
+                policy,
+                capacity,
+                bytes,
+                spec.helper_bytes,
+                native_safe,
+            );
+            if reply.waiting.is_none() {
+                ledger.recovery = Some(crate::recovery::RecoveryLease {
+                    identity: helper,
+                    action: crate::recovery::RecoveryAction::Pages {
+                        target,
+                        address,
+                        bytes,
+                        before_swap_bytes,
+                        settled: false,
+                    },
+                    return_bytes: bytes,
+                    helper_bytes: spec.helper_bytes,
+                });
+                reply.granted = true;
+                reply.recovery = ledger.recovery.clone();
+            }
+        }
+        Request::FinishPageReturn { version } => {
+            ensure!(version == 1 && uid == 0, "page return requires root");
+            let spec = policy
+                .swap_recovery
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
+            let helper = crate::swap::helper(pid, spec)?;
+            let lease = ledger
+                .recovery
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no native page return"))?;
+            ensure!(lease.identity == helper, "page return helper changed");
+            let crate::recovery::RecoveryAction::Pages {
+                target,
+                before_swap_bytes,
+                settled,
+                ..
+            } = &mut lease.action
+            else {
+                anyhow::bail!("native recovery is not a page return");
+            };
+            let after = crate::page_return::target_swap(target)?;
+            reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after));
+            *settled = true;
+            lease.return_bytes = 0;
+            reply.granted = true;
+        }
+        Request::ReleasePool {
+            version,
+            domain,
+            operation,
+        } => {
+            ensure!(version == 1 && uid == 0, "pool release requires root");
+            let (_, identity, _, _) =
+                host_native::identify_pool(pid, uid, &domain, &policy.domains)?;
+            ledger.release_pool_operation(&domain, &identity, operation);
+            reply.granted = true;
+        }
+        _ => anyhow::bail!("unexpected advance request"),
+    }
+    reply.committed_bytes = ledger.committed();
+    reply.swap_return_bytes = ledger.swap_return_bytes;
+    reply.preparation_barrier = ledger.preparation_barrier();
+    Ok(())
+}
+
+fn pool_join_wait(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    domain: &crate::host::Domain,
+    capacity: Option<crate::host::Capacity>,
+    healthy: bool,
+) -> Option<WaitReason> {
+    let Some(c) = capacity else {
+        return Some(WaitReason::Unknown);
+    };
+    if !healthy
+        || !(0.0..policy.max_memory_full_psi).contains(&c.memory_full_psi)
+        || (domain.io_pressure == crate::host::IoPressure::Enforce
+            && !(0.0..policy.max_io_full_psi).contains(&c.io_full_psi))
+    {
+        return Some(WaitReason::Pressure);
+    }
+    if c.swap_free_bytes
+        < policy
+            .swap_reserve_bytes
+            .saturating_add(ledger.swap_committed())
+    {
+        return Some(WaitReason::SwapHeadroom);
+    }
+    if ledger.committed() > policy.budget_bytes {
+        return Some(WaitReason::Budget);
+    }
+    if c.available_bytes
+        < domain.min_available_bytes.max(
+            policy
+                .reserve_bytes
+                .saturating_add(ledger.committed())
+                .saturating_add(ledger.return_claim(policy)),
+        )
+    {
+        return Some(WaitReason::SwapReturn);
+    }
+    None
+}
+
+fn preparation_reply(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    id: &str,
+    key: &str,
+    uid: u32,
+    reply: &mut Response,
+) -> Result<()> {
+    let p = ledger
+        .preparations
+        .iter()
+        .find(|p| p.id == id && p.uid == uid && p.key == key)
+        .ok_or_else(|| anyhow::anyhow!("unknown or expired preparation capability"))?;
+    reply.granted = p.phase == crate::preparation::PreparationPhase::Ready;
+    reply.waiting = p.waiting;
+    reply.ticket = Some(p.id.clone());
+    reply.preparation = Some(public_preparation(p));
+    reply.launch_slice = policy
+        .domains
+        .iter()
+        .find(|d| d.name == p.domain)
+        .and_then(|d| Path::new(&d.cgroup).file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
     Ok(())
 }

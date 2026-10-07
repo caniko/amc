@@ -220,6 +220,8 @@ mod host_tests {
             }],
             burst: false,
             runtime_max_ms: None,
+            continuation: None,
+            owners_finished: false,
         });
         store.save_snapshot(&ledger).unwrap();
         assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());
