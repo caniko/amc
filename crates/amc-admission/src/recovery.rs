@@ -1,9 +1,13 @@
 //! Root-owned bounded page return and explicit whole-device recovery. Capacity belongs to affected pages,
 //! not to the tiny helper. No ordinary free-swap gate can inhibit this repair.
 use crate::host::{Capacity, HostLedger, HostPolicy, Identity, WaitReason};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+};
 
 pub(crate) fn helper_claim(identity: &Identity, bytes: u64) -> crate::host::Reservation {
     crate::host::Reservation {
@@ -108,6 +112,7 @@ pub fn validate_targets(targets: &[RecoveryTarget]) -> Result<()> {
     ensure!(targets.len() <= 16, "too many recovery targets");
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     for target in targets {
         ensure!(
             crate::ledger::valid_name(&target.name)
@@ -119,8 +124,35 @@ pub fn validate_targets(targets: &[RecoveryTarget]) -> Result<()> {
                 && (0..=32767).contains(&target.priority),
             "invalid or duplicate recovery target"
         );
+        if let Some(identity) = target_identity(&target.path)? {
+            ensure!(
+                identities.insert(identity),
+                "duplicate native recovery target"
+            );
+        }
     }
     Ok(())
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum TargetIdentity {
+    BlockDevice(u64),
+    File(u64, u64),
+}
+
+fn target_identity(path: &str) -> Result<Option<TargetIdentity>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        // Policies may declare paths before provisioning. Campaigns revalidate
+        // the list when native paths are available, before restoring any target.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("observe recovery target {path}")),
+    };
+    Ok(Some(if metadata.file_type().is_block_device() {
+        TargetIdentity::BlockDevice(metadata.rdev())
+    } else {
+        TargetIdentity::File(metadata.dev(), metadata.ino())
+    }))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -315,6 +347,52 @@ impl HostLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_targets_reject_existing_symlink_and_hardlink_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-target-alias-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("swap");
+        let symlink = root.join("symlink");
+        let hardlink = root.join("hardlink");
+        let other = root.join("other");
+        std::fs::write(&original, "swap fixture").unwrap();
+        std::fs::write(&other, "distinct fixture").unwrap();
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+        std::fs::hard_link(&original, &hardlink).unwrap();
+        let target = |name: &str, path: &std::path::Path, priority| RecoveryTarget {
+            name: name.into(),
+            path: path.to_str().unwrap().into(),
+            priority,
+        };
+        let original = target("original", &original, 10);
+        assert!(validate_targets(&[original.clone(), target("other", &other, 20)]).is_ok());
+        for (path, priority) in [(&symlink, 20), (&hardlink, 10)] {
+            assert!(
+                validate_targets(&[original.clone(), target("alias", path, priority)]).is_err(),
+                "accepted alias {} at priority {priority}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_targets_can_be_declared_before_native_paths_are_provisioned() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-target-missing-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let targets = ["first", "second"].map(|name| RecoveryTarget {
+            name: name.into(),
+            path: root.join(name).to_str().unwrap().into(),
+            priority: 10,
+        });
+        assert!(validate_targets(&targets).is_ok());
+    }
+
     #[test]
     fn recovery_policy_rejects_noncanonical_paths_and_nonservice_helpers() {
         let policy = RecoveryPolicy {

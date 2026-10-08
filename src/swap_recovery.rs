@@ -60,6 +60,7 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
     }
     let reply = call(&args.socket, &Request::RecoveryTargets { version: 1 })?;
     let targets = reply.recovery_targets.context("missing recovery targets")?;
+    amc_admission::recovery::validate_targets(&targets)?;
     for target in &targets {
         restore(target)?;
     }

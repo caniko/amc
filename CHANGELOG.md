@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Reject aliases of the same native swap target before restoration, including
+  symlinks, hard links and duplicate block-device identities.
 - Revalidate the full page-return charge-owner frontier and native headroom before
   granting a background recovery scan.
 - Bind mapping-scan resumes to the exact VMA sequence so mapping churn cannot
