@@ -81,7 +81,8 @@ def verify_foreground_evidence(path):
         or helpers.get("aggregateBytesPerUser") != 64 * 1048576
         or helpers.get("reservedBytes") != 128 * 1048576
         or helpers.get("restartPreserved") is not True
-        or helpers.get("payloadsEnteredAfterDrain") is not True):
+        or helpers.get("payloadsEnteredAfterDrain") is not True
+        or helpers.get("existingWorkCompleted") is not True):
         raise RuntimeError("Native preparation helpers lack concurrent aggregate backing")
     if (runners.get("aggregateBytesPerUser") != 64 * 1048576
         or runners.get("reservedBytes") != 128 * 1048576

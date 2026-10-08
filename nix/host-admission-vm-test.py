@@ -187,8 +187,9 @@ with test_section("namespace runners share a host-reserve-backed aggregate ceili
     wait_committed(0)
 
 with test_section("concurrent preparation helpers share the reserve-backed runner slice"):
-    launch("helper-drain", 1000, "small", "touch /tmp/helper-drain-entered; while ! test -e /tmp/helper-drain-finish; do sleep .1; done")
+    launch("helper-drain", 1000, "small", "touch /tmp/helper-drain-entered; while ! test -e /tmp/helper-drain-finish; do sleep .1; done; touch /tmp/helper-drain-completed")
     wait_entered("helper-drain")
+    drain_grant = next(r for r in status()["reservations"] if r["granted"] and r["identity"]["uid"] == 1000)
     for number in [1, 2]:
         machine.succeed(
             f"systemd-run --unit=helper-prepared-{number} --uid=1000 "
@@ -214,12 +215,15 @@ with test_section("concurrent preparation helpers share the reserve-backed runne
     machine.succeed("touch /tmp/helper-drain-finish")
     for number in [1, 2]:
         wait_entered(f"helper-prepared-{number}", client_unit=f"helper-prepared-{number}")
+    machine.succeed("test -e /tmp/helper-drain-completed")
+    assert all(r["id"] != drain_grant["id"] for r in status()["reservations"])
     evidence["preparationHelperBacking"] = {
         "concurrentHelpers": 2, "aggregateBytesPerUser": 64 * 1048576,
         "reservedBytes": 128 * 1048576, "restartPreserved": True,
         "payloadsEnteredAfterDrain": True,
+        "existingWorkCompleted": True,
     }
-    machine.succeed("systemctl stop helper-prepared-1 helper-prepared-2 helper-drain-client")
+    machine.succeed("systemctl stop helper-prepared-1 helper-prepared-2")
     stop_prepared()
     wait_committed(0)
 

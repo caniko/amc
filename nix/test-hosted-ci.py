@@ -82,6 +82,7 @@ class NativeEvidenceTests(unittest.TestCase):
                 "concurrentHelpers": 2, "aggregateBytesPerUser": 64 * 1048576,
                 "reservedBytes": 128 * 1048576, "restartPreserved": True,
                 "payloadsEnteredAfterDrain": True,
+                "existingWorkCompleted": True,
             },
             "pageReturn": {
                 "schemaVersion": 2,
@@ -194,6 +195,7 @@ class NativeEvidenceTests(unittest.TestCase):
                 ("preparationHelperBacking", "reservedBytes", 0),
                 ("preparationHelperBacking", "restartPreserved", False),
                 ("preparationHelperBacking", "payloadsEnteredAfterDrain", False),
+                ("preparationHelperBacking", "existingWorkCompleted", False),
                 ("deviceReturn", "afterUsedKiB", 65536),
                 ("deviceReturn", "restoredPriority", -1),
                 ("deviceReturn", "interruptedRestored", False),
