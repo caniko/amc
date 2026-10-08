@@ -694,6 +694,30 @@ with test_section(
     machine.wait_until_succeeds("test -e /tmp/page-target-ready")
     group = "/sys/fs/cgroup/system.slice/page-target.service"
     machine.wait_until_succeeds(f"test $(cat {group}/memory.swap.current) -ge 33554432")
+    pageout_native = json.loads(
+        machine.succeed("python3 /etc/page-return-target.py --snapshot")
+    )
+    # MADV_PAGEOUT can replace PTEs while their pages still occupy resident swap
+    # cache. Create actual nonresident demand in this disposable target only;
+    # memory.reclaim may return EAGAIN after partial progress, so native counters
+    # below decide whether setup succeeded. Never induce global memory pressure.
+    evict = """import errno
+from pathlib import Path
+try:
+    Path('/sys/fs/cgroup/system.slice/page-target.service/memory.reclaim').write_text('67108864 swappiness=max')
+except OSError as error:
+    if error.errno != errno.EAGAIN:
+        raise
+"""
+    write_file("/tmp/page-return-evict.py", evict)
+    machine.succeed("python3 /tmp/page-return-evict.py")
+    machine.wait_until_succeeds(
+        "python3 /etc/page-return-target.py --snapshot | python3 -c "
+        + shlex.quote(
+            'import json,sys; s=json.load(sys.stdin); assert s["returnBytes"] >= 33554432 and s["swappedBytes"] >= 33554432'
+        ),
+        timeout=30,
+    )
     before_native = json.loads(
         machine.succeed("python3 /etc/page-return-target.py --snapshot")
     )
@@ -768,6 +792,8 @@ time.sleep(120)
     assert after_native["presentBytes"] == after_native["mappingBytes"], after_native
     evidence["pageReturn"] = {
         "schemaVersion": 2,
+        "pageoutNative": pageout_native,
+        "setupReclaimBytes": 64 * 1048576,
         "beforeSwapBytes": before_native["swapBytes"],
         "afterSwapBytes": after_native["swapBytes"],
         "beforeCachedBytes": before_native["cachedBytes"],

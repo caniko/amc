@@ -41,6 +41,7 @@ def snapshot():
         "swapBytes": after,
         "cachedBytes": cached,
         "returnBytes": after - cached,
+        "memoryCurrentBytes": int((group / "memory.current").read_text()),
         "mappingBytes": size,
         "presentBytes": present * mmap.PAGESIZE,
         "swappedBytes": swapped * mmap.PAGESIZE,
