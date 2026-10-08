@@ -592,6 +592,10 @@ impl HostLedger {
                     && r.runtime_max_ms == reservation.runtime_max_ms,
                 "native identity or ceiling changed"
             );
+            ensure!(
+                !r.granted || r.continuation == reservation.continuation,
+                "granted pool belongs to a different completion operation"
+            );
             let owner = crate::ledger::ClientIdentity {
                 pid: reservation.identity.pid,
                 start_ticks: reservation.identity.start_ticks,

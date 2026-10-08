@@ -237,6 +237,59 @@ fn root_pool_retries_continue_but_new_owners_cannot_join_during_draining() {
 }
 
 #[test]
+fn granted_root_pools_reject_a_different_completion_parent_before_joining() {
+    use amc_admission::continuation::ContinuationPolicy;
+    let mut p = policy();
+    p.domains[0].continuation = Some(ContinuationPolicy {
+        parent_max_bytes: 20,
+        memory_bytes: 20,
+        swap_bytes: 0,
+        max_calls: 2,
+        domains: vec!["builders".into()],
+    });
+    p.validate().unwrap();
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    for parent in ["first", "second"] {
+        l.request(job(parent, "work", 1000, 20), &p).unwrap();
+    }
+    advance(&mut l, &p, 250);
+    let first = l.continuation_capability("first", &p).unwrap().unwrap();
+    let second = l.continuation_capability("second", &p).unwrap().unwrap();
+    let mut pool = job("pool", "builders", 0, 20);
+    pool.identity.cgroup = "/builders".into();
+    pool.continuation = Some(
+        l.authorize_continuation(&first, 1000, "builders", 20, 0, "pool")
+            .unwrap(),
+    );
+    l.request(pool.clone(), &p).unwrap();
+    advance(&mut l, &p, 500);
+    assert!(
+        l.reservations
+            .iter()
+            .find(|r| r.id == "pool")
+            .unwrap()
+            .granted
+    );
+
+    let mut other = pool.clone();
+    other.id = "other".into();
+    other.identity.pid = 43;
+    other.continuation = Some(
+        l.authorize_continuation(&second, 1000, "builders", 20, 0, "other")
+            .unwrap(),
+    );
+    let before = serde_json::to_vec(&l).unwrap();
+    assert!(l.request(other, &p).is_err());
+    assert_eq!(serde_json::to_vec(&l).unwrap(), before);
+    pool.identity.pid = 44;
+    assert_eq!(l.request(pool, &p).unwrap(), "pool");
+    let held = l.reservations.iter().find(|r| r.id == "pool").unwrap();
+    assert_eq!(held.continuation.as_deref(), Some("first"));
+    assert_eq!(held.owners.len(), 2);
+}
+
+#[test]
 fn finite_authenticated_children_finish_during_drain_without_admitting_unrelated_work() {
     use amc_admission::continuation::ContinuationPolicy;
     let mut p = policy();
