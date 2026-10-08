@@ -24,6 +24,9 @@ in {
     };
   };
   config = lib.mkIf cfg.enable {
+    boot.kernelPatches =
+      lib.mkIf ((cfg.policy.swap_recovery.page_cgroups or []) != [])
+      (import ./page-return-guard-module.nix {inherit lib;}).boot.kernelPatches;
     environment.systemPackages = [cfg.package];
     systemd.user.slices.app-amchostrunner = lib.mkIf ((cfg.policy.namespace_runner_bytes or 0) > 0) {
       wantedBy = ["default.target"];

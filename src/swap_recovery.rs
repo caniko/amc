@@ -173,6 +173,8 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         eprintln!("page return incomplete: no page-return subtrees are configured");
         return Ok(75);
     }
+    let helper = amc_admission::swap::helper(std::process::id().try_into()?, &policy)?;
+    let _helper_guard = amc_admission::page_return::open_memory(&helper)?;
     let deadline = Instant::now() + Duration::from_secs(45);
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut discovery) = amc_admission::store::Store::open_discovery(state, boot.trim())?;
@@ -317,13 +319,13 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         );
         amc_admission::page_return::read_batch(&memory, address, bytes)?;
         let resident = amc_admission::page_return::range_resident(&pagemap, address, bytes)?;
-        drop(memory);
         thread::sleep(Duration::from_millis(10));
         let reply = call(socket, &Request::FinishPageReturn { version: 1 })?;
         if !resident || reply.resident_bytes != Some(bytes) {
             eprintln!("page return stalled: batch residency is unproven");
             return Ok(75);
         }
+        drop(memory);
         returned = returned.saturating_add(bytes);
         discovery
             .active

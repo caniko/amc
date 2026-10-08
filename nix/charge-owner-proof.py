@@ -29,6 +29,15 @@ def request(payload):
 
 def batch():
     target = json.loads(Path("/tmp/charge-ranges.json").read_text())
+    with (
+        open("/proc/self/amc_mem", "rb", buffering=0),
+        open(f"/proc/{target['pid']}/amc_mem", "rb", buffering=0) as memory,
+    ):
+        batch_with_guards(memory)
+
+
+def batch_with_guards(memory):
+    target = json.loads(Path("/tmp/charge-ranges.json").read_text())
     address = target[sys.argv[2]]
     pid = target["pid"]
     start = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19])
@@ -64,12 +73,11 @@ def batch():
         }
     )
     if reply["granted"]:
-        with open(f"/proc/{pid}/mem", "rb", buffering=0) as memory:
-            for offset in range(0, size, mmap.PAGESIZE):
-                assert (
-                    len(os.pread(memory.fileno(), mmap.PAGESIZE, address + offset))
-                    == mmap.PAGESIZE
-                )
+        for offset in range(0, size, mmap.PAGESIZE):
+            assert (
+                len(os.pread(memory.fileno(), mmap.PAGESIZE, address + offset))
+                == mmap.PAGESIZE
+            )
         reply = request({"op": "finish_page_return", "version": 1})
         assert reply["granted"] and reply["resident_bytes"] == size, reply
         owners = {helper.stat().st_ino: "helper", target_group.stat().st_ino: "target"}

@@ -46,6 +46,10 @@
 - Keep ungranted queue churn from invalidating recovery inventory backing.
 - Reject preparation policies without aggregate helper backing and pass
   hyphen-leading profile names literally through native helper registration.
+- Require FD-owned kernel mm/memcg guards for page return, keeping target and
+  reader placement backed across grant/read races, owner loss and broker restart.
+- Bound guarded swap faults to order-0 pages without speculative readahead and
+  require native direct/cache-path charging and post-grant migration receipts.
 - Resume bounded discovery without treating an interrupted scan prefix as proof
   of current residency; back original swap owners and the remote reader fallback.
 - Give complete charge-owner inventories a bounded maintenance RPC window and

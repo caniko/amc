@@ -129,6 +129,9 @@ pub enum RecoveryAction {
         before_swap_bytes: u64,
         #[serde(default)]
         before_return_bytes: Option<u64>,
+        /// Legacy leases can be cleaned up, but cannot authorize guarded reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guards: Option<crate::page_return::PageReturnGuards>,
         settled: bool,
     },
 }
@@ -171,6 +174,7 @@ impl RecoveryLease {
                 before_swap_bytes,
                 before_return_bytes,
                 settled,
+                guards,
                 ..
             } => {
                 crate::native::cgroup_directory(&target.cgroup)?;
@@ -189,6 +193,9 @@ impl RecoveryLease {
                         && address.checked_add(*bytes).is_some(),
                     "invalid page return demand"
                 );
+                if let Some(guards) = guards {
+                    guards.validate(target, &self.identity)?;
+                }
                 vec![]
             }
         };

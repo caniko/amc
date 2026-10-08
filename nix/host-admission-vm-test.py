@@ -856,6 +856,8 @@ if Path('/tmp/page-return-replace').exists():
     while not Path('/tmp/page-return-replacement-proceed').exists():
         time.sleep(.1)
 target = json.load(open('/tmp/page-target-range.json'))
+reader_guard = open('/proc/self/amc_mem', 'rb', buffering=0)
+target_guard = open('/proc/%s/amc_mem' % target['pid'], 'rb', buffering=0)
 stat = open('/proc/%s/stat' % target['pid']).read().rsplit(') ', 1)[1].split()
 request = {'op':'acquire_page_return','version':1,'pid':target['pid'],'start_ticks':int(stat[19]),'address':target['address'],'bytes':2097152}
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:

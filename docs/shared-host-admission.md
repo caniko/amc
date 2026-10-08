@@ -260,6 +260,55 @@ cannot be transferred from an abandoned scan.
 Inventory backing includes granted native obligations and Ready/continuation
 escrow, while ungranted queue churn cannot discard a valid scan.
 
+### Kernel page-return guard (version 1)
+
+Incremental page return requires the `pageReturnKernelGuardVersion = 1` package
+capability and a booted kernel carrying both patches in `nix/kernel/`. The
+host-admission module adds them whenever page-return subtrees are configured;
+standalone consumers can import `nixosModules.page-return-guard`. The patch
+baseline is Linux 6.18.48. A package capability alone does not prove the running
+kernel supports the interface: missing or unproven native guards return status
+75 before any recovery read.
+
+Root opens `/proc/<pid>/amc_mem`, a read-only, ptrace-authorized proc-mem
+descriptor additionally requiring `CAP_SYS_ADMIN` in the initial user namespace.
+Its open serializes with cgroup migration and pins the **same mm served by its
+reads** and that target's memory cgroup. Kernel fdinfo reports guard version,
+opaque mm cookie and memcg inode. Both the helper and target descriptors remain
+open through inventory, grant, remote reads and broker-verified settlement. The
+broker independently opens the current guarded mms and authenticates matching
+kernel cookies in the native helper's descriptor table; there is no request-body
+guard assertion. Both cookies persist in the recovery lease and must match again
+at settlement, so exec or last-close/reopen cannot recycle an old grant into a
+replacement mm. Descriptor inventories are bounded in count, size and time.
+
+While guarded, memory-controller migration returns `EBUSY` for any task sharing
+the mm. `CLONE_VM | CLONE_INTO_CGROUP` cannot create a migration bypass. The
+pinned cgroup and ancestry cannot be removed or have their controller/type
+configuration changed. The fallback memcg stays pinned even if the mm owner
+dies and an existing cross-cgroup mm sharer survives. A new private fork/exec mm
+starts unguarded; an obsolete proc descriptor cannot reach its replacement.
+The last guarded FD close clears the pin with RCU-safe CSS lifetime management;
+duplication, helper death and broker restart retain normal kernel FD semantics.
+
+Guarded swap-in uses order-0 faults without swap readahead, so a backed batch
+cannot allocate an unreserved larger folio or neighboring cache pages. Kernel
+fdinfo exposes successful direct/cache swap-in page counts. The disposable VM
+forces migration **after grant and before read** on regular-swap cache and zram
+direct paths, including offlined original owners, reader migration, duplicated
+FDs, broker restart and helper-loss cleanup. Receipts require exact per-page
+`kpagecgroup` attribution, complete batch residency and zero OOM counters. A
+separate native lifetime fixture checks pre-existing cross-cgroup mm sharers,
+conflicting guard acquisition, `clone3` placement, private-fork initialization,
+owner death, memcg offlining/controller changes, exec and last-FD cleanup.
+
+Source anchors for this extension are Linux 6.18.48 `fs/proc/base.c` (`mem_open`,
+`mem_rw`, `mem_release`), `kernel/cgroup/cgroup.c` (`cgroup_migrate_execute`,
+`cgroup_can_fork`, controller/type writes and `cgroup_destroy_locked`),
+`mm/memcontrol.c` (`get_mem_cgroup_from_mm`, `mem_cgroup_swapin_charge_folio`),
+`mm/memory.c` (`alloc_swap_folio`) and `mm/swap_state.c` (`swapin_readahead`).
+Upstream source: <https://github.com/gregkh/linux/tree/v6.18.48>.
+
 A stable zero `memory.swap.current` means a cgroup owns no swap-slot return
 obligation even when `memory.stat.swapcached` is positive: remote reads of
 offlined-owner slots can charge resident cache to the reader's RAM boundary.

@@ -14,6 +14,8 @@
     forAllSystems = nixpkgs.lib.genAttrs systems;
     pkgsFor = system: import nixpkgs {inherit system;};
   in {
+    nixosModules.page-return-guard = import ./nix/page-return-guard-module.nix;
+
     packages = forAllSystems (system: {
       default = (pkgsFor system).callPackage ./nix/package.nix {};
     });
@@ -102,6 +104,7 @@
     lib.admissionNamespaceRunnerVersion = 2;
     lib.swapReturnReservationVersion = 2;
     lib.swapRestorationManifestVersion = 1;
+    lib.pageReturnKernelGuardVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;

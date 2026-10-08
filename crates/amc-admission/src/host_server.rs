@@ -388,8 +388,10 @@ pub fn serve_supervised(
                                 )?;
                                 if fresh.granted {
                                     ensure!(
-                                        serde_json::to_vec(&fresh.recovery)?
-                                            == serde_json::to_vec(&reply.recovery)?,
+                                        inventory_recovery_matches(
+                                            &fresh.recovery,
+                                            &reply.recovery
+                                        )?,
                                         "recovery identity or demand changed during inventory"
                                     );
                                 }
@@ -734,6 +736,48 @@ fn inventory_current(
         && host_native::owner_alive(owner) == Some(true)
         && inventory_peer_connected(stream)
         && inventory_backing(ledger, policy)? == backing)
+}
+
+fn inventory_recovery_matches(
+    fresh: &Option<crate::recovery::RecoveryLease>,
+    scanned: &Option<crate::recovery::RecoveryLease>,
+) -> Result<bool> {
+    use crate::recovery::RecoveryAction;
+    let (Some(fresh), Some(scanned)) = (fresh, scanned) else {
+        return Ok(false);
+    };
+    // Counter snapshots are settlement telemetry, not authorization. The
+    // replay already checks fresh PTE demand and native target/reader backing;
+    // the inventory must still authorize exactly the same helper and batch.
+    let action_matches = match (&fresh.action, &scanned.action) {
+        (RecoveryAction::Device { target: a, .. }, RecoveryAction::Device { target: b, .. }) => {
+            a == b
+        }
+        (
+            RecoveryAction::Pages {
+                target: a,
+                address: aa,
+                bytes: ab,
+                settled: settled_a,
+                guards: guards_a,
+                ..
+            },
+            RecoveryAction::Pages {
+                target: b,
+                address: ba,
+                bytes: bb,
+                settled: settled_b,
+                guards: guards_b,
+                ..
+            },
+        ) => a == b && aa == ba && ab == bb && settled_a == settled_b && guards_a == guards_b,
+        _ => false,
+    };
+    Ok(action_matches
+        && fresh.identity == scanned.identity
+        && fresh.invocation_id == scanned.invocation_id
+        && fresh.return_bytes == scanned.return_bytes
+        && fresh.helper_bytes == scanned.helper_bytes)
 }
 
 fn inventory_backing(ledger: &HostLedger, policy: &HostPolicy) -> Result<Vec<u8>> {
@@ -1194,6 +1238,13 @@ fn handle_advance_request(
             let helper = crate::swap::helper(pid, spec)?;
             let invocation_id = host_native::recovery_invocation(&helper)?;
             let target = crate::page_return::identity(target_pid, start_ticks, spec)?;
+            let target_guard = crate::page_return::open_memory(&target)?;
+            let helper_guard = crate::page_return::open_memory(&helper)?;
+            ensure!(
+                crate::page_return::helper_holds_guards(pid, &target_guard, &helper_guard)?,
+                "page return helper does not retain the kernel mm guards"
+            );
+            let guards = crate::page_return::PageReturnGuards::new(&target_guard, &helper_guard);
             let page = crate::page_return::page_size()?;
             ensure!(
                 bytes > 0
@@ -1213,8 +1264,8 @@ fn handle_advance_request(
                     crate::recovery::RecoveryAction::Pages { settled: true, .. }
                 ) {
                     ensure!(
-                        matches!(&lease.action,crate::recovery::RecoveryAction::Pages {target:t,address:a,bytes:b,..}
-                        if t == &target && *a == address && *b == bytes),
+                        matches!(&lease.action,crate::recovery::RecoveryAction::Pages {target:t,address:a,bytes:b,guards:g,..}
+                        if t == &target && *a == address && *b == bytes && g.as_ref() == Some(&guards)),
                         "previous page return is not settled"
                     );
                     reply.granted = true;
@@ -1273,6 +1324,7 @@ fn handle_advance_request(
                         bytes,
                         before_swap_bytes,
                         before_return_bytes: Some(usage.return_bytes()),
+                        guards: Some(guards),
                         settled: false,
                     },
                     return_bytes: bytes,
@@ -1301,6 +1353,7 @@ fn handle_advance_request(
                 bytes,
                 address,
                 settled,
+                guards,
                 ..
             } = &mut lease.action
             else {
@@ -1309,6 +1362,17 @@ fn handle_advance_request(
             ensure!(
                 crate::page_return::identity(target.pid, target.start_ticks, spec)? == *target,
                 "page return target changed before settlement"
+            );
+            let target_guard = crate::page_return::open_memory(target)?;
+            let helper_guard = crate::page_return::open_memory(&helper)?;
+            ensure!(
+                guards.as_ref()
+                    == Some(&crate::page_return::PageReturnGuards::new(
+                        &target_guard,
+                        &helper_guard
+                    ))
+                    && crate::page_return::helper_holds_guards(pid, &target_guard, &helper_guard)?,
+                "page return protected mm changed before settlement"
             );
             let after = crate::page_return::target_usage(target)?;
             reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after.used_bytes));
@@ -1600,6 +1664,74 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn inventory_replay_keeps_exact_authority_with_fresh_native_counter_telemetry() {
+        let scanned: crate::recovery::RecoveryLease = serde_json::from_value(serde_json::json!({
+            "identity":{"cgroup":"/helper","inode":1,"uid":0,"pid":42,"start_ticks":7},
+            "invocation_id":"11111111111111111111111111111111",
+            "action":{"kind":"pages","target":{"cgroup":"/target","inode":2,"uid":0,"pid":43,"start_ticks":8},
+                "address":4096,"bytes":4096,"before_swap_bytes":8192,"before_return_bytes":8192,"settled":false,
+                "guards":{"target":{"cookie":10,"inode":2},"helper":{"cookie":11,"inode":1}}},
+            "return_bytes":4096,"helper_bytes":1024
+        })).unwrap();
+        let mut fresh = serde_json::to_value(&scanned).unwrap();
+        fresh["action"]["before_swap_bytes"] = 16384.into();
+        fresh["action"]["before_return_bytes"] = 12288.into();
+        let fresh: crate::recovery::RecoveryLease = serde_json::from_value(fresh).unwrap();
+        assert!(
+            inventory_recovery_matches(&Some(fresh.clone()), &Some(scanned.clone())).unwrap(),
+            "live counters are telemetry; grant identity and full batch demand did not change"
+        );
+        for (field, value) in [
+            (
+                "identity",
+                serde_json::json!({"cgroup":"/new-helper","inode":3,"uid":0,"pid":44,"start_ticks":9}),
+            ),
+            (
+                "invocation_id",
+                serde_json::json!("22222222222222222222222222222222"),
+            ),
+            ("return_bytes", serde_json::json!(8192)),
+            ("helper_bytes", serde_json::json!(2048)),
+        ] {
+            let mut changed = serde_json::to_value(&fresh).unwrap();
+            changed[field] = value;
+            assert!(
+                !inventory_recovery_matches(
+                    &Some(serde_json::from_value(changed).unwrap()),
+                    &Some(scanned.clone())
+                )
+                .unwrap(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            (
+                "target",
+                serde_json::json!({"cgroup":"/new-target","inode":4,"uid":0,"pid":45,"start_ticks":10}),
+            ),
+            ("address", serde_json::json!(8192)),
+            ("bytes", serde_json::json!(8192)),
+            ("settled", serde_json::json!(true)),
+            (
+                "guards",
+                serde_json::json!({"target":{"cookie":12,"inode":2},"helper":{"cookie":11,"inode":1}}),
+            ),
+            ("guards", serde_json::json!(null)),
+        ] {
+            let mut changed = serde_json::to_value(&fresh).unwrap();
+            changed["action"][field] = value;
+            assert!(
+                !inventory_recovery_matches(
+                    &Some(serde_json::from_value(changed).unwrap()),
+                    &Some(scanned.clone())
+                )
+                .unwrap(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

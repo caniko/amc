@@ -1,0 +1,3 @@
+# Unified diffs necessarily prefix context with spaces, including tabbed C and
+# empty lines. Treat those two envelope shapes as patch data, not source errors.
+nix/kernel/*.patch whitespace=-blank-at-eol,-space-before-tab

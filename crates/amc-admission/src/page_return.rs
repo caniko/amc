@@ -1,4 +1,4 @@
-//! Bounded reads through an mm-bound /proc/<pid>/mem descriptor fault actual
+//! Bounded reads through an mm-bound /proc/<pid>/amc_mem descriptor fault actual
 //! pages in. No advice-success assumption, process writes, signals, or payload
 //! contents in diagnostics. Native PTEs prove each batch's residency; swap cache
 //! and occupied slots remain separate from outstanding RAM-return demand.
@@ -9,7 +9,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, File},
-    os::unix::fs::{FileExt, MetadataExt},
+    io::Read,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, MetadataExt},
+    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -291,15 +295,136 @@ pub fn selected_return_bytes(policy: &RecoveryPolicy) -> Result<u64> {
     Ok(bytes)
 }
 
-/// Open first, then verify the process. proc mem pins the original mm across
-/// PID reuse and exec; an obsolete descriptor cannot access a replacement mm.
-pub fn open_memory(target: &Identity) -> Result<File> {
-    let file = File::open(format!("/proc/{}/mem", target.pid))?;
+/// Kernel-owned proof of the exact guarded mm, without exposing an mm pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardProof {
+    cookie: u64,
+    inode: u64,
+}
+
+impl GuardProof {
+    fn parse(text: &str) -> Result<Option<Self>> {
+        let field = |name: &str| -> Result<Option<u64>> {
+            let mut values = text.lines().filter_map(|line| line.strip_prefix(name));
+            let value = values
+                .next()
+                .map(|value| value.trim().parse())
+                .transpose()?;
+            ensure!(values.next().is_none(), "duplicate native guard field");
+            Ok(value)
+        };
+        let version = field("amc_guard_version:")?;
+        if version.is_none() {
+            return Ok(None);
+        }
+        ensure!(version == Some(1), "unsupported kernel page-return guard");
+        let proof = Self {
+            cookie: field("amc_guard_cookie:")?.context("missing native mm guard cookie")?,
+            inode: field("amc_guard_memcg_ino:")?.context("missing native memcg guard identity")?,
+        };
+        ensure!(
+            proof.cookie > 0 && proof.inode > 0,
+            "invalid native guard identity"
+        );
+        Ok(Some(proof))
+    }
+}
+
+fn guard_info(path: &Path) -> Result<Option<GuardProof>> {
+    let mut text = String::new();
+    File::open(path)?.take(65537).read_to_string(&mut text)?;
+    ensure!(text.len() <= 65536, "kernel guard fdinfo exceeds bound");
+    GuardProof::parse(&text)
+}
+
+/// Closing the last guarded FD releases the kernel barrier, including on death.
+pub struct GuardedMemory {
+    file: File,
+    proof: GuardProof,
+}
+
+/// Persist both opaque mm identities so exec or a last-close/reopen cannot
+/// reuse a grant belonging to an earlier protected address space.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageReturnGuards {
+    target: GuardProof,
+    helper: GuardProof,
+}
+
+impl PageReturnGuards {
+    pub fn new(target: &GuardedMemory, helper: &GuardedMemory) -> Self {
+        Self {
+            target: target.proof,
+            helper: helper.proof,
+        }
+    }
+
+    pub(crate) fn validate(&self, target: &Identity, helper: &Identity) -> Result<()> {
+        ensure!(
+            self.target.cookie > 0
+                && self.helper.cookie > 0
+                && self.target.inode == target.inode
+                && self.helper.inode == helper.inode,
+            "invalid persisted page return guards"
+        );
+        Ok(())
+    }
+}
+
+/// Open first, then verify the process AND kernel-pinned fallback memcg. The
+/// same FD owns placement protection and serves the exact original mm's reads.
+/// An unavailable kernel guard must never fall back to unguarded proc mem.
+pub fn open_memory(target: &Identity) -> Result<GuardedMemory> {
+    let file = File::open(format!("/proc/{}/amc_mem", target.pid))
+        .context("kernel page-return guard unavailable")?;
+    let proof = guard_info(Path::new(&format!(
+        "/proc/self/fdinfo/{}",
+        file.as_raw_fd()
+    )))?
+    .context("missing kernel page-return guard proof")?;
     ensure!(
-        crate::host_native::process_start(target.pid)? == target.start_ticks,
-        "page return process changed"
+        crate::host_native::process_start(target.pid)? == target.start_ticks
+            && proof.inode == target.inode,
+        "page return process or guarded memcg changed"
     );
-    Ok(file)
+    Ok(GuardedMemory { file, proof })
+}
+
+/// The authenticated helper must retain both its own and the target's exact
+/// guarded mm across the inventory, native grant, reads and settlement. These
+/// are kernel fdinfo fields, not assertions supplied in the request body.
+pub fn helper_holds_guards(
+    pid: i32,
+    target: &GuardedMemory,
+    helper: &GuardedMemory,
+) -> Result<bool> {
+    let mut target_seen = false;
+    let mut helper_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for (index, entry) in fs::read_dir(format!("/proc/{pid}/fdinfo"))?.enumerate() {
+        ensure!(
+            index < 1024 && Instant::now() < deadline,
+            "helper descriptor inventory exceeds bound"
+        );
+        let entry = entry?;
+        let proof = match guard_info(&entry.path()) {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            value => value?,
+        };
+        if let Some(proof) = proof {
+            target_seen |= proof == target.proof;
+            helper_seen |= proof == helper.proof;
+        }
+    }
+    Ok(target_seen && helper_seen)
 }
 
 /// Like proc mem, an opened pagemap pins its original mm across exec/PID reuse.
@@ -359,7 +484,11 @@ pub fn page_size() -> Result<u64> {
     Ok(size as u64)
 }
 
-pub fn read_batch(memory: &File, address: u64, bytes: u64) -> Result<u64> {
+pub fn read_batch(memory: &GuardedMemory, address: u64, bytes: u64) -> Result<u64> {
+    read_batch_at(&memory.file, address, bytes)
+}
+
+fn read_batch_at(memory: &File, address: u64, bytes: u64) -> Result<u64> {
     ensure!(
         bytes > 0 && bytes <= 16 * 1024 * 1024 && address.checked_add(bytes).is_some(),
         "invalid native read bound"
@@ -381,6 +510,27 @@ pub fn read_batch(memory: &File, address: u64, bytes: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::host::HostLedger;
+
+    #[test]
+    fn kernel_guard_proof_rejects_unsupported_incomplete_and_duplicate_identity() {
+        assert_eq!(GuardProof::parse("pos:\t0\nflags:\t0\n").unwrap(), None);
+        let valid = "amc_guard_version:\t1\namc_guard_cookie:\t42\namc_guard_memcg_ino:\t9\n";
+        assert_eq!(
+            GuardProof::parse(valid).unwrap(),
+            Some(GuardProof {
+                cookie: 42,
+                inode: 9
+            })
+        );
+        for invalid in [
+            valid.replace("version:\t1", "version:\t2"),
+            valid.replace("cookie:\t42", "cookie:\t0"),
+            valid.replace("amc_guard_memcg_ino:\t9\n", ""),
+            format!("{valid}amc_guard_cookie:\t43\n"),
+        ] {
+            assert!(GuardProof::parse(&invalid).is_err());
+        }
+    }
     #[test]
     fn resident_swap_cache_owners_do_not_need_additional_return_headroom() {
         let root = std::env::temp_dir().join(format!(
@@ -661,10 +811,10 @@ mod tests {
         let data = [9u8; 4096];
         let memory = File::open("/proc/self/mem").unwrap();
         assert_eq!(
-            read_batch(&memory, data.as_ptr() as u64, 4096).unwrap(),
+            read_batch_at(&memory, data.as_ptr() as u64, 4096).unwrap(),
             4096
         );
-        assert!(read_batch(&memory, 0, u64::MAX).is_err());
+        assert!(read_batch_at(&memory, 0, u64::MAX).is_err());
         assert_eq!(data[4095], 9);
     }
 
