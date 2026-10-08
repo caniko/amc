@@ -97,6 +97,9 @@ impl ContinuationPolicy {
                             && !d.burst
                             && limit.memory_bytes <= d.ceiling_bytes
                             && limit.swap_bytes <= d.swap_bytes
+                            && (d.uid != 0
+                                || (limit.memory_bytes == d.ceiling_bytes
+                                    && limit.swap_bytes == d.swap_bytes))
                     })
                 }),
             "invalid completion rights"

@@ -40,6 +40,39 @@ fn child_envelope_overrides_are_finite_selected_reductions() {
 }
 
 #[test]
+fn root_completion_envelopes_match_the_fixed_native_pool_request() {
+    let mut policy = host_policy();
+    policy.domains[1].uid = 0;
+    policy.domains[0].continuation = Some(
+        serde_json::from_value(serde_json::json!({
+            "parent_max_bytes":10,"memory_bytes":50,"swap_bytes":10,"max_calls":1,
+            "domains":["game"],"envelopes":{"game":{"memory_bytes":40,"swap_bytes":10}}
+        }))
+        .unwrap(),
+    );
+    policy.validate().unwrap();
+    policy.domains[0]
+        .continuation
+        .as_mut()
+        .unwrap()
+        .envelopes
+        .get_mut("game")
+        .unwrap()
+        .memory_bytes = 39;
+    assert!(policy.validate().is_err());
+    let envelope = policy.domains[0]
+        .continuation
+        .as_mut()
+        .unwrap()
+        .envelopes
+        .get_mut("game")
+        .unwrap();
+    envelope.memory_bytes = 40;
+    envelope.swap_bytes = 9;
+    assert!(policy.validate().is_err());
+}
+
+#[test]
 fn preparation_profiles_require_an_executable_launch_slice_basename() {
     let mut policy = host_policy();
     policy.preparations = serde_json::from_value(serde_json::json!([

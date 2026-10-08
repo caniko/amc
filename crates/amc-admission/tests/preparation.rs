@@ -241,6 +241,10 @@ fn root_pool_retries_continue_but_new_owners_cannot_join_during_draining() {
 fn granted_root_pools_reject_a_different_completion_parent_before_joining() {
     use amc_admission::continuation::ContinuationPolicy;
     let mut p = policy();
+    // Root pools have a fixed enforced envelope; this fixture uses a 20-byte
+    // pool so two upfront parent lanes fit its 100-byte host budget.
+    p.domains[2].ceiling_bytes = 20;
+    p.domains[2].swap_bytes = 0;
     p.domains[0].continuation = Some(ContinuationPolicy {
         parent_max_bytes: 20,
         memory_bytes: 20,
