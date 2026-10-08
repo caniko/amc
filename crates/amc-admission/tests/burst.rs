@@ -282,6 +282,31 @@ fn burst_quiet_windows_require_the_complete_upfront_completion_charge_to_fit() {
 }
 
 #[test]
+fn downstream_aged_waits_cannot_veto_burst_backfill() {
+    let mut p = policy();
+    p.domains[0].swap_bytes = 101;
+    p.burst.as_mut().unwrap().min_interval_ms = 0;
+    p.burst.as_mut().unwrap().max_running = 2;
+    let mut l = HostLedger::new("boot".into());
+    l.request(job("held", true, 5), &p).unwrap();
+    advance(&mut l, &p, 250, 1000);
+    let mut first = job("first", false, 20);
+    first.swap_bytes = 101;
+    l.request(first, &p).unwrap();
+    let mut second = job("second", false, 20);
+    second.requested_ms = 1;
+    l.request(second, &p).unwrap();
+    let mut quick = job("quick", true, 5);
+    quick.requested_ms = 2;
+    l.request(quick, &p).unwrap();
+    let waits = advance(&mut l, &p, 1500, 1000);
+    assert_eq!(waits["first"], WaitReason::SwapHeadroom);
+    assert_eq!(waits["second"], WaitReason::AgedRequest);
+    assert!(!waits.contains_key("quick"), "{waits:?}");
+    assert_eq!(l.burst_committed(), 10);
+}
+
+#[test]
 fn independent_users_share_the_burst_allowance_and_pressure_gates() {
     let mut p = policy();
     p.burst.as_mut().unwrap().max_running = 8;

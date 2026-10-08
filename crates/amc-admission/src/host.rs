@@ -778,7 +778,6 @@ impl HostLedger {
                             | WaitReason::SwapReturn
                             | WaitReason::SwapHeadroom
                             | WaitReason::AncestorHeadroom
-                            | WaitReason::AgedRequest
                     )
                     && now.saturating_sub(r.requested_ms) >= policy.aging_ms
                 {
