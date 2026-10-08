@@ -531,7 +531,12 @@ pub fn execute(
     if detached {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let mut child = match command.spawn() {
+    let spawned = {
+        #[cfg(test)]
+        let _guard = crate::test_support::executable_fixture_guard();
+        command.spawn()
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(_) => return Outcome::NotSubmitted(NotSubmitted::SpawnFailed),
     };

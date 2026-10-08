@@ -59,6 +59,15 @@ fn concurrent_scratch_directories_have_exclusive_ownership() {
     }
 }
 
+/// Prevent a test child from inheriting another fixture's writable executable
+/// descriptor before CLOEXEC takes effect. That short window causes ETXTBSY
+/// when the writing test closes its own descriptor and immediately executes it.
+#[cfg(all(feature = "systemd", target_os = "linux"))]
+pub(crate) fn executable_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    static EXECUTABLES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EXECUTABLES.lock().unwrap()
+}
+
 /// Executable fake `systemctl show` manager script.
 #[cfg(all(feature = "systemd", target_os = "linux"))]
 pub(crate) fn show_manager(dir: &Path, body: &str) -> PathBuf {
@@ -68,6 +77,7 @@ pub(crate) fn show_manager(dir: &Path, body: &str) -> PathBuf {
         .find(|p| p.is_file())
         .unwrap();
     let manager = dir.join("manager");
+    let _guard = executable_fixture_guard();
     std::fs::write(&manager, format!("#!{}\n{body}\n", shell.display())).unwrap();
     std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
     manager
