@@ -116,7 +116,7 @@ fn whole_device_status(
     targets: &[RecoveryTarget],
     mut observe: impl FnMut(&RecoveryTarget) -> Result<Option<u64>>,
 ) -> Result<i32> {
-    let mut incomplete = false;
+    let mut incomplete = targets.is_empty();
     // A single successful lease is not a receipt for the remaining devices.
     // Reobserve all configured devices, including earlier waits and later work.
     for target in targets {
@@ -234,6 +234,14 @@ mod tests {
         .unwrap();
         policy.validate().unwrap();
         assert_eq!(return_pages(Path::new("/unused"), policy).unwrap(), 75);
+    }
+
+    #[test]
+    fn whole_device_return_without_device_targets_is_incomplete() {
+        assert_eq!(
+            whole_device_status(&[], |_| panic!("no target to observe")).unwrap(),
+            75
+        );
     }
 
     #[test]
