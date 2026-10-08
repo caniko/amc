@@ -22,16 +22,41 @@ pub(crate) fn stats_fraction(
 /// Unique temp dir; caller removes it. `prefix` names the owner.
 #[allow(dead_code)]
 pub(crate) fn scratch_dir(prefix: &str) -> PathBuf {
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
+        "{prefix}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).unwrap();
+    // Concurrent tests must never share a directory, even on equal clock ticks.
+    std::fs::create_dir(&dir).unwrap();
     dir
+}
+
+#[test]
+fn concurrent_scratch_directories_have_exclusive_ownership() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..32)
+                    .map(|_| scratch_dir("amc-scratch-ownership"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let directories: Vec<_> = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect();
+    let unique: std::collections::BTreeSet<_> = directories.iter().collect();
+    assert_eq!(unique.len(), directories.len());
+    for directory in directories {
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
 
 /// Executable fake `systemctl show` manager script.
