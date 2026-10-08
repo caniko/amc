@@ -289,6 +289,7 @@ pub fn serve_supervised(
     ledger.swap_return_bytes = None;
     crate::namespace_runner::discover(&mut ledger)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
+    ledger.reconcile_preparations(host_native::preparation_owner_alive);
     let parent = socket
         .parent()
         .ok_or_else(|| anyhow::anyhow!("socket has no parent"))?;
@@ -341,6 +342,7 @@ pub fn serve_supervised(
                 }
             }
             reconcile_recovery(&mut ledger);
+            ledger.reconcile_preparations(host_native::preparation_owner_alive);
             let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
             waiting = ledger.advance(
                 crate::clock::boot_ms()?,
@@ -394,7 +396,7 @@ pub fn serve_supervised(
                                 if fresh.granted {
                                     ensure!(
                                         native_demand.as_ref().map_or(Ok(true), crate::swap::NativeReturnInventory::current)?,
-                                        "native device demand or frontier changed during inventory replay"
+                                        "native recovery demand or frontier changed during inventory replay"
                                     );
                                     ensure!(
                                         inventory_recovery_matches(
@@ -868,6 +870,28 @@ impl PendingInventory {
                             spec.helper_bytes,
                         )?;
                         (Some(safe), Some(proof))
+                    } else if let Request::AcquirePageReturn {
+                        pid: target_pid,
+                        start_ticks,
+                        bytes,
+                        ..
+                    } = &scan_request
+                    {
+                        let spec = scan_policy
+                            .swap_recovery
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
+                        let helper = crate::swap::helper(pid, spec)?;
+                        let target = crate::page_return::identity(*target_pid, *start_ticks, spec)?;
+                        let (safe, proof) = crate::swap::page_return_inventory(
+                            &scan_ledger,
+                            &scan_policy,
+                            &target,
+                            &helper,
+                            *bytes,
+                            spec.helper_bytes,
+                        )?;
+                        (Some(safe), Some(proof))
                     } else {
                         (None, None)
                     };
@@ -1080,7 +1104,15 @@ fn handle_advance_request(
             profile,
         } => {
             ensure!(version == 1, "unsupported host protocol");
-            ledger.prepare(id.clone(), key.clone(), uid, &profile, now, policy)?;
+            let owner = crate::ledger::ClientIdentity {
+                pid,
+                start_ticks: host_native::process_start(pid)?,
+            };
+            ensure!(
+                host_native::preparation_owner_alive(&owner) == Some(true),
+                "preparation helper lifetime unavailable"
+            );
+            ledger.prepare(id.clone(), key.clone(), (uid, owner), &profile, now, policy)?;
             preparation_reply(ledger, policy, &id, &key, uid, reply)?;
         }
         Request::Preparation { version, id, key } => {
@@ -1109,6 +1141,19 @@ fn handle_advance_request(
                 .find(|p| p.id == id && p.uid == uid && p.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown preparation capability"))?
                 .clone();
+            if matches!(
+                p.phase,
+                PreparationPhase::Draining | PreparationPhase::Ready
+            ) {
+                ensure!(
+                    p.owner
+                        .as_ref()
+                        .is_some_and(
+                            |owner| host_native::preparation_owner_alive(owner) == Some(true)
+                        ),
+                    "preparation helper is no longer running"
+                );
+            }
             let (domain, identity, memory_bytes, swap_bytes) = if matches!(
                 p.phase,
                 PreparationPhase::Active | PreparationPhase::Reconciling

@@ -69,6 +69,9 @@ pub struct Preparation {
     /// Never include the capability in public status replies.
     pub key: String,
     pub uid: u32,
+    /// Authenticated host helper lifetime; absent only in pre-upgrade snapshots.
+    #[serde(default)]
+    pub owner: Option<crate::ledger::ClientIdentity>,
     pub profile: String,
     pub domain: String,
     pub memory_bytes: u64,
@@ -82,6 +85,20 @@ pub struct Preparation {
 }
 
 impl HostLedger {
+    pub fn reconcile_preparations(
+        &mut self,
+        mut alive: impl FnMut(&crate::ledger::ClientIdentity) -> Option<bool>,
+    ) {
+        self.preparations.retain(|p| {
+            matches!(
+                p.phase,
+                PreparationPhase::Active | PreparationPhase::Reconciling
+            ) || p
+                .owner
+                .as_ref()
+                .is_some_and(|owner| alive(owner) != Some(false))
+        });
+    }
     pub fn preparation_barrier(&self) -> bool {
         self.preparations.iter().any(|p| {
             matches!(
@@ -109,18 +126,25 @@ impl HostLedger {
         &mut self,
         id: String,
         key: String,
-        uid: u32,
+        peer: (u32, crate::ledger::ClientIdentity),
         profile: &str,
         now: u64,
         policy: &HostPolicy,
     ) -> Result<()> {
+        let (uid, owner) = peer;
         ensure!(
-            crate::ledger::valid_name(&id) && crate::ledger::valid_name(&key),
+            crate::ledger::valid_name(&id)
+                && crate::ledger::valid_name(&key)
+                && owner.pid > 0
+                && owner.start_ticks > 0,
             "invalid preparation identity"
         );
         if let Some(p) = self.preparations.iter().find(|p| p.id == id) {
             ensure!(
-                p.uid == uid && p.key == key && p.profile == profile,
+                p.uid == uid
+                    && p.key == key
+                    && p.profile == profile
+                    && p.owner.as_ref() == Some(&owner),
                 "preparation identity changed"
             );
             return Ok(());
@@ -169,6 +193,7 @@ impl HostLedger {
             id,
             key,
             uid,
+            owner: Some(owner),
             profile: profile.into(),
             domain: domain.name.clone(),
             memory_bytes: spec.memory_bytes,

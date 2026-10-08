@@ -24,6 +24,7 @@ artifact_retention_days = 30
 extra_setup = [
   "python3 -c 'from pathlib import Path; p = Path.home() / \".config/nix/nix.conf\"; p.parent.mkdir(parents=True, exist_ok=True); p.open(\"a\").write(\"\\nlog-lines = 1000\\n\")'",
   "python3 -B nix/test-hosted-ci.py",
-  "nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
+  "nix run github:caniko/simit/8008329afdadb9b2c6cd917cd4e1736243e5bc74 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
 ]
 post_build = ["python3 nix/hosted-ci.py"]
+post_build_always = ["python3 -B nix/retain-diagnostics.py"]

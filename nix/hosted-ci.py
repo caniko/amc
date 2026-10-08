@@ -81,7 +81,7 @@ def verify_kernel_guard_evidence(guards):
         raise RuntimeError("Native page return lacks shared-mm, owner, offlining or last-FD lifetime proof")
     for path in ("direct", "cache"):
         batch = guards[path]
-        required = ("missingGuardDenied", "duplicateGuardHeld", "targetMigrationDeniedAfterGrant",
+        required = ("postScanChargeOwnerDenied", "missingGuardDenied", "duplicateGuardHeld", "targetMigrationDeniedAfterGrant",
                     "readerMigrationDeniedAfterGrant", "brokerRestartProtected", "helperLossReleased")
         expected = "directBytes" if path == "direct" else "cacheBytes"
         other = "cacheBytes" if path == "direct" else "directBytes"
@@ -105,6 +105,13 @@ def verify_foreground_evidence(path, kernel_series=None):
     if not isinstance(kernel, str) or not kernel or (kernel_series is not None and not kernel.startswith(kernel_series + ".")):
         raise RuntimeError("Native page return evidence is for the wrong kernel series")
     verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
+    abandoned = receipt.get("abandonedPreparation", {})
+    if (abandoned.get("sigkillWhileBrokerOffline") is not True
+        or abandoned.get("waitMilliseconds") != 3600000
+        or abandoned.get("restartClearedBarrier") is not True
+        or abandoned.get("existingWorkRetainedBytes") != 32 * 1048576
+        or abandoned.get("payloadDidNotExecute") is not True):
+        raise RuntimeError("Native preparation lacks abandoned-helper restart cleanup")
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
     if device.get("postScanNativeDemandDenied") is not True:
@@ -519,7 +526,7 @@ def retain():
                 "passed": True,
                 "revision": revision,
                 "installable": installable,
-                "generatorRevision": "beea3e284a613d46468779bd998e51be2d63566c",
+                "generatorRevision": "8008329afdadb9b2c6cd917cd4e1736243e5bc74",
                 "runId": os.environ.get("GITHUB_RUN_ID"),
                 "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
                 "eventSha": os.environ.get("GITHUB_SHA"),

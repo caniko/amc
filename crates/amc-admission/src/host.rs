@@ -375,6 +375,9 @@ impl HostLedger {
                     && crate::ledger::valid_name(&p.profile)
                     && crate::ledger::valid_name(&p.domain)
                     && p.uid != 0
+                    && p.owner
+                        .as_ref()
+                        .is_none_or(|owner| owner.pid > 0 && owner.start_ticks > 0)
                     && p.memory_bytes > 0
                     && p.memory_bytes <= i64::MAX as u64
                     && p.swap_bytes <= i64::MAX as u64

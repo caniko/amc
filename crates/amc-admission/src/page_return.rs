@@ -201,12 +201,32 @@ pub(crate) fn native_headroom_at(
     claims: &[Reservation],
     bytes: u64,
 ) -> Result<bool> {
+    native_headroom_until(
+        root,
+        target,
+        claims,
+        bytes,
+        Instant::now() + INVENTORY_TIMEOUT,
+    )
+}
+
+pub(crate) fn native_headroom_until(
+    root: &Path,
+    target: &Identity,
+    claims: &[Reservation],
+    bytes: u64,
+    deadline: Instant,
+) -> Result<bool> {
     let leaf = root.join(target.cgroup.trim_start_matches('/'));
     ensure!(
         fs::metadata(&leaf)?.ino() == target.inode,
         "page return identity changed"
     );
     for directory in leaf.ancestors().take_while(|p| *p != root) {
+        ensure!(
+            Instant::now() < deadline,
+            "page headroom observation exceeded time bound"
+        );
         let max = fs::read_to_string(directory.join("memory.max"))?;
         if max.trim() == "max" {
             continue;
@@ -224,6 +244,10 @@ pub(crate) fn native_headroom_at(
                 && (r.identity.cgroup == group
                     || r.identity.cgroup.starts_with(&format!("{group}/")))
         }) {
+            ensure!(
+                Instant::now() < deadline,
+                "page entitlement observation exceeded time bound"
+            );
             if r.identity.inode == 0 && r.identity.pid == 0 {
                 committed = committed.saturating_add(r.memory_bytes);
                 continue;
@@ -272,6 +296,10 @@ pub(crate) fn native_headroom_at(
             return Ok(false);
         }
     }
+    ensure!(
+        Instant::now() < deadline,
+        "page headroom observation exceeded time bound"
+    );
     Ok(true)
 }
 

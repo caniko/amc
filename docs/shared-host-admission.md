@@ -159,7 +159,12 @@ amc prepare --profile game -- game-command args
 An intent immediately closes ordinary and burst admission. Existing grants
 continue; the broker waits for the selected finite operations and their admitted
 completion children to finish. Intentions are FIFO, survive broker restart, and
-expire or cancel without revoking running work. A ready intent owns a real
+expire or cancel without revoking running work. Pending intents bind the
+authenticated host helper PID and process start time. Positive helper death,
+including SIGKILL or a zombie, removes Draining/Ready barriers and backing on the
+next tick or broker restart; unknown lifetime observations retain them. Legacy
+ownerless pending intents are discarded on replay. Active native claims remain
+charged after helper loss. A ready intent owns a real
 host/native-ancestor claim. The hidden entry helper authenticates an atomic,
 once-only transfer into a native scope before executing the payload. Replaying a
 lost reply is permitted only for that same native peer. After transfer, only
@@ -265,9 +270,11 @@ fallback checks before persisting the same lease. Changed ownership or demand
 cannot be transferred from an abandoned scan.
 Inventory backing includes granted native obligations and Ready/continuation
 escrow, while ungranted queue churn cannot discard a valid scan.
-Whole-device replay also verifies the complete scanned cgroup frontier and
-recalculates headroom from live limits, resident bytes and uncovered swap demand,
-including groups with zero demand in the earlier scan. This final replay has a
+Both page and whole-device replay verify the complete scanned cgroup frontier
+and recalculate headroom from live limits, resident bytes and uncovered swap
+demand, including groups with zero demand in the earlier scan. Page replay
+rechecks every possible original charge owner as well as target and reader
+fallback boundaries. This final replay has a
 250 ms bound and rejects incomplete or unsafe observations before durable grant.
 Burst manager evidence is refreshed in a separate single background task and
 expires after one second; missing evidence delays admission while kernel limits
@@ -346,11 +353,15 @@ invocation evidence retain empty-boundary-only cleanup.
 
 Discovery keeps private, locked, atomically saved hints in
 `/var/lib/amc-page-return` (`--state` overrides the directory). Campaigns resume
-through host PID windows, streaming mapping offsets and virtual page addresses,
+through host PID windows, mapping offsets and virtual page addresses,
 including beyond 512 PIDs, 8,192 mappings and 8,388,608 pages. This avoids walking
 empty cgroup descendants. Identity, layout, placement, native backing and PTEs
 are rechecked; hints grant no authority. PID reuse, ordinary exec and migration
-reset the target hint; full sweeps wrap to revisit mapping churn and same-layout
+reset the target hint. Mapping offsets additionally bind a SHA-256 digest of the
+complete maps stream, bounded to 64 MiB. Any changed VMA sequence resets the
+process frontier, even when exec/placement identity and the byte-offset boundary
+are unchanged. EOF requires a fresh matching maps snapshot; oversized or unstable
+snapshots remain incomplete. Full sweeps wrap to revisit churn and same-layout
 exec. Waits/interruption retain the first unread range. A scan-budget cutoff is
 distinct from end-of-mm and cannot establish successful recovery, even with zero
 destination swap counters. Kernel counters must also show zero selected demand.

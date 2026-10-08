@@ -1,6 +1,16 @@
 use amc_admission::{host::*, preparation::*};
 use std::collections::BTreeMap;
 
+fn peer() -> (u32, amc_admission::ledger::ClientIdentity) {
+    (
+        1000,
+        amc_admission::ledger::ClientIdentity {
+            pid: 42,
+            start_ticks: 7,
+        },
+    )
+}
+
 fn policy() -> HostPolicy {
     serde_json::from_value(serde_json::json!({
         "version": 1, "budget_bytes": 100, "reserve_bytes": 67108884, "swap_reserve_bytes": 10,
@@ -66,6 +76,63 @@ fn advance(l: &mut HostLedger, p: &HostPolicy, now: u64) -> BTreeMap<String, Wai
 }
 
 #[test]
+fn abandoned_helper_releases_only_pending_barriers_across_restart() {
+    let mut p = policy();
+    p.preparations[0].wait_ms = 3_600_000;
+    let mut ledger = HostLedger::new("boot".into());
+    ledger.swap_return_bytes = Some(0);
+    ledger
+        .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+        .unwrap();
+    ledger.request(job("new", "work", 1000, 20), &p).unwrap();
+    let mut restored: HostLedger =
+        serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+    restored.reconcile_preparations(|_| None);
+    assert!(restored.preparation_barrier());
+    let replaced = (
+        1000,
+        amc_admission::ledger::ClientIdentity {
+            pid: 42,
+            start_ticks: 8,
+        },
+    );
+    assert!(
+        restored
+            .prepare("intent".into(), "key".into(), replaced, "game", 1, &p)
+            .is_err()
+    );
+    restored.reconcile_preparations(|owner| {
+        assert_eq!(owner, &peer().1);
+        Some(false)
+    });
+    assert!(!restored.preparation_barrier());
+    advance(&mut restored, &p, 250);
+    assert!(restored.reservations[0].granted);
+    // Ready backing also belongs to the pending helper; unknown keeps it backed.
+    advance(&mut ledger, &p, 250);
+    assert_eq!(ledger.preparations[0].phase, PreparationPhase::Ready);
+    let mut pending = ledger.clone();
+    pending.reconcile_preparations(|_| None);
+    assert_eq!(pending.committed(), 40);
+    pending.reconcile_preparations(|_| Some(false));
+    assert_eq!(pending.committed(), 0);
+    // Once transferred, helper death cannot forgive the actual native lifetime.
+    ledger
+        .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 500)
+        .unwrap();
+    ledger.reconcile_preparations(|_| Some(false));
+    assert_eq!(ledger.committed(), 40);
+    assert_eq!(ledger.preparations[0].phase, PreparationPhase::Active);
+    // Legacy ownerless pending state cannot create an hour-long orphan barrier.
+    pending = restored;
+    pending.preparations = vec![ledger.preparations[0].clone()];
+    pending.preparations[0].phase = PreparationPhase::Draining;
+    pending.preparations[0].owner = None;
+    pending.reconcile_preparations(|_| panic!("ownerless legacy intent"));
+    assert!(!pending.preparation_barrier());
+}
+
+#[test]
 fn preparation_closes_admission_before_readiness_and_preserves_live_work() {
     let p = policy();
     p.validate().unwrap();
@@ -73,7 +140,7 @@ fn preparation_closes_admission_before_readiness_and_preserves_live_work() {
     l.swap_return_bytes = Some(0);
     l.request(job("old", "work", 1000, 20), &p).unwrap();
     advance(&mut l, &p, 250);
-    l.prepare("intent".into(), "key".into(), 1000, "game", 300, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 300, &p)
         .unwrap();
     l.request(job("new", "work", 1000, 20), &p).unwrap();
     assert_eq!(advance(&mut l, &p, 500)["new"], WaitReason::Preparation);
@@ -104,7 +171,7 @@ fn ready_transfer_is_once_only_and_unknown_cleanup_survives_restart_and_expiry()
     let p = policy();
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
-    l.prepare("intent".into(), "key".into(), 1000, "game", 0, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
         .unwrap();
     advance(&mut l, &p, 250);
     let native = job("intent", "game", 1000, 40);
@@ -139,7 +206,7 @@ fn cancellation_and_ready_expiry_do_not_remove_another_intents_barrier() {
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
     for id in ["first", "second"] {
-        l.prepare(id.into(), id.into(), 1000, "game", 0, &p)
+        l.prepare(id.into(), id.into(), peer(), "game", 0, &p)
             .unwrap();
     }
     advance(&mut l, &p, 250);
@@ -196,7 +263,7 @@ fn a_drain_includes_live_parents_that_can_still_launch_selected_completion_child
     );
     assert!(l.reservations[0].granted);
     let cap = l.continuation_capability("parent", &p).unwrap().unwrap();
-    l.prepare("intent".into(), "key".into(), 1000, "game", 550, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 550, &p)
         .unwrap();
     advance(&mut l, &p, 750);
     assert_eq!(l.preparations[0].phase, PreparationPhase::Draining);
@@ -229,7 +296,7 @@ fn root_pool_retries_continue_but_new_owners_cannot_join_during_draining() {
     pool.identity.cgroup = "/builders".into();
     l.request(pool.clone(), &p).unwrap();
     advance(&mut l, &p, 250);
-    l.prepare("intent".into(), "key".into(), 1000, "game", 300, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 300, &p)
         .unwrap();
     assert!(l.may_join(&pool.identity));
     pool.identity.pid = 43;
@@ -313,7 +380,7 @@ fn finite_authenticated_children_finish_during_drain_without_admitting_unrelated
     l.request(job("parent", "work", 1000, 10), &p).unwrap();
     advance(&mut l, &p, 250);
     let cap = l.continuation_capability("parent", &p).unwrap().unwrap();
-    l.prepare("intent".into(), "key".into(), 1000, "game", 300, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 300, &p)
         .unwrap();
     assert!(
         l.authorize_continuation(&cap, 1001, "work", 20, 0, "child")
@@ -421,7 +488,7 @@ fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
     let collision = "escrow-parent-builders";
-    l.prepare(collision.into(), "key".into(), 1000, "game", 0, &p)
+    l.prepare(collision.into(), "key".into(), peer(), "game", 0, &p)
         .unwrap();
     advance(&mut l, &p, 250);
     let mut native = job(collision, "game", 1000, 40);
@@ -476,7 +543,7 @@ fn queued_child_keeps_its_obligation_after_parent_exit_and_aged_new_work_cannot_
     child.identity.inode = 2;
     child.continuation = Some(parent);
     l.request(child, &p).unwrap();
-    l.prepare("intent".into(), "key".into(), 1000, "game", 300, &p)
+    l.prepare("intent".into(), "key".into(), peer(), "game", 300, &p)
         .unwrap();
     l.reconcile(|r| Some(r.id == "parent"));
     assert_eq!(l.continuations.len(), 1);
@@ -770,7 +837,7 @@ fn a_ready_claim_is_native_backing_until_its_once_only_consume_transfer() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
-    l.prepare("ready".into(), "key".into(), 1000, "game", 0, &p)
+    l.prepare("ready".into(), "key".into(), peer(), "game", 0, &p)
         .unwrap();
     advance(&mut l, &p, 250);
     let claims = l.native_claims(&p, None).unwrap();

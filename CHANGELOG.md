@@ -32,6 +32,13 @@
 
 ### Fixed
 
+- Revalidate the full page-return charge-owner frontier and native headroom before
+  granting a background recovery scan.
+- Bind mapping-scan resumes to the exact VMA sequence so mapping churn cannot
+  turn skipped swapped pages into successful recovery.
+- Reclaim abandoned preparation barriers after authenticated helper death,
+  including SIGKILL while the broker is offline, while retaining active claims.
+- Retain complete failed-builder logs in the Simit-generated hosted evidence.
 - Back all waited namespace runners with one finite, host-reserved aggregate
   slice per user before shared payload admission.
 - Exclude proven resident swap-cache-only owners from additional return demand.

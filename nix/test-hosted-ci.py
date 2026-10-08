@@ -20,6 +20,13 @@ class NativeEvidenceTests(unittest.TestCase):
         receipt = {
             "kernel": "6.18.48",
             "pageReturnGuard": self.guard_evidence(),
+            "abandonedPreparation": {
+                "sigkillWhileBrokerOffline": True,
+                "waitMilliseconds": 3600000,
+                "restartClearedBarrier": True,
+                "existingWorkRetainedBytes": 32 * 1048576,
+                "payloadDidNotExecute": True,
+            },
             "chargeOwner": {
                 "schemaVersion": 2,
                 "kernel": "fixture",
@@ -185,6 +192,11 @@ class NativeEvidenceTests(unittest.TestCase):
                 ):
                     hosted.verify_foreground_evidence(path)
             for section, key, value in [
+                ("abandonedPreparation", "sigkillWhileBrokerOffline", False),
+                ("abandonedPreparation", "waitMilliseconds", 60000),
+                ("abandonedPreparation", "restartClearedBarrier", False),
+                ("abandonedPreparation", "existingWorkRetainedBytes", 0),
+                ("abandonedPreparation", "payloadDidNotExecute", False),
                 ("pageReturn", "beforeSwapBytes", 0),
                 ("pageReturn", "schemaVersion", 1),
                 ("pageReturn", "beforeReturnBytes", 0),
@@ -264,6 +276,7 @@ class NativeEvidenceTests(unittest.TestCase):
 
     def guard_evidence(self):
         guards = {path: {"schemaVersion": 1, "missingGuardDenied": True,
+                       "postScanChargeOwnerDenied": True,
                       "duplicateGuardHeld": True, "targetMigrationDeniedAfterGrant": True,
                       "readerMigrationDeniedAfterGrant": True, "brokerRestartProtected": True,
                       "helperLossReleased": True, "residentBytes": 2 * 1048576,
@@ -286,6 +299,7 @@ class NativeEvidenceTests(unittest.TestCase):
             with self.subTest(missing=path), self.assertRaises(RuntimeError):
                 hosted.verify_kernel_guard_evidence(incomplete)
             for field, value in [("schemaVersion", 0), ("missingGuardDenied", False),
+                                  ("postScanChargeOwnerDenied", False),
                                  ("duplicateGuardHeld", False), ("targetMigrationDeniedAfterGrant", False),
                                  ("readerMigrationDeniedAfterGrant", False), ("brokerRestartProtected", False),
                                  ("helperLossReleased", False), ("residentBytes", 4096),

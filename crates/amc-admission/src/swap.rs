@@ -284,6 +284,24 @@ fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]
     NativeReturnInventory::scan(root, claims)?.safe()
 }
 
+pub(crate) fn page_return_inventory(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    target: &Identity,
+    helper: &Identity,
+    bytes: u64,
+    helper_bytes: u64,
+) -> Result<(bool, NativeReturnInventory)> {
+    let mut claims = ledger
+        .native_claims(policy, None)
+        .context("native recovery claims are unproven")?;
+    claims.push(crate::recovery::helper_claim(helper, helper_bytes));
+    let mut inventory =
+        NativeReturnInventory::scan_with_limit(Path::new("/sys/fs/cgroup"), &claims, 65_536)?;
+    inventory.pages = Some((target.clone(), helper.clone(), bytes));
+    Ok((inventory.safe()?, inventory))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct NativeDemand {
     max: Option<u64>,
@@ -310,7 +328,7 @@ impl NativeDirectory {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 ensure!(
-                    children.len() < 8192,
+                    children.len() < 65_536,
                     "device inventory frontier exceeded bound"
                 );
                 children.push(entry.path());
@@ -350,10 +368,19 @@ pub(crate) struct NativeReturnInventory {
     root: PathBuf,
     directories: BTreeMap<PathBuf, NativeDirectory>,
     claims: Vec<crate::host::Reservation>,
+    pages: Option<(Identity, Identity, u64)>,
 }
 
 impl NativeReturnInventory {
     fn scan(root: &Path, claims: &[crate::host::Reservation]) -> Result<Self> {
+        Self::scan_with_limit(root, claims, 8192)
+    }
+
+    fn scan_with_limit(
+        root: &Path,
+        claims: &[crate::host::Reservation],
+        limit: usize,
+    ) -> Result<Self> {
         let deadline = Instant::now() + crate::page_return::INVENTORY_TIMEOUT;
         let mut pending = vec![root.to_owned()];
         let mut directories = BTreeMap::new();
@@ -363,7 +390,8 @@ impl NativeReturnInventory {
                 "device return inventory incomplete: time bound exceeded"
             );
             ensure!(
-                directories.len() + pending.len() < 8192,
+                directories.len() + pending.len() < limit
+                    && directory.strip_prefix(root)?.components().count() <= 256,
                 "swap feasibility scan exceeds bound"
             );
             let observed = NativeDirectory::read(&directory, root, deadline)?;
@@ -374,6 +402,7 @@ impl NativeReturnInventory {
             root: root.to_owned(),
             directories,
             claims: claims.to_owned(),
+            pages: None,
         })
     }
 
@@ -389,6 +418,7 @@ impl NativeReturnInventory {
             root: self.root.clone(),
             directories: BTreeMap::new(),
             claims: self.claims.clone(),
+            pages: self.pages.clone(),
         };
         for (directory, scanned) in &self.directories {
             ensure!(
@@ -410,6 +440,9 @@ impl NativeReturnInventory {
     }
 
     fn safe_until(&self, deadline: Instant) -> Result<bool> {
+        if let Some((target, helper, bytes)) = &self.pages {
+            return self.page_safe_until(target, helper, *bytes, deadline);
+        }
         let root = &self.root;
         let claims = &self.claims;
         let disjoint: Vec<_> = claims
@@ -498,11 +531,110 @@ impl NativeReturnInventory {
         }
         Ok(true)
     }
+
+    fn page_safe_until(
+        &self,
+        target: &Identity,
+        helper: &Identity,
+        bytes: u64,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let headroom = |identity: &Identity| {
+            crate::page_return::native_headroom_until(
+                &self.root,
+                identity,
+                &self.claims,
+                bytes,
+                deadline,
+            )
+        };
+        if !headroom(target)? || !headroom(helper)? {
+            return Ok(false);
+        }
+        for (directory, observed) in &self.directories {
+            ensure!(
+                Instant::now() < deadline,
+                "page charge-owner replay exceeded time bound"
+            );
+            if observed
+                .demand
+                .as_ref()
+                .is_some_and(|demand| demand.swap.return_bytes() > 0)
+            {
+                let owner = Identity {
+                    cgroup: format!("/{}", directory.strip_prefix(&self.root)?.display()),
+                    inode: observed.inode,
+                    uid: 0,
+                    pid: 0,
+                    start_ticks: 0,
+                };
+                if !headroom(&owner)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(Instant::now() < deadline)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn page_inventory_replays_all_possible_owners_including_initially_empty_ones() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-page-demand-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (name, current, swap) in [
+            ("target", 1, 0),
+            ("helper", 1, 0),
+            ("owner", 8, 1),
+            ("empty-owner", 9, 0),
+        ] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            for (file, value) in [
+                ("memory.max", 10),
+                ("memory.current", current),
+                ("memory.swap.current", swap),
+            ] {
+                fs::write(directory.join(file), value.to_string()).unwrap();
+            }
+            fs::write(directory.join("memory.stat"), "swapcached 0\n").unwrap();
+        }
+        let identity = |name: &str| Identity {
+            cgroup: format!("/{name}"),
+            inode: fs::metadata(root.join(name)).unwrap().ino(),
+            uid: 0,
+            pid: 42,
+            start_ticks: 7,
+        };
+        let mut inventory = NativeReturnInventory::scan(&root, &[]).unwrap();
+        inventory.pages = Some((identity("target"), identity("helper"), 2));
+        assert!(inventory.safe().unwrap());
+        assert!(inventory.current().unwrap());
+        fs::write(root.join("owner/memory.current"), "9").unwrap();
+        assert!(
+            !inventory.current().unwrap(),
+            "unchanged logical claims hid owner growth"
+        );
+        fs::write(root.join("owner/memory.current"), "8").unwrap();
+        fs::write(root.join("owner/memory.max"), "9").unwrap();
+        assert!(!inventory.current().unwrap());
+        fs::write(root.join("owner/memory.max"), "10").unwrap();
+        fs::write(root.join("empty-owner/memory.swap.current"), "1").unwrap();
+        assert!(
+            !inventory.current().unwrap(),
+            "zero-demand scan omitted a newly charged owner"
+        );
+        fs::write(root.join("empty-owner/memory.swap.current"), "0").unwrap();
+        assert!(inventory.current().unwrap());
+        fs::remove_file(root.join("owner/memory.current")).unwrap();
+        assert!(inventory.current().is_err());
+        assert!(inventory.current_until(Instant::now()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn completed_device_inventory_rechecks_post_scan_demand_without_logical_grant_changes() {
         let root = std::env::temp_dir().join(format!(

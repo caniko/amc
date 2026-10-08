@@ -106,6 +106,39 @@ def denied_migration(pid):
     raise AssertionError("post-grant migration bypassed the kernel guard")
 
 
+def stale_helper():
+    target = json.loads(META.read_text())
+    start = int(Path(f"/proc/{target['pid']}/stat").read_text().rsplit(") ", 1)[1].split()[19])
+    reader = os.open("/proc/self/amc_mem", os.O_RDONLY | os.O_CLOEXEC)
+    memory = os.open(f"/proc/{target['pid']}/amc_mem", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        reply = request({"op": "acquire_page_return", "version": 1, "pid": target["pid"],
+                         "start_ticks": start, "address": target["address"], "bytes": 2 * MIB})
+        assert reply["granted"] is False and "native recovery demand or frontier" in reply["error"], reply
+        RESULT.write_text(json.dumps(reply))
+    finally:
+        os.close(memory)
+        os.close(reader)
+
+
+def deny_changed_owner():
+    observed = Path("/tmp/amc-page-inventory-observed")
+    observed.unlink(missing_ok=True)
+    RESULT.unlink(missing_ok=True)
+    Path("/tmp/amc-page-inventory-pause").touch()
+    subprocess.run(["systemd-run", "--collect", "--unit=page-return", "--property=MemoryMax=128M",
+                    "--property=MemorySwapMax=0", "--", "python3", __file__, "--helper-stale"], check=True)
+    wait(observed.exists)
+    original = ROOT / "original"
+    (original / "memory.max").write_text((original / "memory.current").read_text().strip())
+    wait(RESULT.exists)
+    assert request({"op": "status", "version": 1}).get("recovery") is None
+    subprocess.run(["systemctl", "stop", "page-return"], check=True)
+    (original / "memory.max").write_text(str(128 * MIB))
+    RESULT.unlink()
+    return True
+
+
 def run_helper(killed=False):
     for path in [READY, PROCEED, RESULT]:
         path.unlink(missing_ok=True)
@@ -181,14 +214,16 @@ def prove_path(path):
         (ROOT / "backed" / "cgroup.procs").write_text(str(pid))
         (ROOT / "backed" / "cgroup.freeze").write_text("1")
         wait(lambda: "frozen 1" in (ROOT / "backed" / "cgroup.events").read_text())
-        (ROOT / "original").rmdir()
         policy = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
         policy["swap_recovery"]["page_cgroups"] = ["/amc-guard-proof"]
         Path("/tmp/guard-policy.json").write_text(json.dumps(policy))
-        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--", "amc", "admission", "host-serve",
+        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--setenv=PATH=/etc/amc-test-observer/bin:/run/current-system/sw/bin", "--", "amc", "admission", "host-serve",
                         "--policy", "/tmp/guard-policy.json", "--socket", SOCKET, "--state", f"/var/lib/amc-guard-{path}"], check=True)
         wait(host_ready)
+        stale_denied = deny_changed_owner()
+        (ROOT / "original").rmdir()
         result = run_helper()
+        result["postScanChargeOwnerDenied"] = stale_denied
         expected = "directBytes" if path == "direct" else "cacheBytes"
         other = "cacheBytes" if path == "direct" else "directBytes"
         assert result[expected] == 2 * MIB and result[other] == 0, result
@@ -226,7 +261,9 @@ def proof():
     Path("/tmp/page-return-guard-evidence.json").write_text(json.dumps(receipt))
 
 
-if sys.argv[1:] in (["--helper"], ["--helper-kill"]):
+if sys.argv[1:] == ["--helper-stale"]:
+    stale_helper()
+elif sys.argv[1:] in (["--helper"], ["--helper-kill"]):
     helper(sys.argv[1] == "--helper-kill")
 else:
     proof()

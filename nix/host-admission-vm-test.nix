@@ -44,6 +44,11 @@
     fi
     case "$*" in
       *InvocationID*)
+        if test -e /tmp/amc-page-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /tmp/amc-page-inventory-pause
+          ${pkgs.coreutils}/bin/touch /tmp/amc-page-inventory-observed
+          ${pkgs.coreutils}/bin/sleep 1.5
+        fi
         if test -e /tmp/amc-device-inventory-pause; then
           ${pkgs.coreutils}/bin/rm /tmp/amc-device-inventory-pause
           ${pkgs.coreutils}/bin/touch /tmp/amc-device-inventory-observed
@@ -106,7 +111,7 @@ in
               memory_bytes = 64 * mib;
               swap_bytes = 0;
               drain_domains = ["tools-1000" "tools-1001" "builders" "burst-1000" "burst-1001"];
-              wait_ms = 60000;
+              wait_ms = 3600000;
               ready_ms = 15000;
             }) [1000 1001];
             burst = {
@@ -201,6 +206,7 @@ in
         environment.etc."page-return-guard-proof.py".source = ./page-return-guard-proof.py;
         environment.etc."amc-test-user-policy.json".source = userPolicy;
         environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
+        environment.etc."amc-test-observer".source = observer;
         environment.etc."amc-fixture-systemctl".source = "${observer}/bin/systemctl";
         environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
         virtualisation.memorySize = 2048;

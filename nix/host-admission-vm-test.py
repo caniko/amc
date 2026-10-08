@@ -741,10 +741,16 @@ with test_section("prepared helper loss cancels the intent without executing pay
         "--no-legend --plain 'app-amc-prepare-helper-*'"
     ).splitlines()
     assert len(helpers) == 1, helpers
+    pending = status()["preparations"]
+    assert len(pending) == 1 and pending[0]["owner"]["pid"] > 0, pending
+    assert pending[0]["expires_ms"] - pending[0]["requested_ms"] == 3600000, pending
+    # SIGKILL cannot run Drop; an offline broker cannot receive cancellation.
+    machine.succeed("systemctl stop amc-host-admission")
     machine.succeed(
-        "systemctl --user --machine=1000@.host stop "
+        "systemctl --user --machine=1000@.host kill --signal=KILL "
         + shlex.quote(helpers[0].split()[0])
     )
+    machine.succeed("systemctl start amc-host-admission")
     machine.wait_until_succeeds(
         "amc admission host-status | python3 -c "
         + shlex.quote(
@@ -754,6 +760,13 @@ with test_section("prepared helper loss cancels the intent without executing pay
     )
     machine.fail("test -e /tmp/helper-loss-entered")
     wait_committed(32 * 1048576)
+    evidence["abandonedPreparation"] = {
+        "sigkillWhileBrokerOffline": True,
+        "waitMilliseconds": 3600000,
+        "restartClearedBarrier": True,
+        "existingWorkRetainedBytes": 32 * 1048576,
+        "payloadDidNotExecute": True,
+    }
     machine.succeed("systemctl stop helper-loss-client helper-loss-old-client")
     wait_committed(0)
 
@@ -1057,7 +1070,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
     connection.sendall(b'{"op":"acquire_recovery","version":1,"target":"vm"}\\n')
     response = json.loads(connection.makefile().readline())
 assert not response['granted'], response
-assert 'native device demand or frontier changed' in response['error'], response
+assert 'native recovery demand or frontier changed' in response['error'], response
 with open('/tmp/device-stale-demand-denied', 'w') as receipt:
     json.dump(response, receipt)
 """)

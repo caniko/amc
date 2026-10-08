@@ -308,6 +308,17 @@ pub fn owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
     }
 }
 
+pub(crate) fn preparation_owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
+    let stat = match fs::read_to_string(format!("/proc/{}/stat", owner.pid)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+        Ok(stat) => stat,
+    };
+    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    let start: u64 = fields.get(19)?.parse().ok()?;
+    Some(start == owner.start_ticks && !matches!(*fields.first()?, "Z" | "X" | "x"))
+}
+
 fn recovery_unit(identity: &Identity) -> Result<String> {
     let unit = Path::new(&identity.cgroup)
         .file_name()
