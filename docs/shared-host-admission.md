@@ -115,8 +115,17 @@ cooldown deferral. Passing Rust fixtures alone does not qualify native rollout.
 ## Advance foreground preparation
 
 Optional `preparations` profiles specify a non-root slice domain, native
-memory/swap ceilings, `drain_domains`, a bounded `wait_ms` and a short `ready_ms`.
+memory/swap ceilings, `drain_domains`, a bounded `wait_ms` and a `ready_ms` of
+15–60 seconds, covering the bounded host-native registration and consume path.
 The flake and package export `admissionPreparationVersion = 2`.
+
+Waited `amc exec` and `amc admission exec` calls from a private PID or remapped
+user namespace use a 64 MiB, zero-swap host-native runner. The runner performs
+the ordinary admission and startup checks in the user manager's PID/UID view;
+the namespace-local caller keeps stdin/stdout/stderr and waits for its result.
+This managed-execution path requires the host user-manager session bus and
+host-visible executable/working-directory paths. `amc prepare` instead registers
+the waiting payload in a host-native scope and preserves its namespaces.
 
 ```sh
 amc prepare --profile game -- game-command args

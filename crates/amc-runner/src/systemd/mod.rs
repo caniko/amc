@@ -8,10 +8,11 @@
 
 mod control;
 mod managed;
+mod session_bus;
 mod startup;
 pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
-pub use startup::{StartupBarrier, wait_for_startup};
+pub use startup::{StartupBarrier, wait_for_host_runner, wait_for_startup};
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -145,6 +146,13 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
 }
 
 fn query_state(manager: &Path, unit: &str) -> Option<UnitState> {
+    routed_query_state(manager, unit, None)
+}
+
+fn routed_query_state(manager: &Path, unit: &str, session_uid: Option<u32>) -> Option<UnitState> {
+    if let Some(uid) = session_uid {
+        return session_bus::query(uid, unit);
+    }
     let text = capture(Command::new(manager).args([
         "--user",
         "show",
@@ -361,12 +369,19 @@ pub fn unit_cgroup_dir(manager: &Path, unit: &str) -> Option<PathBuf> {
 
 /// Stop exactly the supplied AMC identity and confirm workload termination.
 pub fn cleanup(manager: &Path, unit: &str) -> Cleanup {
+    routed_cleanup(manager, unit, None)
+}
+
+fn routed_cleanup(manager: &Path, unit: &str, session_uid: Option<u32>) -> Cleanup {
+    if let Some(uid) = session_uid {
+        return session_bus::cleanup(uid, unit);
+    }
     if !valid_unit(unit)
         || capture(Command::new(manager).args(["--user", "stop", "--", unit])).is_err()
     {
         return Cleanup::Unknown;
     }
-    match state(manager, unit) {
+    match query_state(manager, unit).filter(|state| state.loaded) {
         Some(state)
             if state.stopped && terminated(state.control_group.as_deref()) == Some(true) =>
         {
@@ -398,6 +413,7 @@ pub struct ClientRecord {
     submitted: std::cell::Cell<bool>,
     settled: std::cell::Cell<bool>,
     startup: Option<StartupBarrier>,
+    manager_session_uid: Option<u32>,
 }
 
 impl ClientRecord {
@@ -407,6 +423,17 @@ impl ClientRecord {
     pub fn with_startup(startup: StartupBarrier) -> Self {
         Self {
             startup: Some(startup),
+            ..Self::default()
+        }
+    }
+
+    /// Use one explicit local host UID manager for an outer namespace runner.
+    /// Queries use the explicit host session bus; submission remains in
+    /// the caller's local user manager and cannot select a remote context.
+    pub fn with_host_startup(startup: StartupBarrier, uid: u32) -> Self {
+        Self {
+            startup: Some(startup),
+            manager_session_uid: Some(uid),
             ..Self::default()
         }
     }
@@ -484,7 +511,7 @@ fn poll_cancelled(
         Ok(cancellation) => cancellation,
         Err(payload) => {
             record.mark_settled(reap_client(child));
-            let _ = cleanup(manager, unit);
+            let _ = routed_cleanup(manager, unit, record.manager_session_uid);
             std::panic::resume_unwind(payload);
         }
     }
@@ -541,6 +568,8 @@ pub fn execute(
         Err(_) => return Outcome::NotSubmitted(NotSubmitted::SpawnFailed),
     };
     record.mark_submitted();
+    let query = || routed_query_state(manager, unit, record.manager_session_uid);
+    let cleanup = || routed_cleanup(manager, unit, record.manager_session_uid);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut started = false;
     let mut observed: Option<(String, ObservedDomain)> = None;
@@ -551,7 +580,7 @@ pub fn execute(
         let expired = Instant::now() >= deadline && startup_wait_required(detached, started);
         if cancellation.is_some() || expired {
             record.mark_settled(reap_client(&mut child));
-            let cleanup = cleanup(manager, unit);
+            let cleanup = cleanup();
             return match cancellation {
                 Some(signal) => Outcome::Cancelled {
                     signal,
@@ -577,12 +606,12 @@ pub fn execute(
                 // domain cannot be observed) is Unknown, not Completed.
                 // Workload status comes from the manager; the client code is
                 // only a fallback when the manager is silent.
-                match query_state(manager, unit) {
+                match query() {
                     Some(state)
                         if startup_released && confirmed_exit(&state, observed.as_ref()) =>
                     {
                         if !retain {
-                            let _ = cleanup(manager, unit);
+                            let _ = cleanup();
                         }
                         return Outcome::Completed(state.workload_code.unwrap_or(client_code));
                     }
@@ -594,7 +623,7 @@ pub fn execute(
                             cleanup: if observed.is_some() {
                                 Cleanup::Unknown
                             } else {
-                                cleanup(manager, unit)
+                                cleanup()
                             },
                         };
                     }
@@ -605,12 +634,12 @@ pub fn execute(
                 record.mark_settled(reap_client(&mut child));
                 return Outcome::Unknown {
                     exit_code: 1,
-                    cleanup: cleanup(manager, unit),
+                    cleanup: cleanup(),
                 };
             }
         }
         if !started && Instant::now() >= next_query {
-            if let Some(state) = state(manager, unit) {
+            if let Some(state) = query().filter(|state| state.loaded) {
                 if record.startup.is_none() {
                     started = state.started;
                 }
@@ -645,7 +674,7 @@ pub fn execute(
                         return Outcome::Cancelled {
                             signal,
                             started,
-                            cleanup: cleanup(manager, unit),
+                            cleanup: cleanup(),
                         };
                     }
                     if Instant::now() >= deadline {

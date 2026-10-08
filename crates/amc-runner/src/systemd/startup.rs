@@ -11,11 +11,13 @@ use nix::{
 };
 use std::{
     io::{ErrorKind, Read, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::{
         linux::net::SocketAddrExt,
         unix::net::{SocketAddr, UnixListener, UnixStream},
     },
-    time::Duration,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// A one-use rendezvous held by the runner until native startup is pinned.
@@ -23,6 +25,7 @@ use std::{
 pub struct StartupBarrier {
     name: String,
     listener: UnixListener,
+    host_path: Option<(PathBuf, u64, u64)>,
 }
 
 impl StartupBarrier {
@@ -30,7 +33,35 @@ impl StartupBarrier {
     pub fn new(name: String) -> Result<Self> {
         let listener = UnixListener::bind_addr(&address(&name)?)?;
         listener.set_nonblocking(true)?;
-        Ok(Self { name, listener })
+        Ok(Self {
+            name,
+            listener,
+            host_path: None,
+        })
+    }
+
+    /// Hold a host-native *runner* before it starts the inner managed launch.
+    /// Unlike the payload barrier, the host runner validates the manager's
+    /// PID/cgroup challenge in its own host view. The inner payload retains its
+    /// independent native identity and admission checks.
+    pub fn host_runner(path: PathBuf) -> Result<Self> {
+        let parent = std::fs::symlink_metadata(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("missing host rendezvous parent"))?,
+        )?;
+        ensure!(
+            parent.is_dir() && parent.uid() == geteuid().as_raw() && parent.mode() & 0o077 == 0,
+            "untrusted host runner rendezvous directory"
+        );
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        Ok(Self {
+            name: String::new(),
+            listener,
+            host_path: Some((path, metadata.dev(), metadata.ino())),
+        })
     }
 
     /// Literal name passed to the exec helper; peer credentials authorize use.
@@ -47,6 +78,26 @@ impl StartupBarrier {
             Err(error) => return Err(error.into()),
         };
         let peer = getsockopt(&stream, PeerCredentials)?;
+        if self.host_path.is_some() {
+            ensure!(
+                main_pid > 0 && peer.uid() == geteuid().as_raw(),
+                "host runner UID mismatch"
+            );
+            ensure!(
+                group.starts_with('/') && group.len() <= 4096 && !group.contains('\n'),
+                "invalid native runner group"
+            );
+            stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+            stream.write_all(format!("{main_pid}\n{group}\n").as_bytes())?;
+            let mut response = [0];
+            stream.read_exact(&mut response)?;
+            ensure!(
+                response == [1],
+                "host runner rejected native startup identity"
+            );
+            return Ok(true);
+        }
         ensure!(
             main_pid > 0 && peer.pid() as u32 == main_pid && peer.uid() == geteuid().as_raw(),
             "startup helper does not match native MainPID/UID"
@@ -62,6 +113,78 @@ impl StartupBarrier {
         stream.write_all(&[1])?;
         Ok(true)
     }
+}
+
+impl Drop for StartupBarrier {
+    fn drop(&mut self) {
+        if let Some((path, dev, ino)) = &self.host_path
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Authenticate the kernel-reported host parent, then verify the runner's own
+/// host PID and cgroup against the manager snapshot before doing any inner work.
+pub fn wait_for_host_runner(path: &Path, parent_start: u64) -> Result<()> {
+    let mut stream = UnixStream::connect(path)?;
+    let peer = getsockopt(&stream, PeerCredentials)?;
+    ensure!(
+        peer.pid() > 0 && peer.uid() == geteuid().as_raw(),
+        "host runner parent UID/PID mismatch"
+    );
+    let start = || -> Result<u64> {
+        let text = std::fs::read_to_string(format!("/proc/{}/stat", peer.pid()))?;
+        text.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .ok_or_else(|| anyhow::anyhow!("missing host runner parent identity"))?
+            .parse()
+            .map_err(Into::into)
+    };
+    ensure!(
+        start()? == parent_start,
+        "host runner parent identity changed"
+    );
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut bytes = Vec::new();
+    for _ in 0..4120 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "host runner startup deadline exhausted"
+        );
+        stream.set_read_timeout(Some(remaining))?;
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+        if bytes.iter().filter(|b| **b == b'\n').count() == 2 {
+            break;
+        }
+    }
+    let text = std::str::from_utf8(&bytes)?;
+    let mut fields = text.split_terminator('\n');
+    let pid: u32 = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing runner PID"))?
+        .parse()?;
+    let group = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing runner cgroup"))?;
+    let placement = std::fs::read_to_string("/proc/self/cgroup")?;
+    ensure!(
+        fields.next().is_none()
+            && text.ends_with('\n')
+            && pid == std::process::id()
+            && placement
+                .lines()
+                .any(|line| line.strip_prefix("0::") == Some(group))
+            && start()? == parent_start,
+        "host runner native identity changed"
+    );
+    stream.write_all(&[1])?;
+    Ok(())
 }
 
 fn address(name: &str) -> Result<SocketAddr> {

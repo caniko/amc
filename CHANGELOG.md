@@ -32,6 +32,17 @@
 
 ### Fixed
 
+- Keep finite completion calls available after rejected enqueue attempts, bound
+  aggregate admission snapshots, and retain existing obligations on rejected growth.
+- Include parents that can launch future completion children in preparation drains
+  and require a ready window long enough for the native transfer.
+- Keep burst backfill available when draining cannot resolve an aged request's
+  swap-return, swap-headroom, completion-escrow, or native-ancestor wait.
+- Preserve prepared and completion native claims during whole-device recovery;
+  report empty page-return selection and unfinished multi-device return as incomplete.
+- Allow finite root services alongside operation-serial-owned root pools.
+- Preserve literal arguments, streams, exit status, and startup denial for waited
+  native/admitted launches from private PID and remapped user namespaces.
 - Preserve verified pre-change counter and pressure evidence across restarts
   without combining values from different workload lifetimes.
 - Mark final counters unavailable when sample persistence fails or the final

@@ -18,6 +18,7 @@ class NativeEvidenceTests(unittest.TestCase):
         self,
     ):
         receipt = {
+            "nativeNamespaceCompletion": self.namespace_evidence(),
             "pageReturn": {
                 "schemaVersion": 2,
                 "beforeSwapBytes": 64 * 1048576,
@@ -89,12 +90,47 @@ class NativeEvidenceTests(unittest.TestCase):
                     self.assertRaises(RuntimeError),
                 ):
                     hosted.verify_foreground_evidence(path)
+
             for section in receipt:
                 broken = dict(receipt)
                 del broken[section]
                 path.write_text(json.dumps(broken))
                 with self.subTest(missing=section), self.assertRaises(RuntimeError):
                     hosted.verify_foreground_evidence(path)
+            for variant, modes in receipt["nativeNamespaceCompletion"].items():
+                for mode in modes:
+                    for key, value in [
+                        ("rapid_jobs", []),
+                        ("startup_loss", {}),
+                        ("host_runner_loss", {}),
+                    ]:
+                        broken = json.loads(json.dumps(receipt))
+                        broken["nativeNamespaceCompletion"][variant][mode][key] = value
+                        path.write_text(json.dumps(broken))
+                        with (
+                            self.subTest(variant=variant, mode=mode, key=key),
+                            self.assertRaises(RuntimeError),
+                        ):
+                            hosted.verify_foreground_evidence(path)
+
+    def namespace_evidence(self):
+        run = {
+            "rapid_jobs": [
+                {"exit": code, "streams": "preserved"} for code in [0, 42, 0, 42]
+            ],
+            "startup_loss": {"disconnect": "no-exec", "invalid-ack": "no-exec"},
+            "host_runner_loss": {
+                "disconnect": "no-exec",
+                "wrong-pid": "no-exec",
+                "wrong-cgroup": "no-exec",
+            },
+        }
+        return {
+            variant: {
+                mode: json.loads(json.dumps(run)) for mode in ["native", "admitted"]
+            }
+            for variant in ["private-pid", "private-pid-user"]
+        }
 
     def test_supervision_exports_are_complete_and_have_no_oom_events(self):
         with tempfile.TemporaryDirectory() as directory:

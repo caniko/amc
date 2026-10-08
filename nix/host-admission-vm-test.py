@@ -120,6 +120,28 @@ with test_section(
             "disconnect": "no-exec",
             "invalid-ack": "no-exec",
         }, receipt
+    namespace_jobs = {}
+    for name, namespace in [
+        ("private-pid", "--unshare-pid"),
+        ("private-pid-user", "--unshare-pid --unshare-user --uid 0 --gid 0"),
+    ]:
+        namespace_jobs[name] = {}
+        for mode in ["", " --admission"]:
+            receipt = json.loads(
+                machine.succeed(
+                    user
+                    + f"bwrap --bind / / --dev /dev --proc /proc {namespace} -- "
+                    + "python3 /etc/amc-native-completion.py amc"
+                    + mode,
+                    timeout=180,
+                )
+            )
+            assert [r["exit"] for r in receipt["rapid_jobs"]] == [0, 42, 0, 42], receipt
+            assert all(r["streams"] == "preserved" for r in receipt["rapid_jobs"]), (
+                receipt
+            )
+            namespace_jobs[name]["admitted" if mode else "native"] = receipt
+    evidence["nativeNamespaceCompletion"] = namespace_jobs
     wait_committed(0)
 
 with test_section("durable root pool tracks every potential execution owner"):

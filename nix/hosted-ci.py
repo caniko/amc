@@ -70,6 +70,33 @@ def verify_foreground_evidence(path):
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
     completion = receipt.get("completion", {})
+    namespaces = receipt.get("nativeNamespaceCompletion", {})
+    if set(namespaces) != {"private-pid", "private-pid-user"}:
+        raise RuntimeError(
+            "Native completion evidence lacks the required namespace variants"
+        )
+    for modes in namespaces.values():
+        if set(modes) != {"native", "admitted"}:
+            raise RuntimeError(
+                "Native completion evidence lacks both managed launch modes"
+            )
+        for run in modes.values():
+            jobs = run.get("rapid_jobs", [])
+            if (
+                [r.get("exit") for r in jobs] != [0, 42, 0, 42]
+                or any(r.get("streams") != "preserved" for r in jobs)
+                or run.get("startup_loss")
+                != {"disconnect": "no-exec", "invalid-ack": "no-exec"}
+                or run.get("host_runner_loss")
+                != {
+                    "disconnect": "no-exec",
+                    "wrong-pid": "no-exec",
+                    "wrong-cgroup": "no-exec",
+                }
+            ):
+                raise RuntimeError(
+                    "Native namespace completion lacks literal streams, exit status or startup denial"
+                )
     page_fields = [
         "beforeSwapBytes",
         "afterSwapBytes",

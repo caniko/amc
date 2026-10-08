@@ -51,6 +51,8 @@ enum Command {
     RecoverSwap(swap_recovery::RecoveryArgs),
     #[command(hide = true)]
     NativeStart(native_start::NativeStartArgs),
+    #[command(hide = true)]
+    NativeHost(native_start::HostArgs),
     /// Coordinate production workload reservations across local processes.
     Admission {
         #[command(subcommand)]
@@ -258,6 +260,16 @@ fn main() {
 }
 
 fn execute(cli: Cli) -> Result<i32> {
+    if matches!(
+        &cli.command,
+        Command::Exec(_)
+            | Command::Admission {
+                command: admission::AdmissionCommand::Exec { .. }
+            }
+    ) && let Some(code) = native_start::host_execution()?
+    {
+        return Ok(code);
+    }
     match cli.command {
         Command::Exec(arguments) => native_exec::execute(arguments),
         Command::Prepare(arguments) => preparation::execute(arguments),
@@ -265,6 +277,13 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::PreparedHost(arguments) => preparation::host(arguments),
         Command::RecoverSwap(arguments) => swap_recovery::execute(arguments),
         Command::NativeStart(arguments) => native_start::execute(arguments),
+        Command::NativeHost(arguments) => {
+            amc_runner::systemd::wait_for_host_runner(&arguments.socket, arguments.parent_start)?;
+            execute(Cli::try_parse_from(
+                std::iter::once(std::env::current_exe()?.into_os_string())
+                    .chain(arguments.arguments),
+            )?)
+        }
         Command::Admission { command } => admission::execute(command),
         Command::Supervise { command } => supervision::execute(command),
         Command::Doctor { json } => {
