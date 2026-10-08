@@ -5,12 +5,12 @@ import errno
 import json
 import mmap
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 MIB = 1048576
 ROOT = Path("/sys/fs/cgroup/amc-charge-proof")
@@ -212,7 +212,7 @@ def proof():
                 if error.errno != errno.EAGAIN:
                     raise
             wait(
-                lambda: (
+                lambda name=name: (
                     observe(ROOT / name)["swap"] >= 32 * MIB
                     and observe(ROOT / name)["cached"] == 0
                 )
