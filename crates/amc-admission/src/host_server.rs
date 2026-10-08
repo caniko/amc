@@ -386,16 +386,11 @@ pub fn serve_supervised(
                             let now = crate::clock::boot_ms()?;
                             let owner_key =
                                 format!("owner-{}-{}", identity.pid, identity.start_ticks);
-                            let operation = match &request {
-                                Request::AcquirePool { operation, .. } => *operation,
-                                _ => None,
-                            };
-                            if credentials.uid() == 0 && !policy.preparations.is_empty() {
-                                ensure!(
-                                    operation.is_some(),
-                                    "root pool requires a finite worker operation"
-                                );
-                            }
+                            let operation = root_operation(
+                                &request,
+                                credentials.uid(),
+                                !policy.preparations.is_empty(),
+                            )?;
                             let existing = ledger.reservations.iter().find(|r| {
                                 r.identity.cgroup == identity.cgroup
                                     && r.identity.inode == identity.inode
@@ -581,6 +576,20 @@ fn public_preparation(p: &crate::preparation::Preparation) -> crate::preparation
     let mut public = p.clone();
     public.key.clear();
     public
+}
+
+fn root_operation(request: &Request, uid: u32, preparations: bool) -> Result<Option<u64>> {
+    let operation = match request {
+        Request::AcquirePool { operation, .. } => *operation,
+        _ => None,
+    };
+    if uid == 0 && preparations && matches!(request, Request::AcquirePool { .. }) {
+        ensure!(
+            operation.is_some(),
+            "root pool requires a finite worker operation"
+        );
+    }
+    Ok(operation)
 }
 
 fn populate_status(reply: &mut Response, ledger: &HostLedger, uid: u32) {
@@ -1119,6 +1128,27 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_root_services_do_not_require_an_aggregate_worker_serial() {
+        let ordinary: Request = serde_json::from_value(serde_json::json!({
+            "op":"acquire", "version":1, "wait_ms":1000
+        }))
+        .unwrap();
+        assert_eq!(root_operation(&ordinary, 0, true).unwrap(), None);
+        let pool: Request = serde_json::from_value(serde_json::json!({
+            "op":"acquire_pool", "version":1, "wait_ms":1000, "domain":"builders"
+        }))
+        .unwrap();
+        assert!(root_operation(&pool, 0, true).is_err());
+        assert_eq!(root_operation(&pool, 0, false).unwrap(), None);
+        let worker: Request = serde_json::from_value(serde_json::json!({
+            "op":"acquire_pool", "version":1, "wait_ms":1000,
+            "domain":"builders", "operation":7
+        }))
+        .unwrap();
+        assert_eq!(root_operation(&worker, 0, true).unwrap(), Some(7));
+    }
 
     #[test]
     fn page_return_target_identity_and_addresses_are_only_visible_to_root() {
