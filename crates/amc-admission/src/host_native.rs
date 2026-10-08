@@ -41,6 +41,40 @@ pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Ident
     identify_entry(pid, uid, domains, false)
 }
 
+/// A lost acquisition reply must remain replayable after policy reload.
+pub fn identify_acquire(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    grants: &[crate::host::Reservation],
+) -> Result<(String, Identity, u64, u64)> {
+    identify_acquire_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        domains,
+        grants,
+    )
+}
+
+fn identify_acquire_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    grants: &[crate::host::Reservation],
+) -> Result<(String, Identity, u64, u64)> {
+    if let Some(grant) = grants
+        .iter()
+        .find(|grant| grant.granted && grant.identity.pid == pid && grant.identity.uid == uid)
+    {
+        return identify_replay_at(proc, root, pid, uid, grant, false);
+    }
+    identify_entry_at(proc, root, pid, uid, domains, false)
+}
+
 /// Prepared scopes retain the submitting application's filesystem namespace.
 /// Only authenticated Consume, never ordinary Acquire, accepts this entry kind.
 pub fn identify_prepared(
@@ -74,13 +108,24 @@ fn identify_prepared_replay_at(
     uid: u32,
     granted: &crate::host::Reservation,
 ) -> Result<(String, Identity, u64, u64)> {
+    identify_replay_at(proc, root, pid, uid, granted, true)
+}
+
+fn identify_replay_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
     let identity = &granted.identity;
     ensure!(
         granted.granted
             && pid == identity.pid
             && uid == identity.uid
             && process_start_at(proc, pid)? == identity.start_ticks,
-        "consumed preparation peer changed"
+        "persisted grant peer changed"
     );
     let placement = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
     ensure!(
@@ -89,10 +134,12 @@ fn identify_prepared_replay_at(
             && Path::new(&identity.cgroup)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(
-                    |name| name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
-                ),
-        "consumed preparation placement changed"
+                .is_some_and(|name| if prepared {
+                    name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
+                } else {
+                    name.starts_with("app-amc-job-") && name.ends_with(".service")
+                }),
+        "persisted grant placement changed"
     );
     crate::native::cgroup_directory(&identity.cgroup)?;
     let directory = root.join(identity.cgroup.trim_start_matches('/'));
@@ -101,7 +148,7 @@ fn identify_prepared_replay_at(
             && number(&directory, "memory.max")? == granted.memory_bytes
             && number(&directory, "memory.swap.max")? == granted.swap_bytes
             && process_start_at(proc, pid)? == identity.start_ticks,
-        "consumed preparation enforcement changed"
+        "persisted grant enforcement changed"
     );
     Ok((
         granted.domain.clone(),
@@ -649,6 +696,82 @@ mod tests {
         let mut peer = lane.clone();
         peer.id = "other-lane".into();
         assert_eq!(ancestor_headroom_at(&root, &lane, &[peer]), Some(0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acquired_replay_survives_policy_removal_and_rejects_changed_native_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-acquired-replay-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let group = "/retired.slice/app-amc-job-original.service";
+        let directory = groups.join(group.trim_start_matches('/'));
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (job) S {}7\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(directory.join("memory.max"), "40").unwrap();
+        fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        let grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"original", "domain":"removed", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":group, "inode":fs::metadata(&directory).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        }))
+        .unwrap();
+        let grants = [grant.clone()];
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).unwrap(),
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        let reduced = [Domain {
+            name: grant.domain.clone(),
+            uid: 1000,
+            cgroup: "/retired.slice".into(),
+            ceiling_bytes: 39,
+            swap_bytes: 9,
+            fair_share_bytes: 39,
+            io_pressure: crate::host::IoPressure::Enforce,
+            min_available_bytes: 0,
+            continuation: None,
+            burst: false,
+        }];
+        assert!(identify_entry_at(&proc, &groups, 42, 1000, &reduced, false).is_err());
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &reduced, &grants).unwrap(),
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &reduced, &[]).is_err());
+        assert!(identify_acquire_at(&proc, &groups, 42, 1001, &[], &grants).is_err());
+        let mut pending = grant.clone();
+        pending.granted = false;
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &[pending]).is_err());
+        let mut replaced = grant.clone();
+        replaced.identity.inode += 1;
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &[replaced]).is_err());
+        for (name, changed, original) in
+            [("memory.max", "39", "40"), ("memory.swap.max", "9", "10")]
+        {
+            fs::write(directory.join(name), changed).unwrap();
+            assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
+            fs::write(directory.join(name), original).unwrap();
+        }
+        fs::write(proc.join("42/cgroup"), "0::/elsewhere.service\n").unwrap();
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (job) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

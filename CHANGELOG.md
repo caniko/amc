@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Replay ordinary persisted acquisitions after domain removal or ceiling reduction,
+  while freshly authenticating native identity and the original enforced envelope.
 - Reject aliases of the same native swap target before restoration, including
   symlinks, hard links and duplicate block-device identities.
 - Revalidate the full page-return charge-owner frontier and native headroom before

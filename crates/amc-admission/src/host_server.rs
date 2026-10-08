@@ -512,12 +512,36 @@ pub fn serve_supervised(
                                         &policy.domains,
                                     )?
                                 } else {
-                                    host_native::identify(
+                                    host_native::identify_acquire(
                                         credentials.pid(),
                                         credentials.uid(),
                                         &policy.domains,
+                                        &ledger.reservations,
                                     )?
                                 };
+                            // An exact ordinary grant replay is already backed,
+                            // even after removal or reduction of its policy domain.
+                            // Pool joins still use current enrollment and ownership.
+                            if matches!(request, Request::Acquire { .. })
+                                && let Some(grant) = ledger
+                                    .reservations
+                                    .iter()
+                                    .find(|r| r.granted && r.identity == identity)
+                            {
+                                if grant.burst {
+                                    burst_manager.register(&identity)?;
+                                    if burst_manager.runtime(&identity) != grant.runtime_max_ms {
+                                        reply.waiting = Some(WaitReason::Unknown);
+                                        return Ok(reply);
+                                    }
+                                }
+                                let id = grant.id.clone();
+                                reply.granted = true;
+                                reply.ticket = Some(id.clone());
+                                reply.continuation =
+                                    ledger.continuation_capability(&id, &policy)?;
+                                return Ok(reply);
+                            }
                             let now = crate::clock::boot_ms()?;
                             let burst = policy.domains.iter().any(|d| d.name == domain && d.burst);
                             let runtime_max_ms = if burst {
