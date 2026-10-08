@@ -4,8 +4,12 @@ use anyhow::{Context, Result, ensure};
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 pub fn process_start(pid: i32) -> Result<u64> {
+    process_start_at(Path::new("/proc"), pid)
+}
+
+fn process_start_at(proc: &Path, pid: i32) -> Result<u64> {
     ensure!(pid > 0, "invalid workload PID");
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = fs::read_to_string(proc.join(pid.to_string()).join("stat"))?;
     Ok(stat
         .rsplit_once(") ")
         .context("missing process identity")?
@@ -47,14 +51,92 @@ pub fn identify_prepared(
     identify_entry(pid, uid, domains, true)
 }
 
+/// A committed Consume replay authenticates the original native grant rather
+/// than re-admitting its envelope against a possibly replaced host policy.
+pub fn identify_prepared_replay(
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+) -> Result<(String, Identity, u64, u64)> {
+    identify_prepared_replay_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        granted,
+    )
+}
+
+fn identify_prepared_replay_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+) -> Result<(String, Identity, u64, u64)> {
+    let identity = &granted.identity;
+    ensure!(
+        granted.granted
+            && pid == identity.pid
+            && uid == identity.uid
+            && process_start_at(proc, pid)? == identity.start_ticks,
+        "consumed preparation peer changed"
+    );
+    let placement = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
+    ensure!(
+        placement.lines().find_map(|line| line.strip_prefix("0::"))
+            == Some(identity.cgroup.as_str())
+            && Path::new(&identity.cgroup)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(
+                    |name| name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
+                ),
+        "consumed preparation placement changed"
+    );
+    crate::native::cgroup_directory(&identity.cgroup)?;
+    let directory = root.join(identity.cgroup.trim_start_matches('/'));
+    ensure!(
+        fs::metadata(&directory)?.ino() == identity.inode
+            && number(&directory, "memory.max")? == granted.memory_bytes
+            && number(&directory, "memory.swap.max")? == granted.swap_bytes
+            && process_start_at(proc, pid)? == identity.start_ticks,
+        "consumed preparation enforcement changed"
+    );
+    Ok((
+        granted.domain.clone(),
+        identity.clone(),
+        granted.memory_bytes,
+        granted.swap_bytes,
+    ))
+}
+
 fn identify_entry(
     pid: i32,
     uid: u32,
     domains: &[Domain],
     prepared: bool,
 ) -> Result<(String, Identity, u64, u64)> {
-    let start_ticks = process_start(pid)?;
-    let process = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    identify_entry_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        domains,
+        prepared,
+    )
+}
+
+fn identify_entry_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
+    let start_ticks = process_start_at(proc, pid)?;
+    let process = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
     let cgroup = process
         .lines()
         .find_map(|l| l.strip_prefix("0::"))
@@ -81,7 +163,8 @@ fn identify_entry(
         },
         "host admission requires a native AMC entry helper"
     );
-    let directory = crate::native::cgroup_directory(cgroup)?;
+    crate::native::cgroup_directory(cgroup)?;
+    let directory = root.join(cgroup.trim_start_matches('/'));
     let memory = number(&directory, "memory.max")?;
     let swap = number(&directory, "memory.swap.max")?;
     ensure!(
@@ -89,7 +172,7 @@ fn identify_entry(
         "native ceiling exceeds enrolled host contract"
     );
     ensure!(
-        process_start(pid)? == start_ticks,
+        process_start_at(proc, pid)? == start_ticks,
         "peer process identity changed"
     );
     Ok((
@@ -373,6 +456,66 @@ fn psi(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_replay_uses_the_persisted_grant_and_rejects_changed_native_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-prepared-replay-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let group = "/retired.slice/app-amc-prepared-intent.scope";
+        let directory = groups.join(group.trim_start_matches('/'));
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (prepared) S {}7\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(directory.join("memory.max"), "40").unwrap();
+        fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        let grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"intent", "domain":"removed", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":group, "inode":fs::metadata(&directory).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        }))
+        .unwrap();
+        // The old policy-based lookup fails after the domain disappears.
+        assert!(identify_entry_at(&proc, &groups, 42, 1000, &[], true).is_err());
+        let replay = identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).unwrap();
+        assert_eq!(
+            replay,
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1001, &grant).is_err());
+        let mut pending = grant.clone();
+        pending.granted = false;
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &pending).is_err());
+        let mut replaced = grant.clone();
+        replaced.identity.inode += 1;
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &replaced).is_err());
+        for (name, changed, original) in
+            [("memory.max", "39", "40"), ("memory.swap.max", "9", "10")]
+        {
+            fs::write(directory.join(name), changed).unwrap();
+            assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+            fs::write(directory.join(name), original).unwrap();
+        }
+        fs::write(proc.join("42/cgroup"), "0::/elsewhere.scope\n").unwrap();
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (prepared) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn burst_deadline_requires_native_identity_and_bounded_cleanup() {

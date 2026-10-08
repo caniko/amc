@@ -766,8 +766,25 @@ fn handle_advance_request(
                 .find(|p| p.id == id && p.uid == uid && p.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown preparation capability"))?
                 .clone();
-            let (domain, identity, memory_bytes, swap_bytes) =
-                host_native::identify_prepared(pid, uid, &policy.domains)?;
+            let (domain, identity, memory_bytes, swap_bytes) = if matches!(
+                p.phase,
+                PreparationPhase::Active | PreparationPhase::Reconciling
+            ) {
+                let grant = ledger
+                    .reservations
+                    .iter()
+                    .find(|r| r.id == id && r.granted)
+                    .ok_or_else(|| anyhow::anyhow!("consumed preparation grant disappeared"))?;
+                ensure!(
+                    grant.domain == p.domain
+                        && grant.memory_bytes == p.memory_bytes
+                        && grant.swap_bytes == p.swap_bytes,
+                    "consumed preparation envelope changed"
+                );
+                host_native::identify_prepared_replay(pid, uid, grant)?
+            } else {
+                host_native::identify_prepared(pid, uid, &policy.domains)?
+            };
             if let Some(origin) = &origin {
                 ensure!(
                     identity.start_ticks == origin.start_ticks,
