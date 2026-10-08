@@ -213,6 +213,75 @@ fn aged_bulk_host_headroom_wait_does_not_veto_a_physically_fitting_burst() {
 }
 
 #[test]
+fn bursts_backfill_when_drain_cannot_clear_swap_return_or_ancestor_waits() {
+    for reason in [
+        WaitReason::SwapHeadroom,
+        WaitReason::SwapReturn,
+        WaitReason::AncestorHeadroom,
+    ] {
+        let mut p = policy();
+        p.domains[0].swap_bytes = 101;
+        p.reserve_swap_return = true;
+        p.burst.as_mut().unwrap().min_interval_ms = 0;
+        p.burst.as_mut().unwrap().max_running = 2;
+        let mut l = HostLedger::new("boot".into());
+        l.swap_return_bytes = Some(0);
+        l.request(job("held", true, 5), &p).unwrap();
+        advance(&mut l, &p, 250, 1000);
+        let mut bulk = job("bulk", false, 20);
+        if reason == WaitReason::SwapHeadroom {
+            bulk.swap_bytes = 101;
+        }
+        if reason == WaitReason::SwapReturn {
+            l.swap_return_bytes = Some(970);
+        }
+        l.request(bulk, &p).unwrap();
+        l.request(job("quick", true, 5), &p).unwrap();
+        let waits = l.advance(
+            1500,
+            &p,
+            Some(Capacity {
+                available_bytes: 1000,
+                swap_free_bytes: 100,
+                memory_full_psi: 0.0,
+                io_full_psi: 0.0,
+            }),
+            &mut BTreeMap::from([("normal".into(), 0), ("burst".into(), 0)]),
+            |r, _| {
+                Some(
+                    if reason == WaitReason::AncestorHeadroom && r.id == "bulk" {
+                        0
+                    } else {
+                        1000
+                    },
+                )
+            },
+        );
+        assert_eq!(waits["bulk"], reason);
+        assert!(!waits.contains_key("quick"), "{reason:?}: {waits:?}");
+    }
+}
+
+#[test]
+fn burst_quiet_windows_require_the_complete_upfront_completion_charge_to_fit() {
+    use amc_admission::continuation::ContinuationPolicy;
+    let mut p = policy();
+    p.domains[0].continuation = Some(ContinuationPolicy {
+        parent_max_bytes: 80,
+        memory_bytes: 30,
+        swap_bytes: 0,
+        max_calls: 1,
+        domains: vec!["normal".into()],
+    });
+    let mut l = HostLedger::new("boot".into());
+    l.request(job("bulk", false, 60), &p).unwrap();
+    l.request(job("quick", true, 5), &p).unwrap();
+    let waits = advance(&mut l, &p, 1500, 1000);
+    assert_eq!(waits["bulk"], WaitReason::Budget);
+    assert!(!waits.contains_key("quick"));
+}
+
+#[test]
 fn independent_users_share_the_burst_allowance_and_pressure_gates() {
     let mut p = policy();
     p.burst.as_mut().unwrap().max_running = 8;

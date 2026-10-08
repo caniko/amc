@@ -787,10 +787,21 @@ impl HostLedger {
                         .map_or(0, |c| c.available_bytes)
                         .saturating_add(burst_committed)
                         .saturating_sub(policy.reserve_bytes)
-                        .saturating_sub(normal_committed);
-                    burst_aged_block |= r.memory_bytes
+                        .saturating_sub(normal_committed)
+                        .saturating_sub(self.return_claim(policy));
+                    let mut drained = self.clone();
+                    drained.reservations.retain(|r| !(r.granted && r.burst));
+                    burst_aged_block |= memory_charge
                         <= policy.budget_bytes.saturating_sub(normal_committed)
-                        && r.memory_bytes <= possible_host_bytes;
+                        && memory_charge <= possible_host_bytes
+                        && swap_charge
+                            <= capacity
+                                .map_or(0, |c| c.swap_free_bytes)
+                                .saturating_sub(policy.swap_reserve_bytes)
+                                .saturating_sub(drained.swap_committed())
+                        && drained
+                            .completion_ancestry_wait(r, policy, &mut ancestry)
+                            .is_none();
                 }
                 waiting.insert(r.id.clone(), reason);
             } else {
