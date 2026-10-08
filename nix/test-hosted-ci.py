@@ -18,6 +18,7 @@ class NativeEvidenceTests(unittest.TestCase):
         self,
     ):
         receipt = {
+            "pageReturnGuard": self.guard_evidence(),
             "chargeOwner": {
                 "schemaVersion": 2,
                 "kernel": "fixture",
@@ -238,6 +239,46 @@ class NativeEvidenceTests(unittest.TestCase):
                             self.assertRaises(RuntimeError),
                         ):
                             hosted.verify_foreground_evidence(path)
+
+    def guard_evidence(self):
+        guards = {path: {"schemaVersion": 1, "missingGuardDenied": True,
+                      "duplicateGuardHeld": True, "targetMigrationDeniedAfterGrant": True,
+                      "readerMigrationDeniedAfterGrant": True, "brokerRestartProtected": True,
+                      "helperLossReleased": True, "residentBytes": 2 * 1048576,
+                      "directBytes": 2 * 1048576 if path == "direct" else 0,
+                      "cacheBytes": 2 * 1048576 if path == "cache" else 0,
+                      "targetInode": 123, "readerInode": 456,
+                      "chargedBytesByInode": {str(123 if path == "direct" else 456): 2 * 1048576},
+                      "oom": 0, "oomKill": 0} for path in ["direct", "cache"]}
+        guards["lifetime"] = dict.fromkeys(["sharedMmMigrationDenied", "conflictingGuardDenied",
+            "cloneIntoCgroupDenied", "privateForkReset", "ownerTurnoverPinnedCharge", "offliningDenied",
+            "controllerDisableDenied", "unchangedControllersAllowed", "execCookieChanged", "obsoleteMmReadEmpty", "lastCloseReleased"], True)
+        return guards
+
+    def test_guard_receipt_requires_both_fault_paths_and_denies_weakened_native_proof(self):
+        valid = self.guard_evidence()
+        hosted.verify_kernel_guard_evidence(valid)
+        for path in ("direct", "cache"):
+            incomplete = dict(valid)
+            del incomplete[path]
+            with self.subTest(missing=path), self.assertRaises(RuntimeError):
+                hosted.verify_kernel_guard_evidence(incomplete)
+            for field, value in [("schemaVersion", 0), ("missingGuardDenied", False),
+                                 ("duplicateGuardHeld", False), ("targetMigrationDeniedAfterGrant", False),
+                                 ("readerMigrationDeniedAfterGrant", False), ("brokerRestartProtected", False),
+                                 ("helperLossReleased", False), ("residentBytes", 4096),
+                                 ("directBytes", 4096), ("cacheBytes", 4096), ("readerInode", 123),
+                                 ("targetInode", 0), ("chargedBytesByInode", {"unbacked": 2 * 1048576}),
+                                 ("oom", 1), ("oomKill", 1)]:
+                invalid = json.loads(json.dumps(valid))
+                invalid[path][field] = value
+                with self.subTest(path=path, field=field), self.assertRaises(RuntimeError):
+                    hosted.verify_kernel_guard_evidence(invalid)
+        for field in valid["lifetime"]:
+            invalid = json.loads(json.dumps(valid))
+            invalid["lifetime"][field] = False
+            with self.subTest(lifetime=field), self.assertRaises(RuntimeError):
+                hosted.verify_kernel_guard_evidence(invalid)
 
     def namespace_evidence(self):
         run = {

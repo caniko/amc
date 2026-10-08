@@ -1104,3 +1104,11 @@ time.sleep(120)
     )
     machine.succeed('test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10')
     evidence["deviceReturn"]["wrongActivePriorityDenied"] = True
+
+with test_section(
+    "post-grant migration is kernel-blocked on direct and swap-cache recovery paths"
+):
+    machine.succeed("python3 /etc/page-return-guard-proof.py", timeout=240)
+    evidence["pageReturnGuard"] = json.loads(
+        machine.succeed("cat /tmp/page-return-guard-evidence.json")
+    )

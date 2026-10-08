@@ -39,6 +39,7 @@ NATIVE_CASES = {
     "bounded page return makes real swap progress without disabling swap",
     "explicit whole-device recovery restores swap on success and interrupted cleanup",
     "mixed original swap charges and offline fallback retain native backing",
+    "post-grant migration is kernel-blocked on direct and swap-cache recovery paths",
     "finite completion children finish a drain while newer root worker serials wait",
 }
 SUPERVISION_CASES = {
@@ -68,8 +69,38 @@ def verify_native_report(path, required_cases=NATIVE_CASES):
         raise RuntimeError("Native VM report contains unsuccessful execution cases")
 
 
+def verify_kernel_guard_evidence(guards):
+    if set(guards) != {"direct", "cache", "lifetime"}:
+        raise RuntimeError("Native page return lacks both guarded kernel fault paths")
+    lifetime = guards["lifetime"]
+    required_lifetime = ("sharedMmMigrationDenied", "conflictingGuardDenied", "cloneIntoCgroupDenied",
+                         "privateForkReset", "ownerTurnoverPinnedCharge", "offliningDenied",
+                         "controllerDisableDenied", "unchangedControllersAllowed", "execCookieChanged", "obsoleteMmReadEmpty", "lastCloseReleased")
+    if set(lifetime) != set(required_lifetime) or any(lifetime[field] is not True for field in required_lifetime):
+        raise RuntimeError("Native page return lacks shared-mm, owner, offlining or last-FD lifetime proof")
+    for path in ("direct", "cache"):
+        batch = guards[path]
+        required = ("missingGuardDenied", "duplicateGuardHeld", "targetMigrationDeniedAfterGrant",
+                    "readerMigrationDeniedAfterGrant", "brokerRestartProtected", "helperLossReleased")
+        expected = "directBytes" if path == "direct" else "cacheBytes"
+        other = "cacheBytes" if path == "direct" else "directBytes"
+        owner = "targetInode" if path == "direct" else "readerInode"
+        if (batch.get("schemaVersion") != 1
+            or any(batch.get(field) is not True for field in required)
+            or any(type(batch.get(field)) is not int for field in
+                   ("residentBytes", "directBytes", "cacheBytes", "targetInode", "readerInode", "oom", "oomKill"))
+            or batch["residentBytes"] != 2 * 1048576
+            or batch[expected] != 2 * 1048576 or batch[other] != 0
+            or batch["targetInode"] <= 0 or batch["readerInode"] <= 0
+            or batch["targetInode"] == batch["readerInode"]
+            or batch.get("chargedBytesByInode") != {str(batch[owner]): 2 * 1048576}
+            or batch["oom"] != 0 or batch["oomKill"] != 0):
+            raise RuntimeError("Native guard lacks post-grant migration, exact fault charging or cleanup proof")
+
+
 def verify_foreground_evidence(path):
     receipt = json.loads(path.read_text())
+    verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
     completion = receipt.get("completion", {})

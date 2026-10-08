@@ -282,18 +282,18 @@
  		/*
  		 * If @ss has non-root csses attached to it, can't move.
  		 * If @ss is an implicit controller, it is exempt from this
-@@ -3583,6 +3583,11 @@
- 	if (!cgrp)
- 		return -ENODEV;
+@@ -3616,6 +3619,11 @@
+ 	}
  
 +	if (cgrp->amc_recovery_pins) {
 +		ret = -EBUSY;
 +		goto out_unlock;
 +	}
 +
- 	for_each_subsys(ss, ssid) {
- 		if (enable & (1 << ssid)) {
- 			if (cgrp->subtree_control & (1 << ssid)) {
+ 	ret = cgroup_vet_subtree_control_enable(cgrp, enable);
+ 	if (ret)
+ 		goto out_unlock;
+ 
 @@ -3724,7 +3729,7 @@
  		return -ENOENT;
  

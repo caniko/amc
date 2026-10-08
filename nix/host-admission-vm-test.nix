@@ -42,6 +42,13 @@
     fi
     exec ${pkgs.systemd}/bin/systemctl "$@"
   '';
+  guardLifetime =
+    pkgs.runCommand "amc-guard-lifetime-proof" {
+      nativeBuildInputs = [pkgs.stdenv.cc];
+    } ''
+      mkdir -p $out/bin
+      $CC -std=gnu11 -O2 -Wall -Wextra -Werror ${./page-return-guard-lifetime.c} -o $out/bin/amc-guard-lifetime-proof
+    '';
 in
   (pkgs.testers.runNixOSTest {
     name = "amc-shared-host-admission";
@@ -164,9 +171,10 @@ in
         };
         path = [pkgs.systemd];
       };
-      environment.systemPackages = [package pkgs.python3 pkgs.bubblewrap pkgs.util-linux];
+      environment.systemPackages = [package guardLifetime pkgs.python3 pkgs.bubblewrap pkgs.util-linux];
       environment.etc."page-return-target.py".source = ./page-return-target.py;
       environment.etc."charge-owner-proof.py".source = ./charge-owner-proof.py;
+      environment.etc."page-return-guard-proof.py".source = ./page-return-guard-proof.py;
       environment.etc."amc-test-user-policy.json".source = userPolicy;
       environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
       environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
