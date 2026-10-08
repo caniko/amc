@@ -16,4 +16,5 @@ in
   assert (builtins.head old.boot.kernelPatches).patch == (builtins.head current.boot.kernelPatches).patch;
   assert (builtins.elemAt old.boot.kernelPatches 1).patch == ./kernel/amc-page-return-bounded-faults.patch;
   assert (builtins.elemAt current.boot.kernelPatches 1).patch == ./kernel/amc-page-return-bounded-faults-7.2.patch;
-  assert (builtins.head current.boot.kernelPatches).extraStructuredConfig.MEMCG == lib.kernel.yes; true
+  assert builtins.all (patch: !(patch ? extraStructuredConfig)) current.boot.kernelPatches;
+  assert (builtins.head current.boot.kernelPatches).structuredExtraConfig.MEMCG == lib.kernel.yes; true
