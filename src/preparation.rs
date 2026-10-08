@@ -209,7 +209,7 @@ mod tests {
         assert!(arguments.contains(&"--address=unix:path=/run/user/4321/bus".into()));
         assert!(arguments.windows(2).any(|args| args == ["--", "call"]));
         assert!(arguments.contains(&"prepared-host".into()));
-        assert!(arguments.contains(&"game-$literal".into()));
+        assert!(arguments.contains(&"--profile=game-$literal".into()));
         assert!(arguments.contains(&"no-env-expand".into()));
         assert!(
             arguments

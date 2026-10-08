@@ -75,6 +75,8 @@ fn root_completion_envelopes_match_the_fixed_native_pool_request() {
 #[test]
 fn preparation_profiles_require_an_executable_launch_slice_basename() {
     let mut policy = host_policy();
+    policy.reserve_bytes = 67108864;
+    policy.namespace_runner_bytes = 67108864;
     policy.preparations = serde_json::from_value(serde_json::json!([
         {"name":"game", "domain":"game", "memory_bytes":40, "swap_bytes":0,
          "drain_domains":["work"], "wait_ms":10000, "ready_ms":15000}

@@ -142,6 +142,10 @@ Host status reports `namespace_runner_reserved_bytes`; consumers can require
 preparation helpers (version 1 covered only namespace runners). Without an allowance, shared
 namespace execution fails before payload submission.
 
+Policies with preparation profiles must declare a backed runner allowance;
+zero remains valid when preparations are disabled. Profile names are forwarded
+as a single literal option value, including names that begin with hyphens.
+
 ```sh
 amc prepare --profile game -- game-command args
 ```
@@ -253,6 +257,8 @@ broker rejects stale backing, replaced helpers, disconnected peers and results
 older than one second, then repeats native identity, host capacity and local
 fallback checks before persisting the same lease. Changed ownership or demand
 cannot be transferred from an abandoned scan.
+Inventory backing includes granted native obligations and Ready/continuation
+escrow, while ungranted queue churn cannot discard a valid scan.
 
 A stable zero `memory.swap.current` means a cgroup owns no swap-slot return
 obligation even when `memory.stat.swapcached` is positive: remote reads of

@@ -328,15 +328,14 @@ pub(super) fn helper_command(
             "1",
         ])
         .arg(&executable)
-        .arg("8")
+        .arg("7")
         .arg(&executable)
         .arg("prepared-host")
         .arg("--rendezvous")
         .arg(rendezvous)
         .arg("--socket")
         .arg(&args.socket)
-        .arg("--profile")
-        .arg(&args.profile)
+        .arg(format!("--profile={}", args.profile))
         .args(["1", "no-env-expand", "0"]);
     Ok(command)
 }
@@ -390,6 +389,38 @@ pub(super) fn scope_command(reply: &Response, id: &str, pid: i32) -> Result<Comm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_helper_argv_parses_literal_hyphen_leading_profiles() {
+        use clap::Parser;
+        for profile in ["game-$literal", "-game", "--game", "--"] {
+            let args = PrepareArgs {
+                socket: "/run/amc-host/admission.sock".into(),
+                profile: profile.into(),
+                payload_env: vec![],
+                command: vec!["payload".into()],
+            };
+            let command = helper_command(
+                &args,
+                std::path::Path::new("/run/user/1000/amc-intent"),
+                "intent",
+            )
+            .unwrap();
+            let arguments: Vec<_> = command.get_args().collect();
+            let index = arguments
+                .iter()
+                .position(|arg| *arg == "ExecStartEx")
+                .unwrap();
+            let argc: usize = arguments[index + 4].to_str().unwrap().parse().unwrap();
+            let parsed =
+                crate::Cli::try_parse_from(arguments[index + 5..index + 5 + argc].iter().copied())
+                    .unwrap();
+            let crate::Command::PreparedHost(helper) = parsed.command else {
+                panic!("wrong helper command")
+            };
+            assert_eq!(helper.profile, profile);
+        }
+    }
 
     #[test]
     fn progress_requires_each_matching_ack_and_rejects_disconnected_waiters() {

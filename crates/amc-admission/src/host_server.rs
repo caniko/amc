@@ -740,7 +740,15 @@ fn inventory_backing(ledger: &HostLedger, policy: &HostPolicy) -> Result<Vec<u8>
     let claims = ledger
         .native_claims(policy, None)
         .ok_or_else(|| anyhow::anyhow!("native inventory backing unavailable"))?;
-    Ok(serde_json::to_vec(&(claims, &ledger.recovery))?)
+    // Queue churn owns no native capacity and must not starve recovery.
+    // Keep the same effective fields used by the native headroom scans.
+    let mut backing: Vec<_> = claims
+        .iter()
+        .filter(|r| r.granted)
+        .map(|r| (&r.id, &r.identity, r.memory_bytes, r.swap_bytes))
+        .collect();
+    backing.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cgroup.cmp(&b.1.cgroup)));
+    Ok(serde_json::to_vec(&(backing, &ledger.recovery))?)
 }
 
 fn inventory_peer_connected(stream: &UnixStream) -> bool {
@@ -1539,11 +1547,24 @@ mod tests {
         ledger.reservations.push(
             serde_json::from_value(serde_json::json!({
                 "id":"pool", "domain":"builders", "memory_bytes":20, "swap_bytes":0,
-                "requested_ms":0, "deadline_ms":10000, "granted":true,
+                "requested_ms":0, "deadline_ms":10000, "granted":false,
                 "identity":{"cgroup":"/builders", "inode":1,"uid":0,"pid":42,"start_ticks":7}
             }))
             .unwrap(),
         );
+        assert!(
+            inventory_current(
+                &owner,
+                &backing,
+                Instant::now(),
+                &task.stream,
+                &ledger,
+                &policy
+            )
+            .unwrap(),
+            "an ungranted waiter must not invalidate proven native backing"
+        );
+        ledger.reservations[0].granted = true;
         assert!(
             !inventory_current(
                 &owner,

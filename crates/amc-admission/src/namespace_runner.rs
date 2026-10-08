@@ -22,6 +22,10 @@ pub fn cgroup(uid: u32) -> String {
 pub fn validate(policy: &HostPolicy) -> Result<()> {
     let bytes = policy.namespace_runner_bytes;
     ensure!(
+        policy.preparations.is_empty() || bytes >= SERVICE_BYTES,
+        "preparation profiles require a backed aggregate helper allowance"
+    );
+    ensure!(
         bytes == 0
             || ((SERVICE_BYTES..=1024 * 1024 * 1024).contains(&bytes)
                 && bytes
@@ -140,6 +144,28 @@ pub fn verify(pid: i32, uid: u32, policy: &HostPolicy, claims: &[Reservation]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_profiles_require_a_backed_helper_allowance() {
+        let mut policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "domains":[{"name":"game","uid":1000,"cgroup":"/game.slice","ceiling_bytes":100,"swap_bytes":0,"fair_share_bytes":100}],
+            "preparations":[{"name":"game","domain":"game","memory_bytes":100,"swap_bytes":0,
+                "drain_domains":[],"wait_ms":10000,"ready_ms":15000}]
+        })).unwrap();
+        assert!(
+            policy.validate().is_err(),
+            "preparation without helper backing must fail before the broker starts"
+        );
+        policy.namespace_runner_bytes = SERVICE_BYTES;
+        policy.validate().unwrap();
+        policy.reserve_bytes -= 1;
+        assert!(policy.validate().is_err());
+        policy.preparations.clear();
+        policy.namespace_runner_bytes = 0;
+        policy.validate().unwrap();
+    }
 
     #[test]
     fn aggregate_runners_are_reserved_once_per_user_and_cannot_outgrow_host_reserve() {

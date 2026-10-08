@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 
 fn policy() -> HostPolicy {
     serde_json::from_value(serde_json::json!({
-        "version": 1, "budget_bytes": 100, "reserve_bytes": 20, "swap_reserve_bytes": 10,
+        "version": 1, "budget_bytes": 100, "reserve_bytes": 67108884, "swap_reserve_bytes": 10,
+        "namespace_runner_bytes":67108864,
         "max_memory_full_psi": 1.0, "max_io_full_psi": 20.0,
         "resume_ms": 250, "aging_ms": 1000, "queue_limit": 32,
         "domains": [
@@ -48,7 +49,7 @@ fn job(id: &str, domain: &str, uid: u32, bytes: u64) -> Reservation {
 
 fn capacity() -> Option<Capacity> {
     Some(Capacity {
-        available_bytes: 200,
+        available_bytes: 67109064,
         swap_free_bytes: 100,
         memory_full_psi: 0.0,
         io_full_psi: 0.0,
@@ -773,14 +774,17 @@ fn a_ready_claim_is_native_backing_until_its_once_only_consume_transfer() {
         .unwrap();
     advance(&mut l, &p, 250);
     let claims = l.native_claims(&p, None).unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].memory_bytes, 40);
-    assert_eq!(claims[0].identity.cgroup, "/game.slice");
+    assert_eq!(claims.len(), 2);
+    let ready = claims.iter().find(|r| r.id == "ready").unwrap();
+    assert_eq!(ready.memory_bytes, 40);
+    assert_eq!(ready.identity.cgroup, "/game.slice");
     let native = job("ready", "game", 1000, 40);
-    assert!(l.native_claims(&p, Some(&native)).unwrap().is_empty());
+    let transferred = l.native_claims(&p, Some(&native)).unwrap();
+    assert_eq!(transferred.len(), 1);
+    assert_eq!(transferred[0].id, "namespace-runners-1000");
     l.consume("ready", "key", 1000, native, 500).unwrap();
     let claims = l.native_claims(&p, None).unwrap();
-    assert_eq!(claims.len(), 1);
+    assert_eq!(claims.len(), 2);
     assert_eq!(claims[0].identity.pid, 42);
     assert_eq!(l.committed(), 40);
 }
