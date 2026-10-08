@@ -18,6 +18,7 @@ class NativeEvidenceTests(unittest.TestCase):
         self,
     ):
         receipt = {
+            "kernel": "6.18.48",
             "pageReturnGuard": self.guard_evidence(),
             "chargeOwner": {
                 "schemaVersion": 2,
@@ -127,6 +128,16 @@ class NativeEvidenceTests(unittest.TestCase):
             path = Path(directory) / "amc-foreground-evidence.json"
             path.write_text(json.dumps(receipt))
             hosted.verify_foreground_evidence(path)
+            hosted.verify_foreground_evidence(path, "6.18")
+            with self.assertRaises(RuntimeError):
+                hosted.verify_foreground_evidence(path, "7.2")
+            current = {**receipt, "kernel": "7.2.8-cachyos-lto"}
+            path.write_text(json.dumps(current))
+            hosted.verify_foreground_evidence(path, "7.2")
+            for kernel in ["6.18.48", "7.20.8", "", None]:
+                path.write_text(json.dumps({**receipt, "kernel": kernel}))
+                with self.subTest(kernel=kernel), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path, "7.2")
             for key, value in [
                 ("frozenMigration", False),
                 ("originalOwnerDenied", False),

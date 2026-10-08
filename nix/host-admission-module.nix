@@ -6,6 +6,8 @@
 }: let
   cfg = config.services.amc.hostAdmission;
   policy = pkgs.writeText "amc-host-policy.json" (builtins.toJSON cfg.policy);
+  pagesEnabled = (cfg.policy.swap_recovery.page_cgroups or []) != [];
+  guardModule = import ./page-return-guard-module.nix {inherit config lib;};
 in {
   options.services.amc.hostAdmission = {
     enable = lib.mkEnableOption "root-owned shared AMC resource reservations";
@@ -24,9 +26,8 @@ in {
     };
   };
   config = lib.mkIf cfg.enable {
-    boot.kernelPatches =
-      lib.mkIf ((cfg.policy.swap_recovery.page_cgroups or []) != [])
-      (import ./page-return-guard-module.nix {inherit lib;}).boot.kernelPatches;
+    assertions = lib.mkIf pagesEnabled guardModule.assertions;
+    boot.kernelPatches = lib.mkIf pagesEnabled guardModule.boot.kernelPatches;
     environment.systemPackages = [cfg.package];
     systemd.user.slices.app-amchostrunner = lib.mkIf ((cfg.policy.namespace_runner_bytes or 0) > 0) {
       wantedBy = ["default.target"];

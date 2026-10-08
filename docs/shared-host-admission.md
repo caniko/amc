@@ -302,6 +302,13 @@ separate native lifetime fixture checks pre-existing cross-cgroup mm sharers,
 conflicting guard acquisition, `clone3` placement, private-fork initialization,
 owner death, memcg offlining/controller changes, exec and last-FD cleanup.
 
+The guard module selects the bounded-fault patch for Linux 6.18 or 7.2 and
+rejects unsupported series at evaluation. Hosted qualification runs the full
+shared-admission VM on both the pinned Nixpkgs kernel and Canix's exact pinned
+CachyOS 7.2.8 source with ThinLTO and baseline CPU settings. The latter covers
+the changed 7.2 swap-cache allocator and records the running kernel series.
+Atlas's Zen4-optimized build and runtime remain consumer qualification gates.
+
 Source anchors for this extension are Linux 6.18.48 `fs/proc/base.c` (`mem_open`,
 `mem_rw`, `mem_release`), `kernel/cgroup/cgroup.c` (`cgroup_migrate_execute`,
 `cgroup_can_fork`, controller/type writes and `cgroup_destroy_locked`),

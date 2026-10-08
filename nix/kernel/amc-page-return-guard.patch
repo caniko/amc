@@ -236,17 +236,13 @@
  	mmu_notifier_subscriptions_init(mm);
 --- a/include/linux/mm_types.h
 +++ b/include/linux/mm_types.h
-@@ -1144,6 +1144,10 @@
- 		 * new_owner->alloc_lock is held
- 		 */
- 		struct task_struct __rcu *owner;
+@@ -1146 +1146,5 @@
+-		struct task_struct __rcu *owner;
++		struct task_struct __rcu *owner;
 +		/* FD-owned AMC recovery guard; writers hold cgroup_mutex. */
 +		struct mem_cgroup __rcu *amc_recovery_memcg;
 +		unsigned int amc_recovery_refs;
 +		u64 amc_recovery_cookie;
- #endif
- 		struct user_namespace *user_ns;
- 
 --- a/include/linux/memcontrol.h
 +++ b/include/linux/memcontrol.h
 @@ -746,6 +746,8 @@
@@ -303,16 +299,16 @@
  
  	cgroup_kn_unlock(of->kn);
  	return ret ?: nbytes;
-@@ -6189,6 +6194,9 @@
- 
- 	lockdep_assert_held(&cgroup_mutex);
- 
+@@ -6200,6 +6205,9 @@
+ 	 * ->self.children as dead children linger on it while being
+ 	 * drained; otherwise, "rmdir parent/child parent" may fail.
+ 	 */
 +	if (cgrp->amc_recovery_pins)
 +		return -EBUSY;
 +
- 	/*
- 	 * Only migration can raise populated from zero and we're already
- 	 * holding cgroup_mutex.
+ 	if (css_has_online_children(&cgrp->self))
+ 		return -EBUSY;
+ 
 @@ -6863,6 +6871,16 @@
  	if (ret)
  		return ret;

@@ -14,6 +14,7 @@ ALLOWED = {
     ".#checks.x86_64-linux.test",
     ".#checks.x86_64-linux.clippy",
     ".#nixosTests.x86_64-linux.shared-admission",
+    ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",
     ".#nixosTests.x86_64-linux.supervision",
 }
 NATIVE_CASES = {
@@ -98,8 +99,11 @@ def verify_kernel_guard_evidence(guards):
             raise RuntimeError("Native guard lacks post-grant migration, exact fault charging or cleanup proof")
 
 
-def verify_foreground_evidence(path):
+def verify_foreground_evidence(path, kernel_series=None):
     receipt = json.loads(path.read_text())
+    kernel = receipt.get("kernel", "")
+    if not isinstance(kernel, str) or not kernel or (kernel_series is not None and not kernel.startswith(kernel_series + ".")):
+        raise RuntimeError("Native page return evidence is for the wrong kernel series")
     verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
@@ -487,9 +491,10 @@ def retain():
         )
         verify_native_report(output / "junit.xml", required)
         shutil.copyfile(output / "junit.xml", evidence / "junit.xml")
-        if installable.endswith(".shared-admission"):
+        if installable.endswith((".shared-admission", ".shared-admission-atlas-kernel")):
             verify_foreground_evidence(
-                output / "shared-admission" / "amc-foreground-evidence.json"
+                output / "shared-admission" / "amc-foreground-evidence.json",
+                "7.2" if installable.endswith(".shared-admission-atlas-kernel") else "6.18",
             )
             shutil.copytree(output / "shared-admission", evidence / "shared-admission")
         if installable.endswith(".supervision"):

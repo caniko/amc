@@ -5,7 +5,7 @@ import shlex
 machine = globals()["machine"]
 test_section = globals()["subtest"]
 globals()["start_all"]()
-evidence = {}
+evidence = {"kernel": machine.succeed("uname -r").strip()}
 machine.wait_for_unit("amc-host-admission.service")
 for user, uid in [("alice", 1000), ("bob", 1001)]:
     machine.succeed(
