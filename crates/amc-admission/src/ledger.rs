@@ -93,9 +93,16 @@ impl Policy {
             !self.contracts.is_empty() && self.contracts.len() <= 32,
             "invalid contract count"
         );
+        let mut slice_classes = BTreeMap::new();
         for (name, contract) in &self.contracts {
             ensure!(valid_name(name), "invalid contract name");
             contract.validate()?;
+            ensure!(
+                slice_classes
+                    .insert(&contract.slice, contract.burst)
+                    .is_none_or(|burst| burst == contract.burst),
+                "contracts sharing a native slice must use the same burst class"
+            );
             ensure!(
                 contract.memory_max <= self.budget_bytes,
                 "contract cannot fit budget"

@@ -29,6 +29,7 @@ impl PreparationProfile {
             crate::ledger::valid_name(&self.name)
                 && domain.uid != 0
                 && !domain.burst
+                && domain.continuation.is_none()
                 && domain.cgroup.ends_with(".slice")
                 && self.memory_bytes > 0
                 && self.memory_bytes <= domain.ceiling_bytes

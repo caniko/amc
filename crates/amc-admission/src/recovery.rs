@@ -33,6 +33,10 @@ fn default_batch_bytes() -> u64 {
 
 impl RecoveryPolicy {
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_page_size(crate::page_return::page_size()?)
+    }
+
+    fn validate_with_page_size(&self, page_size: u64) -> Result<()> {
         crate::native::cgroup_directory(&self.cgroup)?;
         ensure!(
             (1..=1_073_741_824).contains(&self.helper_bytes)
@@ -40,7 +44,8 @@ impl RecoveryPolicy {
                 && self.targets.len() <= 16
                 && (!self.targets.is_empty() || !self.page_cgroups.is_empty())
                 && self.page_cgroups.len() <= 64
-                && (4096..=16 * 1024 * 1024).contains(&self.batch_bytes),
+                && (4096..=16 * 1024 * 1024).contains(&self.batch_bytes)
+                && self.batch_bytes >= page_size,
             "invalid recovery policy"
         );
         let mut names = BTreeSet::new();
@@ -247,6 +252,24 @@ impl HostLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_batches_must_cover_a_complete_native_page() {
+        let mut policy = RecoveryPolicy {
+            cgroup: "/recovery".into(),
+            helper_bytes: 1024 * 1024,
+            minimum_bytes: 1,
+            targets: vec![],
+            page_cgroups: vec!["/target".into()],
+            batch_bytes: 4096,
+        };
+        assert!(policy.validate_with_page_size(4096).is_ok());
+        assert!(policy.validate_with_page_size(65536).is_err());
+        policy.batch_bytes = 65536;
+        assert!(policy.validate_with_page_size(65536).is_ok());
+        policy.batch_bytes = 65535;
+        assert!(policy.validate_with_page_size(65536).is_err());
+    }
+
     #[test]
     fn recovery_can_enter_below_swap_floor_but_never_without_real_ram_or_native_proof() {
         let policy: HostPolicy = serde_json::from_value(serde_json::json!({
