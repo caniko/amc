@@ -1,5 +1,79 @@
 use amc_admission::{host::HostPolicy, ledger::Policy};
 
+fn host_policy() -> HostPolicy {
+    serde_json::from_value(serde_json::json!({
+        "version":1, "budget_bytes":100, "reserve_bytes":20, "swap_reserve_bytes":10,
+        "max_memory_full_psi":1.0, "max_io_full_psi":20.0,
+        "resume_ms":250, "aging_ms":1000, "queue_limit":32,
+        "domains":[
+            {"name":"work", "uid":1000, "cgroup":"/work.slice",
+             "ceiling_bytes":50, "swap_bytes":10, "fair_share_bytes":50},
+            {"name":"game", "uid":1000, "cgroup":"/parent/game.slice",
+             "ceiling_bytes":40, "swap_bytes":10, "fair_share_bytes":50}
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn preparation_profiles_require_an_executable_launch_slice_basename() {
+    let mut policy = host_policy();
+    policy.preparations = serde_json::from_value(serde_json::json!([
+        {"name":"game", "domain":"game", "memory_bytes":40, "swap_bytes":0,
+         "drain_domains":["work"], "wait_ms":10000, "ready_ms":15000}
+    ]))
+    .unwrap();
+    for basename in ["a".repeat(80), "game".into()] {
+        policy.domains[1].cgroup = format!("/parent/{basename}.slice");
+        policy.validate().unwrap();
+    }
+    for basename in ["a".repeat(81), "game\\x20name".into()] {
+        policy.domains[1].cgroup = format!("/parent/{basename}.slice");
+        assert!(policy.validate().is_err(), "{basename}");
+    }
+}
+
+#[test]
+fn completion_lanes_fit_every_selected_child_domain_envelope() {
+    let mut policy = host_policy();
+    policy.domains[1].continuation = Some(
+        serde_json::from_value(serde_json::json!({
+            "parent_max_bytes":20, "memory_bytes":50, "swap_bytes":10,
+            "max_calls":8, "domains":["work"]
+        }))
+        .unwrap(),
+    );
+    policy.validate().unwrap();
+    policy.domains[1]
+        .continuation
+        .as_mut()
+        .unwrap()
+        .memory_bytes = 51;
+    assert!(policy.validate().is_err());
+    policy.domains[1]
+        .continuation
+        .as_mut()
+        .unwrap()
+        .memory_bytes = 50;
+    policy.domains[1].continuation.as_mut().unwrap().swap_bytes = 11;
+    assert!(policy.validate().is_err());
+}
+
+#[test]
+fn recovery_helpers_fit_the_enclosing_host_budget() {
+    let mut policy = host_policy();
+    policy.swap_recovery = Some(
+        serde_json::from_value(serde_json::json!({
+            "cgroup":"/recovery.service", "helper_bytes":100, "minimum_bytes":1,
+            "targets":[], "page_cgroups":["/work.slice"]
+        }))
+        .unwrap(),
+    );
+    policy.validate().unwrap();
+    policy.swap_recovery.as_mut().unwrap().helper_bytes = 101;
+    assert!(policy.validate().is_err());
+}
+
 #[test]
 fn a_native_slice_cannot_mix_burst_and_ordinary_contracts() {
     let mut policy: Policy = serde_json::from_value(serde_json::json!({

@@ -53,10 +53,14 @@ impl ContinuationPolicy {
                     .checked_mul(self.domains.len() as u64)
                     .and_then(|escrow| escrow.checked_add(self.parent_max_bytes))
                     .is_some_and(|bytes| bytes <= policy.budget_bytes)
-                && self
-                    .domains
-                    .iter()
-                    .all(|name| policy.domains.iter().any(|d| &d.name == name && !d.burst)),
+                && self.domains.iter().all(|name| {
+                    policy.domains.iter().any(|d| {
+                        &d.name == name
+                            && !d.burst
+                            && self.memory_bytes <= d.ceiling_bytes
+                            && self.swap_bytes <= d.swap_bytes
+                    })
+                }),
             "invalid completion rights"
         );
         Ok(())

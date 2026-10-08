@@ -190,6 +190,10 @@ impl HostPolicy {
         }
         if let Some(recovery) = &self.swap_recovery {
             recovery.validate()?;
+            ensure!(
+                recovery.helper_bytes <= self.budget_bytes,
+                "recovery helper cannot fit host budget"
+            );
         }
         Ok(())
     }

@@ -30,7 +30,11 @@ impl PreparationProfile {
                 && domain.uid != 0
                 && !domain.burst
                 && domain.continuation.is_none()
-                && domain.cgroup.ends_with(".slice")
+                && std::path::Path::new(&domain.cgroup)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|slice| slice.strip_suffix(".slice"))
+                    .is_some_and(crate::ledger::valid_name)
                 && self.memory_bytes > 0
                 && self.memory_bytes <= domain.ceiling_bytes
                 && self.swap_bytes <= domain.swap_bytes
