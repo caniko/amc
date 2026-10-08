@@ -10,6 +10,7 @@ pub mod host_server;
 mod host_transaction;
 pub mod ledger;
 pub mod native;
+pub mod page_discovery;
 pub mod page_return;
 pub mod preparation;
 pub mod protocol;

@@ -954,10 +954,8 @@ fn handle_advance_request(
             }
             let usage = crate::page_return::target_usage(&target)?;
             let before_swap_bytes = usage.used_bytes;
-            if before_swap_bytes == 0 {
-                reply.waiting = Some(WaitReason::SwapReturn);
-                return Ok(());
-            }
+            // The mm may contain swapped pages charged to another (or now
+            // offlined) memcg. Destination swap counters are not page ownership.
             if !crate::page_return::range_swapped(
                 &crate::page_return::open_pagemap(&target)?,
                 address,

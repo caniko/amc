@@ -36,6 +36,7 @@ NATIVE_CASES = {
     "prepared host helper preserves private PID and user namespaces",
     "bounded page return makes real swap progress without disabling swap",
     "explicit whole-device recovery restores swap on success and interrupted cleanup",
+    "mixed original swap charges and offline fallback retain native backing",
     "finite completion children finish a drain while newer root worker serials wait",
 }
 SUPERVISION_CASES = {
@@ -71,6 +72,42 @@ def verify_foreground_evidence(path):
     device = receipt.get("deviceReturn", {})
     completion = receipt.get("completion", {})
     namespaces = receipt.get("nativeNamespaceCompletion", {})
+    charge = receipt.get("chargeOwner", {})
+    if (
+        not charge.get("kernel")
+        or any(
+            charge.get(key) is not True
+            for key in (
+                "frozenMigration",
+                "originalOwnerDenied",
+                "offlineFallbackDenied",
+            )
+        )
+        or any(
+            charge.get(key) != 2 * 1048576
+            for key in ("batchBytes", "fallbackResidentBytes", "onlineResidentBytes")
+        )
+        or charge.get("oom") != 0
+        or charge.get("oomKill") != 0
+        or any(
+            charge.get(after, {}).get("memory", 0)
+            - charge.get(before, {}).get("memory", 0)
+            < 2 * 1048576
+            for before, after in (
+                ("fallbackBefore", "fallbackAfter"),
+                ("onlineBefore", "onlineAfter"),
+            )
+        )
+        or charge.get("before", {}).get("destination", {}).get("swap") != 0
+        or any(
+            charge.get("before", {}).get(owner, {}).get("swap", 0) < 32 * 1048576
+            or charge.get("before", {}).get(owner, {}).get("cached") != 0
+            for owner in ("a", "b")
+        )
+    ):
+        raise RuntimeError(
+            "Native charge-owner evidence lacks mixed-origin, migration or fallback backing"
+        )
     if set(namespaces) != {"private-pid", "private-pid-user"}:
         raise RuntimeError(
             "Native completion evidence lacks the required namespace variants"

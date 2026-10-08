@@ -415,6 +415,15 @@ impl HostLedger {
                     && c.policy.memory_bytes <= i64::MAX as u64,
                 "invalid durable completion rights"
             );
+            ensure!(
+                c.policy.envelopes.iter().all(|(domain, limit)| {
+                    c.policy.domains.contains(domain)
+                        && limit.memory_bytes > 0
+                        && limit.memory_bytes <= c.policy.memory_bytes
+                        && limit.swap_bytes <= c.policy.swap_bytes
+                }),
+                "invalid durable completion envelopes"
+            );
         }
         ensure!(
             self.pool_operations.len() <= 256

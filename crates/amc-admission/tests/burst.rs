@@ -272,6 +272,7 @@ fn burst_quiet_windows_require_the_complete_upfront_completion_charge_to_fit() {
         swap_bytes: 0,
         max_calls: 1,
         domains: vec!["normal".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.request(job("bulk", false, 60), &p).unwrap();

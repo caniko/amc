@@ -175,6 +175,14 @@ parent exit. Call/UID/domain/ceiling bounds continue to apply during draining.
 Completion rights do not grow on policy reload or authorize arbitrary new work.
 Root Nix clients bind these rights to the original socket peer's kernel identity.
 
+An optional `envelopes` map reduces `memory_bytes`/`swap_bytes` for named child
+domains. Each override must select an allowed domain, fit that native domain,
+and stay within the default child ceiling. Escrow sums the individual lanes;
+their limits are persisted with the parent and survive policy reloads. Consumers
+require `admissionContinuationEnvelopesVersion >= 1` before emitting overrides.
+Use `amc admission host-policy-check --policy FILE` to validate the actual emitted
+policy without starting a broker.
+
 ## Swap-return priority and recovery
 
 `reserve_swap_return = true` charges observed nonresident host swap demand not
@@ -195,6 +203,30 @@ prove every requested page resident after reading; the broker independently
 checks the range before settling its claim. Occupied swap slots and resident
 `memory.stat` swap cache are separate telemetry. Read faults can bring a page
 back into RAM while Linux retains its swap slot: slot deletion is not RAM return.
+
+Linux keeps the original swap-entry memcg charge when a process migrates. If
+that memcg is offline, swap-in falls back to the faulting mm's current memcg.
+A frozen cgroup can still be migrated. A swapped PTE does not expose its charge
+owner to this userspace API, and a single mm can contain mixed-origin pages.
+Consequently each batch conservatively checks every online cgroup with swap
+charges, plus the current target/fallback and the helper, against its own native
+ancestors and commitments. This can wait for an unrelated charged domain to
+gain headroom; it cannot borrow the destination grant to cover another owner.
+The native VM requires separate proofs of online original charging, frozen
+migration, offlining fallback and both headroom denials with zero OOM events. See Linux
+[`mem_cgroup_swapin_charge_folio`](https://github.com/gregkh/linux/blob/v6.18.48/mm/memcontrol.c#L4779-L4799)
+and [cgroup memory ownership](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-ownership).
+
+Discovery keeps private, locked, atomically saved hints in
+`/var/lib/amc-page-return` (`--state` overrides the directory). Campaigns resume
+through host PID windows, streaming mapping offsets and virtual page addresses,
+including beyond 512 PIDs, 8,192 mappings and 8,388,608 pages. This avoids walking
+empty cgroup descendants. Identity, layout, placement, native backing and PTEs
+are rechecked; hints grant no authority. PID reuse, ordinary exec and migration
+reset the target hint; full sweeps wrap to revisit mapping churn and same-layout
+exec. Waits/interruption retain the first unread range. A scan-budget cutoff is
+distinct from end-of-mm and cannot establish successful recovery, even with zero
+destination swap counters. Kernel counters must also show zero selected demand.
 
 ```sh
 amc recover-swap                 # bounded incremental return, devices stay on

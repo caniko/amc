@@ -113,6 +113,7 @@ mod tests {
                     swap_bytes: 0,
                     max_calls: 64,
                     domains: (0..16).map(|i| format!("d{i:079}")).collect(),
+                    envelopes: Default::default(),
                 },
                 calls: (0..64).map(|i| format!("c{i:079}")).collect(),
             });

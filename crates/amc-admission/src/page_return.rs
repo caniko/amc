@@ -92,7 +92,56 @@ fn recovery_headroom_at(
     let mut claims = claims.to_vec();
     claims.push(crate::recovery::helper_claim(helper, helper_bytes));
     Ok(native_headroom_at(root, helper, &claims, 0)?
-        && native_headroom_at(root, target, &claims, bytes)?)
+        && native_headroom_at(root, target, &claims, bytes)?
+        && charge_owner_headroom_at(root, &claims, bytes)?)
+}
+
+/// A swapped PTE does not expose its recorded memcg to userspace. Moving a
+/// process does not move its swap charge; an offlined owner instead falls back
+/// to the faulting mm. Back the target fallback AND every online possible
+/// original owner, including shared/mixed-origin pages. Never credit a target's
+/// grant as proof that another memcg owns these particular swap entries.
+fn charge_owner_headroom_at(root: &Path, claims: &[Reservation], bytes: u64) -> Result<bool> {
+    fn visit(
+        directory: &Path,
+        root: &Path,
+        claims: &[Reservation],
+        bytes: u64,
+        depth: usize,
+    ) -> Result<bool> {
+        ensure!(
+            depth <= 256,
+            "native charge-owner hierarchy exceeds depth bound"
+        );
+        if directory != root && directory.join("memory.swap.current").exists() {
+            let swap: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
+                .trim()
+                .parse()?;
+            if swap > 0 {
+                let owner = Identity {
+                    uid: 0,
+                    pid: 0,
+                    start_ticks: 0,
+                    inode: fs::metadata(directory)?.ino(),
+                    cgroup: format!("/{}", directory.strip_prefix(root)?.display()),
+                };
+                // Hierarchical charge observations may overlap, but every one
+                // gets an independent conservative feasibility check.
+                if !native_headroom_at(root, &owner, claims, bytes)? {
+                    return Ok(false);
+                }
+            }
+        }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && !visit(&entry.path(), root, claims, bytes, depth + 1)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    visit(root, root, claims, bytes, 0)
 }
 
 pub(crate) fn native_headroom_at(
@@ -138,14 +187,30 @@ pub(crate) fn native_headroom_at(
                 .parse()?;
             // Credit only the charged entitlement inside this exact target path.
             // Other grants cannot back these pages merely by sharing an ancestor.
-            if target.cgroup == r.identity.cgroup
-                || target
-                    .cgroup
-                    .starts_with(&format!("{}/", r.identity.cgroup))
+            let overlaps = claims.iter().any(|other| {
+                other.granted
+                    && other.identity.inode != 0
+                    && !std::ptr::eq(other, r)
+                    && (other.identity.cgroup == r.identity.cgroup
+                        || other
+                            .identity
+                            .cgroup
+                            .starts_with(&format!("{}/", r.identity.cgroup))
+                        || r.identity
+                            .cgroup
+                            .starts_with(&format!("{}/", other.identity.cgroup)))
+            });
+            if !overlaps
+                && (target.cgroup == r.identity.cgroup
+                    || target
+                        .cgroup
+                        .starts_with(&format!("{}/", r.identity.cgroup)))
             {
                 covered_return = covered_return.max(r.memory_bytes.saturating_sub(resident));
             }
-            covered_current = covered_current.saturating_add(resident);
+            if !overlaps {
+                covered_current = covered_current.saturating_add(resident);
+            }
             committed = committed.saturating_add(r.memory_bytes.max(resident));
         }
         let obligation = current
@@ -157,40 +222,6 @@ pub(crate) fn native_headroom_at(
         }
     }
     Ok(true)
-}
-
-pub fn candidates(policy: &RecoveryPolicy) -> Result<Vec<i32>> {
-    let mut pids = std::collections::BTreeSet::new();
-    let mut count = 0usize;
-    let mut pending: Vec<_> = policy
-        .page_cgroups
-        .iter()
-        .map(|p| crate::native::cgroup_directory(p))
-        .collect::<Result<_>>()?;
-    while let Some(directory) = pending.pop() {
-        count += 1;
-        ensure!(count <= 8192, "page return discovery exceeds bound");
-        let groups = fs::read_dir(&directory);
-        let groups = match groups {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            other => other?,
-        };
-        for child in groups {
-            let child = child?;
-            if child.file_type()?.is_dir() {
-                pending.push(child.path());
-            }
-        }
-        if let Ok(procs) = fs::read_to_string(directory.join("cgroup.procs")) {
-            for pid in procs.lines() {
-                pids.insert(pid.parse()?);
-                if pids.len() >= 512 {
-                    return Ok(pids.into_iter().collect());
-                }
-            }
-        }
-    }
-    Ok(pids.into_iter().collect())
 }
 
 /// Count the selected subtrees even when no readable process remains. An
@@ -281,62 +312,6 @@ pub fn page_size() -> Result<u64> {
     Ok(size as u64)
 }
 
-pub fn first_swapped_range(target: &Identity, bound: u64) -> Result<Option<(u64, u64)>> {
-    let page = page_size()?;
-    ensure!(bound >= page, "return batch smaller than page");
-    let maps = fs::read_to_string(format!("/proc/{}/maps", target.pid))?;
-    let map = File::open(format!("/proc/{}/pagemap", target.pid))?;
-    let mut scanned = 0u64;
-    let mut entries = [0u8; 4096];
-    for mapping in maps.lines().take(8192) {
-        let mut fields = mapping.split_whitespace();
-        let range = fields.next().context("missing page mapping")?;
-        if !fields
-            .next()
-            .is_some_and(|p| p.starts_with('r') && p.ends_with('p'))
-        {
-            continue;
-        }
-        let (first, last) = range.split_once('-').context("invalid page mapping")?;
-        let first = u64::from_str_radix(first, 16)?;
-        let last = u64::from_str_radix(last, 16)?;
-        let mut address = first;
-        while address < last {
-            let count = ((last - address) / page).min((entries.len() / 8) as u64) as usize;
-            if count == 0 {
-                break;
-            }
-            scanned += count as u64;
-            if scanned > 8_388_608 {
-                return Ok(None);
-            }
-            map.read_exact_at(
-                &mut entries[..count * 8],
-                (address / page)
-                    .checked_mul(8)
-                    .context("pagemap overflow")?,
-            )?;
-            let swapped = |i: usize| {
-                u64::from_ne_bytes(
-                    entries[i * 8..i * 8 + 8]
-                        .try_into()
-                        .expect("eight-byte pagemap entry"),
-                ) & (1u64 << 62)
-                    != 0
-            };
-            if let Some(first) = (0..count).find(|i| swapped(*i)) {
-                let pages = (first..count)
-                    .take((bound / page) as usize)
-                    .take_while(|i| swapped(*i))
-                    .count();
-                return Ok(Some((address + first as u64 * page, pages as u64 * page)));
-            }
-            address += count as u64 * page;
-        }
-    }
-    Ok(None)
-}
-
 pub fn read_batch(memory: &File, address: u64, bytes: u64) -> Result<u64> {
     ensure!(
         bytes > 0 && bytes <= 16 * 1024 * 1024 && address.checked_add(bytes).is_some(),
@@ -359,6 +334,116 @@ pub fn read_batch(memory: &File, address: u64, bytes: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::host::HostLedger;
+    #[test]
+    fn charge_owner_scan_does_not_truncate_a_wide_native_hierarchy() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-wide-owner-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..8193 {
+            fs::create_dir(root.join(format!("empty-{i}"))).unwrap();
+        }
+        let owner = root.join("charged");
+        fs::create_dir(&owner).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "10"),
+            ("memory.swap.current", "1"),
+        ] {
+            fs::write(owner.join(name), value).unwrap();
+        }
+        assert!(!charge_owner_headroom_at(&root, &[], 1).unwrap());
+        fs::write(owner.join("memory.max"), "11").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 1).unwrap());
+        fs::write(owner.join("memory.swap.current"), "unproven").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 1).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overlapping_native_observations_cannot_credit_the_same_resident_bytes_twice() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-overlap-owner-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("parent/target")).unwrap();
+        for (group, max, current) in [("parent", "100", 80), ("parent/target", "max", 20)] {
+            fs::write(root.join(group).join("memory.max"), max).unwrap();
+            fs::write(root.join(group).join("memory.current"), current.to_string()).unwrap();
+        }
+        let target = Identity {
+            cgroup: "/parent/target".into(),
+            inode: fs::metadata(root.join("parent/target")).unwrap().ino(),
+            uid: 1000,
+            pid: 42,
+            start_ticks: 7,
+        };
+        let first = Reservation {
+            id: "first".into(),
+            domain: "target".into(),
+            identity: target.clone(),
+            memory_bytes: 20,
+            swap_bytes: 0,
+            requested_ms: 0,
+            deadline_ms: 10000,
+            granted: true,
+            owners: vec![],
+            owners_finished: false,
+            burst: false,
+            runtime_max_ms: None,
+            continuation: None,
+        };
+        let second = Reservation {
+            id: "second".into(),
+            ..first.clone()
+        };
+        assert!(!native_headroom_at(&root, &target, &[first, second], 10).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn moved_and_mixed_origin_pages_need_original_owner_and_offline_fallback_backing() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-charge-owner-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (group, max, current, swap) in [
+            ("original", 20, 19, 2),
+            ("other-origin", 20, 17, 1),
+            ("destination", 40, 10, 0),
+            ("helper", 10, 1, 0),
+        ] {
+            fs::create_dir_all(root.join(group)).unwrap();
+            for (name, value) in [
+                ("memory.max", max),
+                ("memory.current", current),
+                ("memory.swap.current", swap),
+            ] {
+                fs::write(root.join(group).join(name), value.to_string()).unwrap();
+            }
+        }
+        let id = |name: &str, pid| Identity {
+            cgroup: format!("/{name}"),
+            inode: fs::metadata(root.join(name)).unwrap().ino(),
+            uid: 0,
+            pid,
+            start_ticks: 7,
+        };
+        let target = id("destination", 42);
+        let helper = id("helper", 43);
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 2, 10).unwrap());
+        fs::write(root.join("original/memory.max"), "21").unwrap();
+        assert!(recovery_headroom_at(&root, &target, &helper, &[], 2, 10).unwrap());
+        fs::write(root.join("other-origin/memory.max"), "18").unwrap();
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 2, 10).unwrap());
+        // Offlined memcg paths disappear; Linux's fallback is now the target.
+        fs::remove_dir_all(root.join("original")).unwrap();
+        fs::remove_dir_all(root.join("other-origin")).unwrap();
+        assert!(recovery_headroom_at(&root, &target, &helper, &[], 2, 10).unwrap());
+        fs::write(root.join("destination/memory.max"), "11").unwrap();
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 2, 10).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn recovery_backs_helper_growth_under_independent_and_shared_ancestors() {
         let root = std::env::temp_dir().join(format!(

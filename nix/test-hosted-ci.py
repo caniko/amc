@@ -18,6 +18,26 @@ class NativeEvidenceTests(unittest.TestCase):
         self,
     ):
         receipt = {
+            "chargeOwner": {
+                "kernel": "fixture",
+                "frozenMigration": True,
+                "originalOwnerDenied": True,
+                "offlineFallbackDenied": True,
+                "batchBytes": 2 * 1048576,
+                "fallbackResidentBytes": 2 * 1048576,
+                "onlineResidentBytes": 2 * 1048576,
+                "fallbackBefore": {"memory": 0},
+                "fallbackAfter": {"memory": 2 * 1048576},
+                "onlineBefore": {"memory": 0},
+                "onlineAfter": {"memory": 2 * 1048576},
+                "before": {
+                    "destination": {"swap": 0},
+                    "a": {"swap": 32 * 1048576, "cached": 0},
+                    "b": {"swap": 32 * 1048576, "cached": 0},
+                },
+                "oom": 0,
+                "oomKill": 0,
+            },
             "nativeNamespaceCompletion": self.namespace_evidence(),
             "pageReturn": {
                 "schemaVersion": 2,
@@ -57,6 +77,19 @@ class NativeEvidenceTests(unittest.TestCase):
             path = Path(directory) / "amc-foreground-evidence.json"
             path.write_text(json.dumps(receipt))
             hosted.verify_foreground_evidence(path)
+            for key, value in [
+                ("frozenMigration", False),
+                ("originalOwnerDenied", False),
+                ("offlineFallbackDenied", False),
+                ("fallbackResidentBytes", 0),
+                ("onlineAfter", {"memory": 0}),
+                ("oomKill", 1),
+            ]:
+                broken = json.loads(json.dumps(receipt))
+                broken["chargeOwner"][key] = value
+                path.write_text(json.dumps(broken))
+                with self.subTest(charge=key), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path)
             for section, key, value in [
                 ("pageReturn", "beforeSwapBytes", 0),
                 ("pageReturn", "schemaVersion", 1),

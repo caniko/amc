@@ -165,6 +165,7 @@ in
       };
       environment.systemPackages = [package pkgs.python3 pkgs.bubblewrap pkgs.util-linux];
       environment.etc."page-return-target.py".source = ./page-return-target.py;
+      environment.etc."charge-owner-proof.py".source = ./charge-owner-proof.py;
       environment.etc."amc-test-user-policy.json".source = userPolicy;
       environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
       environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
@@ -172,7 +173,7 @@ in
       virtualisation.emptyDiskImages = [512];
       virtualisation.cores = 2;
     };
-    testScript = builtins.readFile ./host-admission-vm-test.py + "\n" + builtins.readFile ./completion-vm-test.py;
+    testScript = builtins.readFile ./host-admission-vm-test.py + "\n" + builtins.readFile ./charge-owner-vm-test.py + "\n" + builtins.readFile ./completion-vm-test.py;
   }).overrideTestDerivation (previous:
     assert pkgs.lib.hasInfix "-o $out" previous.buildCommand; {
       buildCommand = builtins.replaceStrings ["-o $out"] ["-o $out --junit-xml junit.xml"] previous.buildCommand;

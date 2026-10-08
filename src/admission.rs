@@ -21,6 +21,11 @@ use std::{
 
 #[derive(Debug, Subcommand)]
 pub enum AdmissionCommand {
+    /// Validate a composed host policy without starting a broker or native work.
+    HostPolicyCheck {
+        #[arg(long)]
+        policy: PathBuf,
+    },
     /// Serve ceiling-backed reservations shared by enrolled execution domains.
     HostServe {
         #[arg(long)]
@@ -107,21 +112,19 @@ fn socket_path(path: Option<PathBuf>) -> Result<PathBuf> {
 
 pub fn execute(command: AdmissionCommand) -> Result<i32> {
     match command {
+        AdmissionCommand::HostPolicyCheck { policy } => {
+            let policy = host_policy(&policy)?;
+            policy.validate()?;
+            println!("host policy valid");
+            Ok(0)
+        }
         AdmissionCommand::HostServe {
             policy,
             socket,
             state,
             health_file,
         } => {
-            let mut bytes = Vec::new();
-            File::open(policy)?
-                .take(MAX_STATE_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() as u64 <= MAX_STATE_BYTES,
-                "host policy too large"
-            );
-            let policy = serde_json::from_slice(&bytes)?;
+            let policy = host_policy(&policy)?;
             let signals = crate::control::Signals::install()?;
             amc_admission::host_server::serve_supervised(
                 policy,
@@ -274,6 +277,18 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
     }
+}
+
+fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_STATE_BYTES,
+        "host policy too large"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn run(

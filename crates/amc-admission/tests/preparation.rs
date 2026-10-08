@@ -179,6 +179,7 @@ fn a_drain_includes_live_parents_that_can_still_launch_selected_completion_child
         swap_bytes: 0,
         max_calls: 1,
         domains: vec!["work".into()],
+        envelopes: Default::default(),
     });
     p.domains.push(parent_domain);
     p.validate().unwrap();
@@ -246,6 +247,7 @@ fn granted_root_pools_reject_a_different_completion_parent_before_joining() {
         swap_bytes: 0,
         max_calls: 2,
         domains: vec!["builders".into()],
+        envelopes: Default::default(),
     });
     p.validate().unwrap();
     let mut l = HostLedger::new("boot".into());
@@ -299,6 +301,7 @@ fn finite_authenticated_children_finish_during_drain_without_admitting_unrelated
         swap_bytes: 0,
         max_calls: 1,
         domains: vec!["work".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
@@ -350,6 +353,7 @@ fn pending_root_pools_cannot_change_their_first_completion_parent() {
         swap_bytes: 0,
         max_calls: 2,
         domains: vec!["builders".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
@@ -405,6 +409,7 @@ fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
         swap_bytes: 0,
         max_calls: 1,
         domains: vec!["builders".into()],
+        envelopes: Default::default(),
     });
     p.domains[1].cgroup = "/shared/game.slice".into();
     p.domains[2].cgroup = "/shared/builders.slice".into();
@@ -451,6 +456,7 @@ fn queued_child_keeps_its_obligation_after_parent_exit_and_aged_new_work_cannot_
         swap_bytes: 0,
         max_calls: 2,
         domains: vec!["work".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
@@ -496,6 +502,7 @@ fn parents_reserve_completion_capacity_up_front_and_children_transfer_that_backi
         swap_bytes: 0,
         max_calls: 3,
         domains: vec!["work".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
@@ -549,6 +556,7 @@ fn completion_lanes_are_backed_in_their_native_ancestors_before_the_parent_start
         swap_bytes: 0,
         max_calls: 2,
         domains: vec!["builders".into()],
+        envelopes: Default::default(),
     });
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
@@ -604,6 +612,60 @@ fn completion_lanes_are_backed_in_their_native_ancestors_before_the_parent_start
         ancestry,
     );
     assert_eq!(waits["new-native-peer"], WaitReason::AncestorHeadroom);
+}
+
+#[test]
+fn asymmetric_completion_envelopes_preserve_each_childs_backing_and_authority() {
+    let mut p = policy();
+    p.domains[0].continuation = Some(
+        serde_json::from_value(serde_json::json!({
+            "parent_max_bytes":10,"memory_bytes":50,"swap_bytes":10,"max_calls":4,
+            "domains":["work","game"],
+            "envelopes":{"game":{"memory_bytes":40,"swap_bytes":0}}
+        }))
+        .unwrap(),
+    );
+    p.validate().unwrap();
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    l.request(job("parent", "work", 1000, 10), &p).unwrap();
+    advance(&mut l, &p, 250);
+    assert_eq!(l.committed(), 100);
+    assert_eq!(l.swap_committed(), 10);
+    let cap = l.continuation_capability("parent", &p).unwrap().unwrap();
+    assert!(
+        l.authorize_continuation(&cap, 1000, "game", 41, 0, "too-large")
+            .is_err()
+    );
+    assert!(
+        l.authorize_continuation(&cap, 1000, "game", 40, 1, "wrong-swap")
+            .is_err()
+    );
+    let mut child = job("child", "game", 1000, 40);
+    child.continuation = Some(
+        l.authorize_continuation(&cap, 1000, "game", 40, 0, "child")
+            .unwrap(),
+    );
+    l.request(child, &p).unwrap();
+    advance(&mut l, &p, 500);
+    assert!(
+        l.reservations
+            .iter()
+            .find(|r| r.id == "child")
+            .unwrap()
+            .granted
+    );
+    let mut restored: HostLedger =
+        serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(restored.committed(), 100);
+    assert_eq!(restored.swap_committed(), 10);
+    assert_eq!(
+        restored
+            .authorize_continuation(&cap, 1000, "work", 50, 10, "builder")
+            .unwrap(),
+        "parent"
+    );
 }
 
 #[test]

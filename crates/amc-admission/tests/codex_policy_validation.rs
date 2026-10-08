@@ -16,6 +16,30 @@ fn host_policy() -> HostPolicy {
 }
 
 #[test]
+fn child_envelope_overrides_are_finite_selected_reductions() {
+    let base = serde_json::json!({
+        "parent_max_bytes":10,"memory_bytes":50,"swap_bytes":10,"max_calls":1,
+        "domains":["work","game"],
+        "envelopes":{"game":{"memory_bytes":40,"swap_bytes":10}}
+    });
+    let mut policy = host_policy();
+    policy.domains[0].continuation = Some(serde_json::from_value(base.clone()).unwrap());
+    policy.validate().unwrap();
+    for overrides in [
+        serde_json::json!({"other":{"memory_bytes":1,"swap_bytes":0}}),
+        serde_json::json!({"game":{"memory_bytes":0,"swap_bytes":0}}),
+        serde_json::json!({"game":{"memory_bytes":51,"swap_bytes":0}}),
+        serde_json::json!({"game":{"memory_bytes":40,"swap_bytes":11}}),
+        serde_json::json!({"game":{"memory_bytes":41,"swap_bytes":0}}),
+    ] {
+        let mut invalid = base.clone();
+        invalid["envelopes"] = overrides;
+        policy.domains[0].continuation = Some(serde_json::from_value(invalid).unwrap());
+        assert!(policy.validate().is_err());
+    }
+}
+
+#[test]
 fn preparation_profiles_require_an_executable_launch_slice_basename() {
     let mut policy = host_policy();
     policy.preparations = serde_json::from_value(serde_json::json!([

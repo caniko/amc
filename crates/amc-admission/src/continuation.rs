@@ -5,6 +5,14 @@
 use crate::host::{HostLedger, HostPolicy, Reservation};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionEnvelope {
+    pub memory_bytes: u64,
+    pub swap_bytes: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +22,9 @@ pub struct ContinuationPolicy {
     pub swap_bytes: u64,
     pub max_calls: usize,
     pub domains: Vec<String>,
+    /// Optional smaller per-domain lanes, frozen when the parent is admitted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub envelopes: BTreeMap<String, CompletionEnvelope>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -33,6 +44,27 @@ pub struct Continuation {
 }
 
 impl ContinuationPolicy {
+    pub fn envelope(&self, domain: &str) -> CompletionEnvelope {
+        self.envelopes
+            .get(domain)
+            .copied()
+            .unwrap_or(CompletionEnvelope {
+                memory_bytes: self.memory_bytes,
+                swap_bytes: self.swap_bytes,
+            })
+    }
+
+    fn escrow(&self, swap: bool) -> u64 {
+        self.domains.iter().fold(0u64, |sum, domain| {
+            let limit = self.envelope(domain);
+            sum.saturating_add(if swap {
+                limit.swap_bytes
+            } else {
+                limit.memory_bytes
+            })
+        })
+    }
+
     pub fn validate(&self, policy: &HostPolicy) -> Result<()> {
         ensure!(
             self.parent_max_bytes > 0
@@ -48,17 +80,23 @@ impl ContinuationPolicy {
                     .collect::<std::collections::BTreeSet<_>>()
                     .len()
                     == self.domains.len()
+                && self.envelopes.iter().all(|(domain, limit)| {
+                    self.domains.contains(domain)
+                        && limit.memory_bytes > 0
+                        && limit.memory_bytes <= self.memory_bytes
+                        && limit.swap_bytes <= self.swap_bytes
+                })
                 && self
-                    .memory_bytes
-                    .checked_mul(self.domains.len() as u64)
-                    .and_then(|escrow| escrow.checked_add(self.parent_max_bytes))
+                    .escrow(false)
+                    .checked_add(self.parent_max_bytes)
                     .is_some_and(|bytes| bytes <= policy.budget_bytes)
                 && self.domains.iter().all(|name| {
+                    let limit = self.envelope(name);
                     policy.domains.iter().any(|d| {
                         &d.name == name
                             && !d.burst
-                            && self.memory_bytes <= d.ceiling_bytes
-                            && self.swap_bytes <= d.swap_bytes
+                            && limit.memory_bytes <= d.ceiling_bytes
+                            && limit.swap_bytes <= d.swap_bytes
                     })
                 }),
             "invalid completion rights"
@@ -87,6 +125,7 @@ impl HostLedger {
     pub(crate) fn completion_escrow(&self, swap: bool) -> u64 {
         self.continuations.iter().fold(0u64, |sum, c| {
             sum.saturating_add(c.policy.domains.iter().fold(0u64, |total, domain| {
+                let limit = c.policy.envelope(domain);
                 let used = self
                     .reservations
                     .iter()
@@ -100,9 +139,9 @@ impl HostLedger {
                     });
                 total.saturating_add(
                     (if swap {
-                        c.policy.swap_bytes
+                        limit.swap_bytes
                     } else {
-                        c.policy.memory_bytes
+                        limit.memory_bytes
                     })
                     .saturating_sub(used),
                 )
@@ -115,10 +154,8 @@ impl HostLedger {
             return 0;
         }
         (if swap { r.swap_bytes } else { r.memory_bytes }).saturating_add(
-            self.completion_spec(r, policy).map_or(0, |c| {
-                (if swap { c.swap_bytes } else { c.memory_bytes })
-                    .saturating_mul(c.domains.len() as u64)
-            }),
+            self.completion_spec(r, policy)
+                .map_or(0, |c| c.escrow(swap)),
         )
     }
 
@@ -193,6 +230,7 @@ impl HostLedger {
         }
         for c in &self.continuations {
             for domain in &c.policy.domains {
+                let limit = c.policy.envelope(domain);
                 let used = self
                     .reservations
                     .iter()
@@ -212,13 +250,11 @@ impl HostLedger {
                         && &r.domain == domain
                         && r.continuation.as_deref() == Some(&c.capability.parent)
                 });
-                let memory = c
-                    .policy
+                let memory = limit
                     .memory_bytes
                     .saturating_sub(used.0)
                     .saturating_sub(transfer.map_or(0, |r| r.memory_bytes));
-                let swap = c
-                    .policy
+                let swap = limit
                     .swap_bytes
                     .saturating_sub(used.1)
                     .saturating_sub(transfer.map_or(0, |r| r.swap_bytes));
@@ -243,7 +279,9 @@ impl HostLedger {
         let mut lanes = vec![];
         if let Some(c) = self.completion_spec(r, policy) {
             for domain in &c.domains {
-                let Some(lane) = self.lane(&r.id, domain, c.memory_bytes, c.swap_bytes, policy)
+                let limit = c.envelope(domain);
+                let Some(lane) =
+                    self.lane(&r.id, domain, limit.memory_bytes, limit.swap_bytes, policy)
                 else {
                     return Some(WaitReason::Unknown);
                 };
@@ -347,6 +385,7 @@ impl HostLedger {
                 c.capability.parent == capability.parent && c.capability.key == capability.key
             })
             .ok_or_else(|| anyhow::anyhow!("unknown completion capability"))?;
+        let limit = c.policy.envelope(domain);
         ensure!(
             uid == c.uid
                 && (c.calls.iter().any(|id| id == call)
@@ -354,8 +393,8 @@ impl HostLedger {
                         && (r.id == capability.parent
                             || r.continuation.as_ref() == Some(&capability.parent))))
                 && c.policy.domains.iter().any(|d| d == domain)
-                && memory <= c.policy.memory_bytes
-                && swap <= c.policy.swap_bytes,
+                && memory <= limit.memory_bytes
+                && swap <= limit.swap_bytes,
             "completion is outside its original operation contract"
         );
         if !c.calls.iter().any(|id| id == call) {
@@ -371,10 +410,11 @@ impl HostLedger {
     pub fn is_continuation(&self, r: &Reservation) -> bool {
         r.continuation.as_ref().is_some_and(|parent| {
             self.continuations.iter().any(|c| {
+                let limit = c.policy.envelope(&r.domain);
                 c.capability.parent == *parent
                     && c.policy.domains.contains(&r.domain)
-                    && r.memory_bytes <= c.policy.memory_bytes
-                    && r.swap_bytes <= c.policy.swap_bytes
+                    && r.memory_bytes <= limit.memory_bytes
+                    && r.swap_bytes <= limit.swap_bytes
                     && (r.identity.uid == c.uid || r.identity.uid == 0)
                     && (c.calls.contains(&r.id)
                         || std::iter::once((r.identity.pid, r.identity.start_ticks))

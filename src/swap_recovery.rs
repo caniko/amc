@@ -1,6 +1,7 @@
 //! Root recovery runs inside the configured finite native maintenance unit.
 use amc_admission::{
     host_server::{Request, call},
+    page_discovery::{self, ProcessCursor, Scan},
     recovery::{RecoveryAction, RecoveryPolicy, RecoveryTarget},
 };
 use anyhow::{Context, Result, ensure};
@@ -15,6 +16,9 @@ use std::{
 pub struct RecoveryArgs {
     #[arg(long, default_value = "/run/amc-host/admission.sock")]
     socket: PathBuf,
+    /// Private durable discovery hints, retained between bounded campaigns.
+    #[arg(long, default_value = "/var/lib/amc-page-return")]
+    state: PathBuf,
     /// Restore configured swap devices without acquiring return capacity.
     #[arg(long)]
     restore: bool,
@@ -54,6 +58,7 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
     if !args.whole_device {
         return match return_pages(
             &args.socket,
+            &args.state,
             reply
                 .recovery_policy
                 .context("missing page return policy")?,
@@ -125,91 +130,165 @@ fn whole_device_status(
     Ok(if incomplete { 75 } else { 0 })
 }
 
-fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
+fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i32> {
     if policy.page_cgroups.is_empty() {
         eprintln!("page return incomplete: no page-return subtrees are configured");
         return Ok(75);
     }
     let deadline = Instant::now() + Duration::from_secs(45);
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let (store, mut discovery) = amc_admission::store::Store::open_discovery(state, boot.trim())?;
+    discovery.select(&policy);
+    store.save_discovery(&discovery)?;
     let mut returned = 0u64;
     let mut unproven = false;
+    let mut sweep_complete = false;
     for _ in 0..1024 {
         if Instant::now() >= deadline {
             break;
         }
-        let mut progressed = false;
-        for pid in amc_admission::page_return::candidates(&policy)? {
-            if Instant::now() >= deadline {
-                break;
-            }
-            let target = (|| -> Result<_> {
-                let start = amc_admission::host_native::process_start(pid)?;
-                let identity = amc_admission::page_return::identity(pid, start, &policy)?;
-                if amc_admission::page_return::target_usage(&identity)?.used_bytes() == 0 {
-                    return Ok(None);
+        if discovery.active.is_none() {
+            let candidates = page_discovery::candidates(discovery.after_pid)?;
+            if candidates.is_empty() {
+                discovery.wrap();
+                store.save_discovery(&discovery)?;
+                if amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
+                    sweep_complete = true;
+                    break;
                 }
-                let memory = amc_admission::page_return::open_memory(&identity)?;
-                let pagemap = amc_admission::page_return::open_pagemap(&identity)?;
-                Ok(Some((identity, memory, pagemap)))
-            })();
-            let (target, memory, pagemap) = match target {
-                Ok(Some(target)) => target,
-                Ok(None) => continue,
-                Err(_) => {
-                    eprintln!("page return: native target identity or mm is unproven");
-                    unproven = true;
-                    continue;
-                }
-            };
-            let range =
-                amc_admission::page_return::first_swapped_range(&target, policy.batch_bytes);
-            let (address, bytes) = match range {
-                Ok(Some(range)) => range,
-                Ok(None) => continue,
-                Err(_) => {
-                    eprintln!("page return: native mapping discovery is unproven");
-                    unproven = true;
-                    continue;
-                }
-            };
-            let reply = call(
-                socket,
-                &Request::AcquirePageReturn {
-                    version: 1,
-                    pid: target.pid,
-                    start_ticks: target.start_ticks,
-                    address,
-                    bytes,
-                },
-            )?;
-            if !reply.granted {
-                eprintln!("page return waiting: {:?}", reply.waiting);
-                return Ok(75);
+                thread::sleep(Duration::from_millis(100));
+                continue;
             }
-            amc_admission::page_return::read_batch(&memory, address, bytes)?;
-            let resident = amc_admission::page_return::range_resident(&pagemap, address, bytes)?;
-            drop(memory);
-            thread::sleep(Duration::from_millis(10));
-            let reply = call(socket, &Request::FinishPageReturn { version: 1 })?;
-            if !resident || reply.resident_bytes != Some(bytes) {
-                eprintln!("page return stalled: batch residency is unproven");
-                return Ok(75);
+            for pid in candidates {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                discovery.after_pid = pid;
+                match page_discovery::selected(pid, &policy) {
+                    Ok(true) => {
+                        match (|| -> Result<_> {
+                            let start = amc_admission::host_native::process_start(pid)?;
+                            Ok(ProcessCursor {
+                                target: amc_admission::page_return::identity(pid, start, &policy)?,
+                                layout: page_discovery::layout(pid)?,
+                                maps_offset: 0,
+                                address: 0,
+                            })
+                        })() {
+                            Ok(cursor) => {
+                                discovery.active = Some(cursor);
+                                break;
+                            }
+                            Err(_) => {
+                                unproven = true;
+                            }
+                        }
+                    }
+                    Ok(false) => (),
+                    Err(_) if !Path::new(&format!("/proc/{pid}")).exists() => (),
+                    Err(_) => {
+                        unproven = true;
+                    }
+                }
             }
-            returned = returned.saturating_add(bytes);
-            progressed = true;
-            break;
+            store.save_discovery(&discovery)?;
+            if discovery.active.is_none() {
+                continue;
+            }
         }
-        if !progressed {
-            // Small memory.stat updates can remain buffered until the kernel's
-            // periodic rstat flush. An empty PTE scan is not evidence that the
-            // selected subtree's RAM-return obligation has settled. Reobserve
-            // within this campaign's existing deadline, retaining every proof
-            // failure and requiring the actual counter to reach zero.
-            if unproven || amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
-                break;
+        let cursor = discovery
+            .active
+            .as_mut()
+            .context("missing process cursor")?;
+        let pid = cursor.target.pid;
+        let target = (|| -> Result<_> {
+            let start = amc_admission::host_native::process_start(pid)?;
+            let identity = amc_admission::page_return::identity(pid, start, &policy)?;
+            let layout = page_discovery::layout(pid)?;
+            cursor.revalidate(identity.clone(), layout);
+            let memory = amc_admission::page_return::open_memory(&identity)?;
+            let pagemap = amc_admission::page_return::open_pagemap(&identity)?;
+            ensure!(
+                amc_admission::page_return::identity(pid, start, &policy)? == identity,
+                "page return placement changed while opening native descriptors"
+            );
+            Ok((memory, pagemap))
+        })();
+        let (memory, pagemap) = match target {
+            Ok(target) => target,
+            Err(_) => {
+                eprintln!("page return: native target identity or mm is unproven");
+                unproven = true;
+                discovery.finish_process();
+                store.save_discovery(&discovery)?;
+                continue;
             }
-            thread::sleep(Duration::from_millis(100));
+        };
+        let range = page_discovery::scan(cursor, &pagemap, policy.batch_bytes);
+        let (address, bytes) = match range {
+            Ok(Scan::Range { address, bytes }) => (address, bytes),
+            Ok(Scan::More) => {
+                store.save_discovery(&discovery)?;
+                continue;
+            }
+            Ok(Scan::Complete) => {
+                discovery.finish_process();
+                store.save_discovery(&discovery)?;
+                continue;
+            }
+            Err(_) => {
+                eprintln!("page return: native mapping discovery is unproven");
+                unproven = true;
+                discovery.finish_process();
+                store.save_discovery(&discovery)?;
+                continue;
+            }
+        };
+        let target = cursor.target.clone();
+        // Persist the first unread page. A wait, interruption or lost reply
+        // must revisit this range instead of dropping the return obligation.
+        store.save_discovery(&discovery)?;
+        let reply = call(
+            socket,
+            &Request::AcquirePageReturn {
+                version: 1,
+                pid: target.pid,
+                start_ticks: target.start_ticks,
+                address,
+                bytes,
+            },
+        )?;
+        if !reply.granted {
+            eprintln!("page return waiting: {:?}", reply.waiting);
+            return Ok(75);
         }
+        ensure!(
+            amc_admission::page_return::identity(target.pid, target.start_ticks, &policy)?
+                == target
+                && page_discovery::layout(target.pid)?
+                    == discovery
+                        .active
+                        .as_ref()
+                        .context("missing native cursor")?
+                        .layout,
+            "native target changed after page return admission"
+        );
+        amc_admission::page_return::read_batch(&memory, address, bytes)?;
+        let resident = amc_admission::page_return::range_resident(&pagemap, address, bytes)?;
+        drop(memory);
+        thread::sleep(Duration::from_millis(10));
+        let reply = call(socket, &Request::FinishPageReturn { version: 1 })?;
+        if !resident || reply.resident_bytes != Some(bytes) {
+            eprintln!("page return stalled: batch residency is unproven");
+            return Ok(75);
+        }
+        returned = returned.saturating_add(bytes);
+        discovery
+            .active
+            .as_mut()
+            .context("missing settled cursor")?
+            .address = address + bytes;
+        store.save_discovery(&discovery)?;
     }
     let remaining = amc_admission::page_return::selected_return_bytes(&policy)?;
     eprintln!(
@@ -217,12 +296,27 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
     );
     // Partial progress, unreadable/unsupported pages and campaign cutoffs remain
     // stalled. The next timer can resume, but this invocation did not complete.
-    Ok(if remaining == 0 && !unproven { 0 } else { 75 })
+    Ok(page_status(remaining, unproven, sweep_complete))
+}
+
+fn page_status(remaining: u64, unproven: bool, sweep_complete: bool) -> i32 {
+    if remaining == 0 && !unproven && sweep_complete {
+        0
+    } else {
+        75
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_discovery_cutoff_cannot_prove_completion_with_zero_destination_counters() {
+        assert_eq!(page_status(0, false, false), 75);
+        assert_eq!(page_status(0, true, true), 75);
+        assert_eq!(page_status(1, false, true), 75);
+        assert_eq!(page_status(0, false, true), 0);
+    }
 
     #[test]
     fn default_recovery_cannot_succeed_without_selected_page_return_subtrees() {
@@ -233,7 +327,10 @@ mod tests {
         }))
         .unwrap();
         policy.validate().unwrap();
-        assert_eq!(return_pages(Path::new("/unused"), policy).unwrap(), 75);
+        assert_eq!(
+            return_pages(Path::new("/unused"), Path::new("/unused-state"), policy).unwrap(),
+            75
+        );
     }
 
     #[test]

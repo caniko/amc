@@ -98,6 +98,7 @@
     lib.admissionSizingVersion = 1;
     lib.admissionBurstVersion = 1;
     lib.admissionPreparationVersion = 2;
+    lib.admissionContinuationEnvelopesVersion = 1;
     lib.swapReturnReservationVersion = 2;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
