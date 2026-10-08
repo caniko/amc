@@ -887,16 +887,25 @@ time.sleep(120)
     machine.wait_until_succeeds(
         "test $(awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps) -ge 32768"
     )
+    restore_executable = machine.succeed(
+        "readlink -f /run/current-system/sw/bin/amc"
+    ).strip()
     machine.succeed(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 "
-        "--property='ExecStopPost=amc recover-swap --restore --socket /run/amc-device/admission.sock' -- "
-        "python3 /tmp/device-return-interrupt.py"
+        "--property="
+        + shlex.quote(
+            f"ExecStopPost={restore_executable} recover-swap --restore --socket /run/amc-device/admission.sock"
+        )
+        + " -- python3 /tmp/device-return-interrupt.py"
     )
     machine.wait_until_succeeds("test -e /tmp/device-return-off")
     machine.fail("grep -q '^/dev/vdb' /proc/swaps")
     machine.succeed("systemctl stop page-return")
     machine.succeed(
-        "test $(awk '$1 == \"/dev/vdb\" {print $5}' /proc/swaps) = 10; touch /tmp/page-target-probe"
+        'test "$(systemctl show page-return --property=Result --value)" = success'
+    )
+    machine.succeed(
+        'test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10; touch /tmp/page-target-probe'
     )
     machine.wait_until_succeeds("test -e /tmp/page-target-intact")
     machine.wait_until_succeeds(
