@@ -397,6 +397,16 @@ mod tests {
         ] {
             fs::write(owner.join(name), value).unwrap();
         }
+        let reader = root.join("reader");
+        fs::create_dir_all(&reader).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "10"),
+            ("memory.swap.current", "0"),
+            ("memory.stat", "swapcached 5\n"),
+        ] {
+            fs::write(reader.join(name), value).unwrap();
+        }
         assert!(charge_owner_headroom_at(&root, &[], 2).unwrap());
         fs::write(owner.join("memory.stat"), "swapcached 7\n").unwrap();
         assert!(!charge_owner_headroom_at(&root, &[], 2).unwrap());

@@ -244,6 +244,13 @@ acquisition RPCs allow 30 seconds so a complete wide scan is not discarded at
 the ordinary two-second program-call deadline. Device inventory also has a
 20-second deadline, within the same maintenance RPC budget.
 
+A stable zero `memory.swap.current` means a cgroup owns no swap-slot return
+obligation even when `memory.stat.swapcached` is positive: remote reads of
+offlined-owner slots can charge resident cache to the reader's RAM boundary.
+That cache supplies no credit to another owner, and the reader's unused native
+RAM is still separately backed before a batch. Positive-slot inconsistent
+accounting remains unknown and inhibits acquisition.
+
 Recovery acquisition requires the configured service's current MainPID,
 `Restart=no`, and `KillMode=control-group`. Leases retain its trusted systemd
 InvocationID. Same-invocation descendants and missing manager observations keep

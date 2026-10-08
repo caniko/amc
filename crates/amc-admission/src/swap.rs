@@ -73,8 +73,17 @@ pub fn cgroup_usage(directory: &Path) -> Result<SwapUsage> {
         let middle = current()?;
         let next_cache = cached()?;
         let last = current()?;
-        if first == middle && middle == last && cache == next_cache && cache <= last {
-            return SwapUsage::new(last, cache);
+        if first == middle && middle == last && cache == next_cache {
+            // Offlined-owner swap-cache faults can charge the reader's RAM
+            // while the slots retain another memcg owner. A stable zero slot
+            // count proves this group owns no return obligation, regardless
+            // of its resident cache. Do not credit that cache to any peer.
+            if last == 0 {
+                return SwapUsage::new(0, 0);
+            }
+            if cache <= last {
+                return SwapUsage::new(last, cache);
+            }
         }
     }
     anyhow::bail!("unstable native swap cache accounting")
@@ -346,6 +355,26 @@ fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_readers_resident_cache_with_no_owned_slots_creates_no_return_demand() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-remote-reader-cache-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("memory.swap.current"), "0").unwrap();
+        fs::write(root.join("memory.stat"), "swapcached 2097152\n").unwrap();
+        let usage = cgroup_usage(&root).unwrap();
+        assert_eq!(usage.used_bytes(), 0);
+        assert_eq!(usage.return_bytes(), 0);
+        // A positive slot/cache mismatch still cannot prove residency credit.
+        fs::write(root.join("memory.swap.current"), "4096").unwrap();
+        assert!(cgroup_usage(&root).is_err());
+        fs::write(root.join("memory.swap.current"), "unknown").unwrap();
+        assert!(cgroup_usage(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn device_observation_preserves_the_active_priority() {

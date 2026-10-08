@@ -37,6 +37,8 @@
 - Exclude proven resident swap-cache-only owners from additional return demand.
 - Bind recovery leases to native service invocations so replacements cannot
   hide dead helpers, while surviving descendants retain backing.
+- Accept stable zero-owned-slot reader cache after offlined-owner recovery
+  without assigning that resident cache as another owner's entitlement.
 - Resume bounded discovery without treating an interrupted scan prefix as proof
   of current residency; back original swap owners and the remote reader fallback.
 - Give complete charge-owner inventories a bounded maintenance RPC window and
