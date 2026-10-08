@@ -202,14 +202,47 @@ pub fn helper(pid: i32, policy: &RecoveryPolicy) -> Result<Identity> {
 
 /// swapoff faults pages into their original memory domains. Host headroom alone
 /// is insufficient: every finite leaf and ancestor must fit its own swap return.
-pub fn native_return_safe(ledger: &HostLedger, policy: &HostPolicy) -> Result<bool> {
-    native_return_safe_at(Path::new("/sys/fs/cgroup"), ledger, policy)
+pub fn native_return_safe(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    helper: &Identity,
+    helper_bytes: u64,
+) -> Result<bool> {
+    native_return_safe_with_helper_at(
+        Path::new("/sys/fs/cgroup"),
+        ledger,
+        policy,
+        helper,
+        helper_bytes,
+    )
 }
 
+fn native_return_safe_with_helper_at(
+    root: &Path,
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    helper: &Identity,
+    helper_bytes: u64,
+) -> Result<bool> {
+    let mut claims = ledger
+        .native_claims(policy, None)
+        .context("native recovery claims are unproven")?;
+    claims.push(crate::recovery::helper_claim(helper, helper_bytes));
+    Ok(
+        crate::page_return::native_headroom_at(root, helper, &claims, 0)?
+            && native_return_safe_claims_at(root, &claims)?,
+    )
+}
+
+#[cfg(test)]
 fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) -> Result<bool> {
     let claims = ledger
         .native_claims(policy, None)
         .context("native recovery claims are unproven")?;
+    native_return_safe_claims_at(root, &claims)
+}
+
+fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]) -> Result<bool> {
     let mut pending = vec![root.to_owned()];
     let mut seen = 0usize;
     while let Some(directory) = pending.pop() {
@@ -237,15 +270,58 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) 
             .trim()
             .parse()?;
         let group = format!("/{}", directory.strip_prefix(root)?.display());
-        let committed = claims
-            .iter()
-            .filter(|r| {
-                r.granted
-                    && (r.identity.cgroup == group
-                        || r.identity.cgroup.starts_with(&format!("{group}/")))
-            })
-            .fold(0u64, |sum, r| sum.saturating_add(r.memory_bytes));
-        if swap > max.saturating_sub(current).saturating_sub(committed) {
+        let mut committed = 0u64;
+        let mut covered_current = 0u64;
+        let mut covered_return = 0u64;
+        for r in claims.iter().filter(|r| {
+            r.granted
+                && (r.identity.cgroup == group
+                    || r.identity.cgroup.starts_with(&format!("{group}/")))
+        }) {
+            if r.identity.inode == 0 && r.identity.pid == 0 {
+                // Ready/escrow envelopes have no resident pages to credit.
+                committed = committed.saturating_add(r.memory_bytes);
+                continue;
+            }
+            let boundary = root.join(r.identity.cgroup.trim_start_matches('/'));
+            ensure!(
+                fs::metadata(&boundary)?.ino() == r.identity.inode,
+                "device return entitlement identity changed"
+            );
+            let resident: u64 = fs::read_to_string(boundary.join("memory.current"))?
+                .trim()
+                .parse()?;
+            committed = committed.saturating_add(r.memory_bytes.max(resident));
+            // Hierarchical observations overlap. Without a disjoint grant
+            // boundary, neither its resident pages nor its return can be
+            // credited again. Synthetic envelopes never supply such credit.
+            let overlaps = claims.iter().any(|other| {
+                other.granted
+                    && other.id != r.id
+                    && other.identity.inode != 0
+                    && (other.identity.cgroup == r.identity.cgroup
+                        || other
+                            .identity
+                            .cgroup
+                            .starts_with(&format!("{}/", r.identity.cgroup))
+                        || r.identity
+                            .cgroup
+                            .starts_with(&format!("{}/", other.identity.cgroup)))
+            });
+            if !overlaps {
+                covered_current = covered_current.saturating_add(resident);
+                covered_return = covered_return.saturating_add(
+                    cgroup_usage(&boundary)?
+                        .return_bytes()
+                        .min(r.memory_bytes.saturating_sub(resident)),
+                );
+            }
+        }
+        let obligation = current
+            .saturating_sub(covered_current)
+            .saturating_add(committed)
+            .saturating_add(swap.saturating_sub(covered_return));
+        if obligation > max {
             return Ok(false);
         }
     }
@@ -255,6 +331,87 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_device_return_backs_the_helper_even_outside_swapped_ancestors() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-device-helper-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (group, max, current, swap) in [
+            ("target", 40, 20, 20),
+            ("helper-parent", 9, 5, 0),
+            ("helper-parent/helper", 10, 5, 0),
+            ("shared", 49, 25, 20),
+            ("shared/target", 40, 20, 20),
+            ("shared/helper", 10, 5, 0),
+        ] {
+            fs::create_dir_all(root.join(group)).unwrap();
+            for (name, value) in [
+                ("memory.max", max),
+                ("memory.current", current),
+                ("memory.swap.current", swap),
+            ] {
+                fs::write(root.join(group).join(name), value.to_string()).unwrap();
+            }
+            fs::write(root.join(group).join("memory.stat"), "swapcached 0\n").unwrap();
+        }
+        let ledger = HostLedger::new("boot".into());
+        let policy = return_policy();
+        let helper = |group: &str| Identity {
+            cgroup: format!("/{group}"),
+            inode: fs::metadata(root.join(group)).unwrap().ino(),
+            uid: 0,
+            pid: 43,
+            start_ticks: 7,
+        };
+        // Remove the deliberately tight shared subtree from this first proof.
+        fs::write(root.join("shared/memory.max"), "50").unwrap();
+        assert!(
+            !native_return_safe_with_helper_at(
+                &root,
+                &ledger,
+                &policy,
+                &helper("helper-parent/helper"),
+                10
+            )
+            .unwrap()
+        );
+        fs::write(root.join("helper-parent/memory.max"), "10").unwrap();
+        assert!(
+            native_return_safe_with_helper_at(
+                &root,
+                &ledger,
+                &policy,
+                &helper("helper-parent/helper"),
+                10
+            )
+            .unwrap()
+        );
+        fs::write(root.join("shared/memory.max"), "49").unwrap();
+        assert!(
+            !native_return_safe_with_helper_at(
+                &root,
+                &ledger,
+                &policy,
+                &helper("shared/helper"),
+                10
+            )
+            .unwrap()
+        );
+        fs::write(root.join("shared/memory.max"), "50").unwrap();
+        assert!(
+            native_return_safe_with_helper_at(
+                &root,
+                &ledger,
+                &policy,
+                &helper("shared/helper"),
+                10
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn return_policy() -> HostPolicy {
         serde_json::from_value(serde_json::json!({
@@ -416,6 +573,63 @@ mod tests {
         let mut missing = policy.clone();
         missing.domains.clear();
         assert!(native_return_safe_at(&root, &ledger, &missing).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn device_return_uses_only_the_disjoint_grants_own_unused_ceiling() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-device-credit-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (group, max, current, swap) in [
+            ("parent", 100, 40, 20),
+            ("parent/target.slice", 40, 20, 20),
+            ("parent/peer.slice", 40, 20, 0),
+        ] {
+            fs::create_dir_all(root.join(group)).unwrap();
+            for (name, value) in [
+                ("memory.max", max),
+                ("memory.current", current),
+                ("memory.swap.current", swap),
+            ] {
+                fs::write(root.join(group).join(name), value.to_string()).unwrap();
+            }
+            fs::write(root.join(group).join("memory.stat"), "swapcached 0\n").unwrap();
+        }
+        let policy = return_policy();
+        let mut ledger = HostLedger::new("boot".into());
+        let grant = |id: &str, group: &str| -> crate::host::Reservation {
+            serde_json::from_value(serde_json::json!({
+                "id":id, "domain":"target", "memory_bytes":40, "swap_bytes":20,
+                "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+                "identity":{"cgroup":group, "inode":fs::metadata(root.join(group.trim_start_matches('/'))).unwrap().ino(),
+                    "uid":1000, "pid":42, "start_ticks":7}
+            })).unwrap()
+        };
+        ledger
+            .reservations
+            .push(grant("target", "/parent/target.slice"));
+        ledger
+            .reservations
+            .push(grant("peer", "/parent/peer.slice"));
+        assert!(native_return_safe_at(&root, &ledger, &policy).unwrap());
+        // A peer's unused capacity cannot cover overflow in the target's leaf.
+        fs::write(root.join("parent/target.slice/memory.swap.current"), "21").unwrap();
+        fs::write(root.join("parent/memory.swap.current"), "21").unwrap();
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        fs::write(root.join("parent/target.slice/memory.swap.current"), "20").unwrap();
+        fs::write(root.join("parent/memory.swap.current"), "20").unwrap();
+        fs::write(root.join("parent/memory.max"), "79").unwrap();
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        fs::write(root.join("parent/memory.max"), "100").unwrap();
+        let mut duplicate = ledger.reservations[0].clone();
+        duplicate.id = "duplicate".into();
+        ledger.reservations.push(duplicate);
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        ledger.reservations.pop();
+        ledger.reservations[0].identity.inode += 1;
+        assert!(native_return_safe_at(&root, &ledger, &policy).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

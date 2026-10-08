@@ -5,6 +5,24 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub(crate) fn helper_claim(identity: &Identity, bytes: u64) -> crate::host::Reservation {
+    crate::host::Reservation {
+        id: "swap-recovery".into(),
+        domain: "swap-recovery".into(),
+        identity: identity.clone(),
+        memory_bytes: bytes,
+        swap_bytes: 0,
+        requested_ms: 0,
+        deadline_ms: u64::MAX,
+        granted: true,
+        owners: vec![],
+        owners_finished: false,
+        burst: false,
+        runtime_max_ms: None,
+        continuation: None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryTarget {

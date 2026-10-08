@@ -876,7 +876,8 @@ fn handle_advance_request(
                 return Ok(());
             }
             let capacity = observe(ledger, policy, health_file);
-            let native_safe = crate::swap::native_return_safe(ledger, policy)?;
+            let native_safe =
+                crate::swap::native_return_safe(ledger, policy, &identity, spec.helper_bytes)?;
             reply.waiting = ledger.recovery_wait(
                 policy,
                 capacity,
@@ -960,7 +961,13 @@ fn handle_advance_request(
             let claims = ledger
                 .native_claims(policy, None)
                 .ok_or_else(|| anyhow::anyhow!("completion native backing unavailable"))?;
-            let native_safe = crate::page_return::native_headroom(&target, &claims, bytes)?;
+            let native_safe = crate::page_return::recovery_headroom(
+                &target,
+                &helper,
+                &claims,
+                bytes,
+                spec.helper_bytes,
+            )?;
             let mut eligibility = ledger.clone();
             eligibility.recovery = None;
             reply.waiting = eligibility.page_return_wait(

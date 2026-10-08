@@ -64,7 +64,38 @@ pub fn native_headroom(target: &Identity, claims: &[Reservation], bytes: u64) ->
     native_headroom_at(Path::new("/sys/fs/cgroup"), target, claims, bytes)
 }
 
-fn native_headroom_at(
+pub fn recovery_headroom(
+    target: &Identity,
+    helper: &Identity,
+    claims: &[Reservation],
+    bytes: u64,
+    helper_bytes: u64,
+) -> Result<bool> {
+    recovery_headroom_at(
+        Path::new("/sys/fs/cgroup"),
+        target,
+        helper,
+        claims,
+        bytes,
+        helper_bytes,
+    )
+}
+
+fn recovery_headroom_at(
+    root: &Path,
+    target: &Identity,
+    helper: &Identity,
+    claims: &[Reservation],
+    bytes: u64,
+    helper_bytes: u64,
+) -> Result<bool> {
+    let mut claims = claims.to_vec();
+    claims.push(crate::recovery::helper_claim(helper, helper_bytes));
+    Ok(native_headroom_at(root, helper, &claims, 0)?
+        && native_headroom_at(root, target, &claims, bytes)?)
+}
+
+pub(crate) fn native_headroom_at(
     root: &Path,
     target: &Identity,
     claims: &[Reservation],
@@ -328,6 +359,45 @@ pub fn read_batch(memory: &File, address: u64, bytes: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::host::HostLedger;
+    #[test]
+    fn recovery_backs_helper_growth_under_independent_and_shared_ancestors() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-helper-headroom-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (group, max, current) in [
+            ("target", 40, 20),
+            ("helper-parent", 9, 5),
+            ("helper-parent/helper", 10, 5),
+            ("shared", 49, 25),
+            ("shared/target", 40, 20),
+            ("shared/helper", 10, 5),
+        ] {
+            fs::create_dir_all(root.join(group)).unwrap();
+            fs::write(root.join(group).join("memory.max"), max.to_string()).unwrap();
+            fs::write(root.join(group).join("memory.current"), current.to_string()).unwrap();
+        }
+        let identity = |group: &str, pid| Identity {
+            cgroup: format!("/{group}"),
+            inode: fs::metadata(root.join(group)).unwrap().ino(),
+            uid: 0,
+            pid,
+            start_ticks: 7,
+        };
+        let target = identity("target", 42);
+        let helper = identity("helper-parent/helper", 43);
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        fs::write(root.join("helper-parent/memory.max"), "10").unwrap();
+        assert!(recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        fs::write(root.join("helper-parent/helper/memory.max"), "9").unwrap();
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        let target = identity("shared/target", 42);
+        let helper = identity("shared/helper", 43);
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        fs::write(root.join("shared/memory.max"), "50").unwrap();
+        assert!(recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn charged_target_entitlement_backs_its_own_return_without_crediting_a_peer() {
         let root = std::env::temp_dir().join(format!(
