@@ -420,6 +420,10 @@ impl HostLedger {
                     .all(|k| crate::root_pool::valid_operation_key(k)),
             "invalid root operation ownership"
         );
+        ensure!(
+            serde_json::to_vec(self)?.len() as u64 <= crate::store::MAX_STATE_BYTES,
+            "host ledger exceeds durable snapshot bound"
+        );
         Ok(())
     }
 

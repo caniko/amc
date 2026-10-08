@@ -342,7 +342,7 @@ pub fn serve_supervised(
                     continue;
                 };
                 let before = serde_json::to_vec(&ledger)?;
-                let result = (|| -> Result<Response> {
+                let result = ledger.transaction(|ledger| -> Result<Response> {
                     let mut reply = Response {
                         version: 1,
                         committed_bytes: ledger.committed(),
@@ -356,7 +356,7 @@ pub fn serve_supervised(
                     match request {
                         Request::Status { version } => {
                             ensure!(version == 1, "unsupported host protocol");
-                            populate_status(&mut reply, &ledger, credentials.uid());
+                            populate_status(&mut reply, ledger, credentials.uid());
                         }
                         Request::Acquire {
                             version, wait_ms, ..
@@ -418,7 +418,7 @@ pub fn serve_supervised(
                                             credentials.uid() == 0,
                                             "only root execution owners can nominate an origin"
                                         );
-                                        origin_continuation(origin, &ledger)?
+                                        origin_continuation(origin, ledger)?
                                     }
                                     _ => None,
                                 }
@@ -478,14 +478,14 @@ pub fn serve_supervised(
                                 && !old_owner
                                 && continuation_parent.is_none()
                             {
-                                let capacity = observe(&mut ledger, &policy, health_file);
+                                let capacity = observe(ledger, &policy, health_file);
                                 let d = policy
                                     .domains
                                     .iter()
                                     .find(|d| d.name == domain)
                                     .ok_or_else(|| anyhow::anyhow!("domain disappeared"))?;
                                 reply.waiting = pool_join_wait(
-                                    &ledger,
+                                    ledger,
                                     &policy,
                                     d,
                                     capacity,
@@ -549,14 +549,14 @@ pub fn serve_supervised(
                                 credentials.pid(),
                                 credentials.uid(),
                                 &policy,
-                                &mut ledger,
+                                ledger,
                                 health_file,
                                 &mut reply,
                             )?;
                         }
                     }
                     Ok(reply)
-                })();
+                });
                 if before != serde_json::to_vec(&ledger)? {
                     store.save_snapshot(&ledger)?;
                 }

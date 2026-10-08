@@ -7,6 +7,7 @@ pub mod health;
 pub mod host;
 pub mod host_native;
 pub mod host_server;
+mod host_transaction;
 pub mod ledger;
 pub mod native;
 pub mod page_return;

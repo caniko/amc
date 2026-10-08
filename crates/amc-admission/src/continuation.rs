@@ -319,8 +319,10 @@ impl HostLedger {
             policy: spec.clone(),
             calls: vec![],
         };
-        self.continuations.push(c);
-        Ok(())
+        self.transaction(|candidate| {
+            candidate.continuations.push(c);
+            Ok(())
+        })
     }
 
     pub fn authorize_continuation(
