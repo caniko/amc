@@ -778,7 +778,7 @@ time.sleep(120)
     )
     machine.succeed("grep -q '^/dev/vdb' /proc/swaps")
 
-    machine.succeed(
+    return_code, return_output = machine.execute(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- amc recover-swap"
     )
     # Capture native residency before the target checks its bytes: that probe
@@ -786,6 +786,14 @@ time.sleep(120)
     after_native = json.loads(
         machine.succeed("python3 /etc/page-return-target.py --snapshot")
     )
+    print("page return native result", return_code, json.dumps(after_native))
+    if return_code != 0:
+        machine.sleep(3)
+        print(
+            "page return delayed native result",
+            machine.succeed("python3 /etc/page-return-target.py --snapshot"),
+        )
+    assert return_code == 0, return_output
     assert after_native["returnBytes"] == 0 and after_native["swappedBytes"] == 0, (
         after_native
     )

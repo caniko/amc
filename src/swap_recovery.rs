@@ -135,6 +135,7 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
                 Ok(Some(target)) => target,
                 Ok(None) => continue,
                 Err(_) => {
+                    eprintln!("page return: native target identity or mm is unproven");
                     unproven = true;
                     continue;
                 }
@@ -145,6 +146,7 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
                 Ok(Some(range)) => range,
                 Ok(None) => continue,
                 Err(_) => {
+                    eprintln!("page return: native mapping discovery is unproven");
                     unproven = true;
                     continue;
                 }
@@ -177,7 +179,15 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
             break;
         }
         if !progressed {
-            break;
+            // Small memory.stat updates can remain buffered until the kernel's
+            // periodic rstat flush. An empty PTE scan is not evidence that the
+            // selected subtree's RAM-return obligation has settled. Reobserve
+            // within this campaign's existing deadline, retaining every proof
+            // failure and requiring the actual counter to reach zero.
+            if unproven || amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
         }
     }
     let remaining = amc_admission::page_return::selected_return_bytes(&policy)?;

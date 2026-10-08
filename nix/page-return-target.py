@@ -37,6 +37,41 @@ def snapshot():
         entry = int.from_bytes(entries[offset : offset + 8], sys.byteorder)
         present += bool(entry & (1 << 63))
         swapped += bool(entry & (1 << 62))
+    # Inventory only PTE flags, never read payload bytes. This distinguishes an
+    # accounting tail from swapped pages outside the known disposable mapping.
+    inventory = {"privateReadable": 0, "other": 0}
+    short_reads = scanned = 0
+    mappings = Path(f"/proc/{pid}/maps").read_text().splitlines()
+    assert len(mappings) <= 8192
+    with open(f"/proc/{pid}/pagemap", "rb", buffering=0) as pagemap:
+        for mapping in mappings:
+            fields = mapping.split()
+            first, last = (int(value, 16) for value in fields[0].split("-"))
+            category = (
+                "privateReadable"
+                if fields[1].startswith("r") and fields[1].endswith("p")
+                else "other"
+            )
+            for address in range(first, last, mmap.PAGESIZE * 512):
+                count = min((last - address) // mmap.PAGESIZE, 512)
+                scanned += count
+                assert scanned <= 8388608
+                entries = os.pread(
+                    pagemap.fileno(), count * 8, address // mmap.PAGESIZE * 8
+                )
+                if len(entries) != count * 8:
+                    short_reads += 1
+                    continue
+                inventory[category] += (
+                    sum(
+                        bool(
+                            int.from_bytes(entries[i : i + 8], sys.byteorder)
+                            & (1 << 62)
+                        )
+                        for i in range(0, len(entries), 8)
+                    )
+                    * mmap.PAGESIZE
+                )
     return {
         "swapBytes": after,
         "cachedBytes": cached,
@@ -45,6 +80,8 @@ def snapshot():
         "mappingBytes": size,
         "presentBytes": present * mmap.PAGESIZE,
         "swappedBytes": swapped * mmap.PAGESIZE,
+        "mmSwappedBytes": inventory,
+        "pagemapShortReads": short_reads,
     }
 
 

@@ -63,8 +63,10 @@ pub fn cgroup_usage(directory: &Path) -> Result<SwapUsage> {
             "swapcached",
         )
     };
-    // memory.stat flushes hierarchical rstat counters. Require stable readings
-    // on both sides of each flush; an inconsistent sample inhibits new work.
+    // memory.stat conditionally flushes hierarchical rstat counters; small
+    // updates may await the periodic kernel flush. Stable samples are required,
+    // but do not force that flush. An inconsistent sample inhibits new work;
+    // the recovery campaign waits for outstanding demand to converge to zero.
     for _ in 0..3 {
         let first = current()?;
         let cache = cached()?;
