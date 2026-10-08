@@ -116,7 +116,7 @@ cooldown deferral. Passing Rust fixtures alone does not qualify native rollout.
 
 Optional `preparations` profiles specify a non-root slice domain, native
 memory/swap ceilings, `drain_domains`, a bounded `wait_ms` and a short `ready_ms`.
-The flake and package export `admissionPreparationVersion = 1`.
+The flake and package export `admissionPreparationVersion = 2`.
 
 ```sh
 amc prepare --profile game -- game-command args
