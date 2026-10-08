@@ -35,7 +35,9 @@ impl PreparationProfile {
                 && self.memory_bytes <= domain.ceiling_bytes
                 && self.swap_bytes <= domain.swap_bytes
                 && (1000..=3_600_000).contains(&self.wait_ms)
-                && (1000..=60_000).contains(&self.ready_ms)
+                // Polling, the five-second bus call and five-second placement
+                // check must fit before the once-only native transfer expires.
+                && (15_000..=60_000).contains(&self.ready_ms)
                 && self.drain_domains.len() <= policy.domains.len()
                 && self
                     .drain_domains
@@ -144,7 +146,16 @@ impl HostLedger {
             .reservations
             .iter()
             .filter(|r| {
-                (r.granted || self.is_continuation(r)) && spec.drain_domains.contains(&r.domain)
+                let operation = r.continuation.as_deref().unwrap_or(&r.id);
+                (r.granted || self.is_continuation(r))
+                    && (spec.drain_domains.contains(&r.domain)
+                        || self.continuations.iter().any(|c| {
+                            c.capability.parent == operation
+                                && c.policy
+                                    .domains
+                                    .iter()
+                                    .any(|domain| spec.drain_domains.contains(domain))
+                        }))
             })
             .map(|r| r.continuation.clone().unwrap_or_else(|| r.id.clone()))
             .collect::<std::collections::BTreeSet<_>>()

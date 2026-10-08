@@ -16,7 +16,7 @@ fn policy() -> HostPolicy {
         ],
         "preparations":[{"name":"game", "domain":"game", "memory_bytes":40,
             "swap_bytes":0, "drain_domains":["work", "builders"],
-            "wait_ms":10000, "ready_ms":1000}],
+            "wait_ms":10000, "ready_ms":15000}],
         "reserve_swap_return":true
     }))
     .unwrap()
@@ -86,6 +86,19 @@ fn preparation_closes_admission_before_readiness_and_preserves_live_work() {
 }
 
 #[test]
+fn preparation_ready_windows_cover_the_bounded_native_registration_path() {
+    let mut p = policy();
+    p.preparations[0].ready_ms = 1000;
+    assert!(p.validate().is_err());
+    p.preparations[0].ready_ms = 15000;
+    p.validate().unwrap();
+    p.preparations[0].ready_ms = 60000;
+    p.validate().unwrap();
+    p.preparations[0].ready_ms = 60001;
+    assert!(p.validate().is_err());
+}
+
+#[test]
 fn ready_transfer_is_once_only_and_unknown_cleanup_survives_restart_and_expiry() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());
@@ -135,7 +148,7 @@ fn cancellation_and_ready_expiry_do_not_remove_another_intents_barrier() {
     assert!(l.preparation_barrier());
     advance(&mut l, &p, 500);
     assert_eq!(l.committed(), 40);
-    advance(&mut l, &p, 1500);
+    advance(&mut l, &p, 500 + p.preparations[0].ready_ms);
     assert!(!l.preparation_barrier());
     assert_eq!(l.committed(), 0);
 }
@@ -150,6 +163,58 @@ fn swap_returns_get_ram_before_new_admissions_and_unknown_observations_block() {
     assert_eq!(advance(&mut l, &p, 500)["new"], WaitReason::SwapReturn);
     l.swap_return_bytes = Some(0);
     advance(&mut l, &p, 750);
+    assert_eq!(l.committed(), 40);
+}
+
+#[test]
+fn a_drain_includes_live_parents_that_can_still_launch_selected_completion_children() {
+    use amc_admission::continuation::ContinuationPolicy;
+    let mut p = policy();
+    let mut parent_domain = p.domains[0].clone();
+    parent_domain.name = "parent".into();
+    parent_domain.cgroup = "/parent.slice".into();
+    parent_domain.continuation = Some(ContinuationPolicy {
+        parent_max_bytes: 20,
+        memory_bytes: 20,
+        swap_bytes: 0,
+        max_calls: 1,
+        domains: vec!["work".into()],
+    });
+    p.domains.push(parent_domain);
+    p.validate().unwrap();
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    l.request(job("parent", "parent", 1000, 20), &p).unwrap();
+    l.advance(
+        250,
+        &p,
+        capacity(),
+        &mut BTreeMap::from([("parent".into(), 0)]),
+        |_, _| Some(200),
+    );
+    assert!(l.reservations[0].granted);
+    let cap = l.continuation_capability("parent", &p).unwrap().unwrap();
+    l.prepare("intent".into(), "key".into(), 1000, "game", 550, &p)
+        .unwrap();
+    advance(&mut l, &p, 750);
+    assert_eq!(l.preparations[0].phase, PreparationPhase::Draining);
+    assert_eq!(l.preparations[0].drain, vec!["parent"]);
+
+    let mut child = job("child", "work", 1000, 20);
+    child.continuation = Some(
+        l.authorize_continuation(&cap, 1000, "work", 20, 0, "child")
+            .unwrap(),
+    );
+    l.request(child, &p).unwrap();
+    l.reconcile(|r| Some(r.id == "parent"));
+    let mut l: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+    l.validate().unwrap();
+    advance(&mut l, &p, 1000);
+    assert!(l.reservations[0].granted);
+    assert_eq!(l.preparations[0].phase, PreparationPhase::Draining);
+    l.reconcile(|_| Some(true));
+    advance(&mut l, &p, 1250);
+    assert_eq!(l.preparations[0].phase, PreparationPhase::Ready);
     assert_eq!(l.committed(), 40);
 }
 

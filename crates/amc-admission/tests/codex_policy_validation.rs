@@ -41,7 +41,7 @@ fn preparation_rejects_a_target_whose_completion_rights_it_cannot_mint() {
                  "swap_bytes":0, "max_calls":8, "domains":["work"]}}
         ],
         "preparations":[{"name":"game", "domain":"game", "memory_bytes":40,
-            "swap_bytes":0, "drain_domains":["work"], "wait_ms":10000, "ready_ms":1000}]
+            "swap_bytes":0, "drain_domains":["work"], "wait_ms":10000, "ready_ms":15000}]
     }))
     .unwrap();
     let profile = policy.preparations.pop().unwrap();
