@@ -127,6 +127,19 @@ This managed-execution path requires the host user-manager session bus and
 host-visible executable/working-directory paths. `amc prepare` instead registers
 the waiting payload in a host-native scope and preserves its namespaces.
 
+Shared namespace execution additionally requires `namespace_runner_bytes`
+(64 MiB–1 GiB per enrolled non-root UID). All of a user's host runners share
+`app-amchostrunner.slice` at that exact aggregate RAM ceiling and zero swap;
+individual services retain their 64 MiB cap. The host module creates the slice.
+Policy validation requires the sum of these aggregate envelopes to fit inside
+`reserve_bytes`. Native projections back them in finite ancestors, including
+while runners wait, and the runner authenticates this allowance with the broker
+before submitting the inner shared job. They are static maintenance backing,
+so preparations do not wait for a runner that is itself waiting for admission.
+Host status reports `namespace_runner_reserved_bytes`; consumers can require
+`lib.admissionNamespaceRunnerVersion = 1`. Without an allowance, shared
+namespace execution fails before payload submission.
+
 ```sh
 amc prepare --profile game -- game-command args
 ```
@@ -213,8 +226,8 @@ that memcg is offline, the direct fault path can use the target mm, but
 memcg. For a remote `/proc/PID/mem` read, that is the finite recovery helper.
 A frozen cgroup can still be migrated. A swapped PTE does not expose its charge
 owner to this userspace API, and a single mm can contain mixed-origin pages.
-Consequently each batch conservatively checks every online cgroup with swap
-charges, plus both the current target and reader fallbacks, against their native
+Consequently each batch conservatively checks every online cgroup with stable
+nonresident swap demand, plus both the current target and reader fallbacks, against their native
 ancestors and commitments. This can wait for an unrelated charged domain to
 gain headroom; it cannot borrow the destination grant to cover another owner.
 The native VM requires separate proofs of online original charging, frozen
@@ -230,6 +243,14 @@ an incomplete inventory rejects acquisition without faulting pages. Root recover
 acquisition RPCs allow 30 seconds so a complete wide scan is not discarded at
 the ordinary two-second program-call deadline. Device inventory also has a
 20-second deadline, within the same maintenance RPC budget.
+
+Recovery acquisition requires the configured service's current MainPID,
+`Restart=no`, and `KillMode=control-group`. Leases retain its trusted systemd
+InvocationID. Same-invocation descendants and missing manager observations keep
+backing after the helper dies. A replacement cannot pin the old lease: once the
+recorded PID/start identity is positively dead, a different verified invocation
+proves the previous control-group invocation was stopped. Legacy leases without
+invocation evidence retain empty-boundary-only cleanup.
 
 Discovery keeps private, locked, atomically saved hints in
 `/var/lib/amc-page-return` (`--state` overrides the directory). Campaigns resume

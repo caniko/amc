@@ -318,6 +318,19 @@ fn run(
         },
     )?;
     let host_socket = response.host_socket;
+    if let Some(host_socket) = &host_socket
+        && let Err(error) = crate::native_start::verify_host_runner(host_socket)
+    {
+        if let Some(entry) = &response.entry {
+            let _ = call(
+                socket,
+                Message::Cancel {
+                    id: entry.id.clone(),
+                },
+            );
+        }
+        return Err(error);
+    }
     let entry_key = response
         .entry_key
         .ok_or_else(|| anyhow::anyhow!("missing admission entry capability"))?;

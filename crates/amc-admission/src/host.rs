@@ -26,6 +26,9 @@ pub struct HostPolicy {
     pub reserve_swap_return: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_recovery: Option<crate::recovery::RecoveryPolicy>,
+    /// Per-user aggregate namespace-runner envelope, backed by reserve_bytes.
+    #[serde(default)]
+    pub namespace_runner_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -90,6 +93,7 @@ pub enum IoPressure {
 
 impl HostPolicy {
     pub fn validate(&self) -> Result<()> {
+        crate::namespace_runner::validate(self)?;
         ensure!(
             self.version == 1 && self.budget_bytes > 0 && self.reserve_bytes > 0,
             "invalid host budget"

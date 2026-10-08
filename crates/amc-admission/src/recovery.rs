@@ -106,6 +106,9 @@ pub fn validate_targets(targets: &[RecoveryTarget]) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryLease {
     pub identity: Identity,
+    /// Trusted manager identity; legacy leases retain conservative empty-only cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     pub action: RecoveryAction,
     /// Full device size backs additional swapout by already-running workloads.
     pub return_bytes: u64,
@@ -133,6 +136,12 @@ pub enum RecoveryAction {
 impl RecoveryLease {
     pub fn validate(&self) -> Result<()> {
         crate::native::cgroup_directory(&self.identity.cgroup)?;
+        ensure!(
+            self.invocation_id.as_ref().is_none_or(|id| id.len() == 32
+                && id.bytes().all(|b| b.is_ascii_hexdigit())
+                && id.bytes().any(|b| b != b'0')),
+            "invalid recovery invocation identity"
+        );
         ensure!(
             self.identity.uid == 0
                 && self.identity.pid > 0

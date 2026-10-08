@@ -25,6 +25,14 @@ in {
   };
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
+    systemd.user.slices.app-amchostrunner = lib.mkIf ((cfg.policy.namespace_runner_bytes or 0) > 0) {
+      wantedBy = ["default.target"];
+      sliceConfig = {
+        MemoryAccounting = true;
+        MemoryMax = cfg.policy.namespace_runner_bytes;
+        MemorySwapMax = 0;
+      };
+    };
     systemd.services.amc-host-admission = {
       description = "AMC atomic host capacity reservations";
       wantedBy = ["multi-user.target"];

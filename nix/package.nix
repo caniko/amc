@@ -40,6 +40,7 @@ rustPlatform.buildRustPackage {
   passthru.admissionSizingVersion = 1;
   passthru.admissionPreparationVersion = 2;
   passthru.admissionContinuationEnvelopesVersion = 1;
+  passthru.admissionNamespaceRunnerVersion = 1;
   passthru.swapReturnReservationVersion = 2;
   passthru.swapRestorationManifestVersion = 1;
   nativeBuildInputs = [makeWrapper python3];

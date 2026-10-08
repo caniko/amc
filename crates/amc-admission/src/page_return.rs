@@ -145,10 +145,9 @@ fn charge_owner_headroom_with_budget_at(
         );
         *remaining -= 1;
         if directory != root && directory.join("memory.swap.current").exists() {
-            let swap: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
-                .trim()
-                .parse()?;
-            if swap > 0 {
+            // Occupied slots already resident in swap cache need no new RAM.
+            // Require the same stable accounting proof as device recovery.
+            if crate::swap::cgroup_usage(directory)?.return_bytes() > 0 {
                 let owner = Identity {
                     uid: 0,
                     pid: 0,
@@ -383,6 +382,30 @@ mod tests {
     use super::*;
     use crate::host::HostLedger;
     #[test]
+    fn resident_swap_cache_owners_do_not_need_additional_return_headroom() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-cached-owner-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let owner = root.join("owner");
+        fs::create_dir_all(&owner).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "10"),
+            ("memory.swap.current", "8"),
+            ("memory.stat", "swapcached 8\n"),
+        ] {
+            fs::write(owner.join(name), value).unwrap();
+        }
+        assert!(charge_owner_headroom_at(&root, &[], 2).unwrap());
+        fs::write(owner.join("memory.stat"), "swapcached 7\n").unwrap();
+        assert!(!charge_owner_headroom_at(&root, &[], 2).unwrap());
+        fs::write(owner.join("memory.stat"), "swapcached 9\n").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn charge_owner_scan_does_not_truncate_a_wide_native_hierarchy() {
         let root = std::env::temp_dir().join(format!(
             "amc-wide-owner-{}",
@@ -398,6 +421,7 @@ mod tests {
             ("memory.max", "10"),
             ("memory.current", "10"),
             ("memory.swap.current", "1"),
+            ("memory.stat", "swapcached 0\n"),
         ] {
             fs::write(owner.join(name), value).unwrap();
         }
@@ -489,6 +513,7 @@ mod tests {
             ] {
                 fs::write(root.join(group).join(name), value.to_string()).unwrap();
             }
+            fs::write(root.join(group).join("memory.stat"), "swapcached 0\n").unwrap();
         }
         let id = |name: &str, pid| Identity {
             cgroup: format!("/{name}"),

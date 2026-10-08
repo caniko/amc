@@ -212,6 +212,7 @@ impl HostLedger {
         child: Option<&Reservation>,
     ) -> Option<Vec<Reservation>> {
         let mut claims = self.reservations.clone();
+        claims.extend(crate::namespace_runner::claims(policy));
         for preparation in self
             .preparations
             .iter()

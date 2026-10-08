@@ -18,6 +18,7 @@ ALLOWED = {
 }
 NATIVE_CASES = {
     "rapid native and admitted jobs preserve completion and fail closed on startup loss",
+    "namespace runners share a host-reserve-backed aggregate ceiling",
     "durable root pool tracks every potential execution owner",
     "helper cannot omit host capacity before private entry",
     "simultaneous users, restart persistence, and automatic lending",
@@ -73,6 +74,17 @@ def verify_foreground_evidence(path):
     completion = receipt.get("completion", {})
     namespaces = receipt.get("nativeNamespaceCompletion", {})
     charge = receipt.get("chargeOwner", {})
+    runners = receipt.get("namespaceRunnerBacking", {})
+    if (runners.get("aggregateBytesPerUser") != 64 * 1048576
+        or runners.get("reservedBytes") != 128 * 1048576
+        or runners.get("concurrentRunners") != 2
+        or runners.get("innerCommittedBytes") != 64 * 1048576
+        or runners.get("restartPreserved") is not True
+        or runners.get("changedCeilingDenied") is not True):
+        raise RuntimeError("Native namespace runners lack aggregate host/native backing")
+    if (page.get("replacementInvocationReclaimed") is not True
+        or page.get("replacementBatchBytes") != 2 * 1048576):
+        raise RuntimeError("Native recovery lacks replacement-invocation reclamation")
     if (
         charge.get("schemaVersion") != 2
         or not charge.get("kernel")

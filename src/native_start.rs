@@ -120,6 +120,7 @@ fn host_command(
     ]);
     command.arg(format!("--unit={unit}"));
     for property in [
+        "Slice=app-amchostrunner.slice",
         "MemoryMax=67108864",
         "MemorySwapMax=0",
         "MemoryAccounting=yes",
@@ -157,6 +158,25 @@ fn host_command(
     command.arg(format!("--setenv=DBUS_SESSION_BUS_ADDRESS={address}"));
     command.arg("--").arg(executable).args(arguments);
     Ok(command)
+}
+
+pub fn verify_host_runner(socket: &Path) -> Result<()> {
+    let placement = std::fs::read_to_string("/proc/self/cgroup")?;
+    if placement.lines().any(|line| {
+        line.rsplit('/').next().is_some_and(|leaf| {
+            leaf.starts_with("app-amc-host-runner-") && leaf.ends_with(".service")
+        })
+    }) {
+        ensure!(
+            amc_admission::host_server::call(
+                socket,
+                &amc_admission::host_server::Request::NamespaceRunner { version: 1 }
+            )?
+            .granted,
+            "namespace runner has no backed aggregate allowance"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -243,6 +263,7 @@ mod tests {
             "--expand-environment=no",
             "--property=MemoryMax=67108864",
             "--property=MemorySwapMax=0",
+            "--property=Slice=app-amchostrunner.slice",
             "--property=Restart=no",
             "--property=KillMode=control-group",
         ] {

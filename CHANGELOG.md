@@ -32,6 +32,11 @@
 
 ### Fixed
 
+- Back all waited namespace runners with one finite, host-reserved aggregate
+  slice per user before shared payload admission.
+- Exclude proven resident swap-cache-only owners from additional return demand.
+- Bind recovery leases to native service invocations so replacements cannot
+  hide dead helpers, while surviving descendants retain backing.
 - Resume bounded discovery without treating an interrupted scan prefix as proof
   of current residency; back original swap owners and the remote reader fallback.
 - Give complete charge-owner inventories a bounded maintenance RPC window and

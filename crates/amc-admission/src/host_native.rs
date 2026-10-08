@@ -301,6 +301,87 @@ pub fn owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
     }
 }
 
+fn recovery_unit(identity: &Identity) -> Result<String> {
+    let unit = Path::new(&identity.cgroup)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("missing recovery unit")?;
+    ensure!(
+        unit.ends_with(".service"),
+        "recovery requires a native service boundary"
+    );
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "--property=ControlGroup,MainPID,Restart,KillMode,InvocationID",
+            "--",
+            unit,
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "recovery manager observation unavailable"
+    );
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn verified_recovery_unit(text: &str, cgroup: &str) -> Result<(i32, String)> {
+    let fields: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let get = |key| fields.get(key).copied().unwrap_or("");
+    let invocation = get("InvocationID");
+    ensure!(
+        get("ControlGroup") == cgroup
+            && get("Restart") == "no"
+            && get("KillMode") == "control-group"
+            && invocation.len() == 32
+            && invocation.bytes().all(|b| b.is_ascii_hexdigit())
+            && invocation.bytes().any(|b| b != b'0'),
+        "recovery requires a non-restarting, invocation-bound control-group service"
+    );
+    let pid: i32 = get("MainPID").parse()?;
+    ensure!(pid > 0, "recovery service has no main process");
+    Ok((pid, invocation.into()))
+}
+
+pub fn recovery_invocation(identity: &Identity) -> Result<String> {
+    let (pid, invocation) = verified_recovery_unit(&recovery_unit(identity)?, &identity.cgroup)?;
+    ensure!(
+        pid == identity.pid && process_start(pid)? == identity.start_ticks,
+        "recovery peer is not the current native main process"
+    );
+    Ok(invocation)
+}
+
+/// A new systemd invocation of a KillMode=control-group service starts only
+/// after the previous invocation's processes have been stopped. Same-invocation
+/// descendants, legacy leases and unavailable observations remain charged.
+pub fn recovery_replaced(lease: &crate::recovery::RecoveryLease) -> Option<bool> {
+    recovery_replaced_at(
+        lease,
+        &recovery_unit(&lease.identity).ok()?,
+        owner_alive(&crate::ledger::ClientIdentity {
+            pid: lease.identity.pid,
+            start_ticks: lease.identity.start_ticks,
+        }),
+    )
+}
+
+fn recovery_replaced_at(
+    lease: &crate::recovery::RecoveryLease,
+    text: &str,
+    alive: Option<bool>,
+) -> Option<bool> {
+    let previous = lease.invocation_id.as_ref()?;
+    if alive != Some(false) {
+        return Some(false);
+    }
+    let (_, current) = verified_recovery_unit(text, &lease.identity.cgroup).ok()?;
+    Some(&current != previous)
+}
+
 pub fn identify_pool(
     pid: i32,
     uid: u32,
@@ -477,6 +558,48 @@ fn psi(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_recovery_invocation_cannot_hide_a_dead_helper_or_release_descendants() {
+        let lease: crate::recovery::RecoveryLease = serde_json::from_value(serde_json::json!({
+            "identity":{"cgroup":"/system.slice/return.service","inode":1,"uid":0,"pid":42,"start_ticks":7},
+            "invocation_id":"11111111111111111111111111111111",
+            "action":{"kind":"device","target":{"name":"swap","path":"/dev/swap","priority":10},"before_used_bytes":1},
+            "helper_bytes":10,"return_bytes":100
+        })).unwrap();
+        let same = "ControlGroup=/system.slice/return.service\nMainPID=43\nRestart=no\nKillMode=control-group\nInvocationID=11111111111111111111111111111111\n";
+        let replacement = same.replace(
+            "InvocationID=11111111111111111111111111111111",
+            "InvocationID=22222222222222222222222222222222",
+        );
+        assert_eq!(recovery_replaced_at(&lease, same, Some(false)), Some(false));
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, None),
+            Some(false)
+        );
+        for invalid in [
+            replacement.replace("Restart=no", "Restart=always"),
+            replacement.replace("KillMode=control-group", "KillMode=process"),
+            replacement.replace("MainPID=43", "MainPID=0"),
+            replacement.replace("/system.slice/return.service", "/foreign.service"),
+        ] {
+            assert_eq!(recovery_replaced_at(&lease, &invalid, Some(false)), None);
+        }
+        let mut legacy = lease.clone();
+        legacy.invocation_id = None;
+        assert_eq!(
+            recovery_replaced_at(&legacy, &replacement, Some(false)),
+            None
+        );
+    }
 
     #[test]
     fn full_native_completion_envelope_covers_its_residual_charge_but_not_siblings() {

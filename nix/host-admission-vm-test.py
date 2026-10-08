@@ -144,6 +144,48 @@ with test_section(
     evidence["nativeNamespaceCompletion"] = namespace_jobs
     wait_committed(0)
 
+with test_section("namespace runners share a host-reserve-backed aggregate ceiling"):
+    for number in [1, 2]:
+        machine.succeed(
+            f"systemd-run --unit=namespace-held-{number} --uid=1000 "
+            "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+            "bwrap --bind / / --dev /dev --proc /proc --unshare-pid -- "
+            "amc admission exec --contract small --timeout 60 -- /bin/sh -c "
+            + shlex.quote(f"touch /tmp/namespace-held-{number}-entered; sleep 120")
+        )
+        wait_entered(f"namespace-held-{number}", client_unit=f"namespace-held-{number}")
+    runner_group = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-amchostrunner.slice"
+    machine.succeed(
+        f'test "$(cat {runner_group}/memory.max)" = 67108864; '
+        f'test "$(cat {runner_group}/memory.swap.max)" = 0; '
+        f'test "$(find {runner_group} -mindepth 1 -maxdepth 1 -type d | wc -l)" = 2'
+    )
+    held = status()
+    assert held["namespace_runner_reserved_bytes"] == 128 * 1048576, held
+    assert held["committed_bytes"] == 64 * 1048576, held
+    machine.succeed("systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    assert status()["namespace_runner_reserved_bytes"] == held["namespace_runner_reserved_bytes"]
+    # Damage the aggregate cap: even an otherwise fitting ordinary payload waits.
+    machine.succeed(f"echo 100663296 > {runner_group}/memory.max")
+    launch("runner-cap-denied", 1001, "small", "touch /tmp/runner-cap-denied-entered; sleep 120")
+    machine.succeed("sleep 1")
+    machine.fail("test -e /tmp/runner-cap-denied-entered")
+    machine.succeed(f"echo 67108864 > {runner_group}/memory.max")
+    wait_entered("runner-cap-denied")
+    evidence["namespaceRunnerBacking"] = {
+        "aggregateBytesPerUser": 64 * 1048576,
+        "reservedBytes": held["namespace_runner_reserved_bytes"],
+        "concurrentRunners": 2,
+        "innerCommittedBytes": held["committed_bytes"],
+        "restartPreserved": True,
+        "changedCeilingDenied": True,
+    }
+    machine.succeed("systemctl stop namespace-held-1 namespace-held-2 runner-cap-denied-client")
+    for grant in status()["reservations"]:
+        stop_scope(grant)
+    wait_committed(0)
+
 with test_section("durable root pool tracks every potential execution owner"):
     # Owners are outside this empty bounded slice, just like Nix's handlers.
     write_file(
@@ -767,6 +809,11 @@ except OSError as error:
     # A cancelled campaign that has acquired, but has not read, a batch retains
     # its claim across broker restart until the helper's native group is empty.
     interrupted = """import json, os, socket, time
+from pathlib import Path
+if Path('/tmp/page-return-replace').exists():
+    Path('/tmp/page-return-replacement-ready').touch()
+    while not Path('/tmp/page-return-replacement-proceed').exists():
+        time.sleep(.1)
 target = json.load(open('/tmp/page-target-range.json'))
 stat = open('/proc/%s/stat' % target['pid']).read().rsplit(') ', 1)[1].split()
 request = {'op':'acquire_page_return','version':1,'pid':target['pid'],'start_ticks':int(stat[19]),'address':target['address'],'bytes':2097152}
@@ -791,6 +838,22 @@ time.sleep(120)
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
     assert status()["recovery"]["return_bytes"] == 2097152
+    previous_lease = status()["recovery"]
+    # The broker misses the old invocation's empty interval completely.
+    machine.succeed("systemctl stop amc-host-admission; rm /tmp/page-return-held; touch /tmp/page-return-replace; systemctl restart page-return")
+    machine.wait_until_succeeds("test -e /tmp/page-return-replacement-ready", timeout=30)
+    replacement_invocation = machine.succeed("systemctl show page-return --property=InvocationID --value").strip()
+    assert replacement_invocation != previous_lease["invocation_id"]
+    machine.succeed("systemctl start amc-host-admission")
+    machine.wait_until_succeeds(
+        "amc admission host-status | python3 -c " + shlex.quote(
+            'import sys,json; assert json.load(sys.stdin).get("recovery") is None'), timeout=30)
+    machine.succeed("touch /tmp/page-return-replacement-proceed")
+    machine.wait_until_succeeds("test -e /tmp/page-return-held", timeout=30)
+    replacement_lease = status()["recovery"]
+    assert replacement_lease["invocation_id"] == replacement_invocation
+    assert replacement_lease["identity"]["pid"] != previous_lease["identity"]["pid"]
+    assert replacement_lease["return_bytes"] == 2097152
     machine.succeed("systemctl stop page-return")
     machine.wait_until_succeeds(
         "amc admission host-status | python3 -c "
@@ -838,6 +901,8 @@ time.sleep(120)
         "waitExitCode": 75,
         "interruptedBatchBytes": 2097152,
         "unreadBatchSettlementDenied": True,
+        "replacementInvocationReclaimed": True,
+        "replacementBatchBytes": replacement_lease["return_bytes"],
     }
     machine.succeed(
         "grep -q '^/dev/vdb' /proc/swaps; systemctl is-active page-target.service"

@@ -9,6 +9,7 @@ pub mod host_native;
 pub mod host_server;
 mod host_transaction;
 pub mod ledger;
+pub mod namespace_runner;
 pub mod native;
 pub mod page_discovery;
 pub mod page_return;

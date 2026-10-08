@@ -53,7 +53,8 @@ in
         policy = {
           version = 1;
           budget_bytes = 160 * mib;
-          reserve_bytes = 64 * mib;
+          reserve_bytes = 128 * mib;
+          namespace_runner_bytes = 64 * mib;
           swap_reserve_bytes = 0;
           max_memory_full_psi = 100.0;
           max_io_full_psi = 100.0;

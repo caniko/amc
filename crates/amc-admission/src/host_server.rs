@@ -23,6 +23,9 @@ use std::{
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    NamespaceRunner {
+        version: u32,
+    },
     Acquire {
         version: u32,
         wait_ms: u64,
@@ -97,6 +100,8 @@ pub struct Response {
     pub committed_bytes: u64,
     #[serde(default)]
     pub budget_bytes: u64,
+    #[serde(default)]
+    pub namespace_runner_reserved_bytes: u64,
     #[serde(default)]
     pub burst_budget_bytes: u64,
     #[serde(default)]
@@ -357,6 +362,10 @@ pub fn serve_supervised(
                         version: 1,
                         committed_bytes: ledger.committed(),
                         budget_bytes: policy.budget_bytes,
+                        namespace_runner_reserved_bytes: crate::namespace_runner::claims(&policy)
+                            .iter()
+                            .map(|r| r.memory_bytes)
+                            .sum(),
                         burst_budget_bytes: policy.burst.as_ref().map_or(0, |b| b.budget_bytes),
                         burst_committed_bytes: ledger.burst_committed(),
                         swap_return_bytes: ledger.swap_return_bytes,
@@ -436,6 +445,23 @@ pub fn serve_supervised(
                             } else {
                                 request_id.clone()
                             };
+                            // A fresh ordinary serial is waiting behind this
+                            // drain/recovery, even if the surviving pool still
+                            // belongs to a completed continuation parent. Check
+                            // its barrier before incompatible-parent lane lookup.
+                            if credentials.uid() == 0
+                                && !old_owner
+                                && continuation.is_none()
+                                && existing.is_some()
+                                && (ledger.preparation_barrier() || ledger.recovery.is_some())
+                            {
+                                reply.waiting = Some(if ledger.recovery.is_some() {
+                                    WaitReason::Recovery
+                                } else {
+                                    WaitReason::Preparation
+                                });
+                                return Ok(reply);
+                            }
                             let CompletionAdmission::Parent(continuation_parent) =
                                 acquire_completion(
                                     ledger,
@@ -679,11 +705,12 @@ fn observe(
     if policy.reserve_swap_return {
         ledger.swap_return_bytes = crate::swap::return_bytes(ledger).ok();
     }
-    if ledger
-        .reservations
-        .iter()
-        .filter(|r| r.granted)
-        .all(|r| host_native::enforcement(r).is_some())
+    if crate::namespace_runner::enforcement(policy) == Some(true)
+        && ledger
+            .reservations
+            .iter()
+            .filter(|r| r.granted)
+            .all(|r| host_native::enforcement(r).is_some())
     {
         host_native::capacity().ok().filter(|_| {
             health_file.is_none_or(|path| crate::health::permits(path).unwrap_or(false))
@@ -715,7 +742,9 @@ fn reconcile_recovery(ledger: &mut HostLedger) {
         continuation: None,
         owners_finished: false,
     };
-    if host_native::empty_reservation(&reservation) == Some(true) {
+    if host_native::empty_reservation(&reservation) == Some(true)
+        || host_native::recovery_replaced(lease) == Some(true)
+    {
         ledger.recovery = None;
     }
 }
@@ -732,6 +761,14 @@ fn handle_advance_request(
     use crate::preparation::PreparationPhase;
     let now = crate::clock::boot_ms()?;
     match request {
+        Request::NamespaceRunner { version } => {
+            ensure!(version == 1, "unsupported host protocol");
+            let claims = ledger
+                .native_claims(policy, None)
+                .ok_or_else(|| anyhow::anyhow!("namespace runner backing unavailable"))?;
+            crate::namespace_runner::verify(pid, uid, policy, &claims)?;
+            reply.granted = true;
+        }
         Request::Prepare {
             version,
             id,
@@ -878,6 +915,7 @@ fn handle_advance_request(
                 .find(|t| t.name == target)
                 .ok_or_else(|| anyhow::anyhow!("unknown recovery target"))?;
             let identity = crate::swap::helper(pid, spec)?;
+            let invocation_id = host_native::recovery_invocation(&identity)?;
             if let Some(lease) = &ledger.recovery {
                 ensure!(
                     lease.identity == identity
@@ -909,6 +947,7 @@ fn handle_advance_request(
                 target.path = device.path.to_string_lossy().into_owned();
                 ledger.recovery = Some(crate::recovery::RecoveryLease {
                     identity,
+                    invocation_id: Some(invocation_id),
                     action: crate::recovery::RecoveryAction::Device {
                         target,
                         before_used_bytes: device.used_bytes,
@@ -933,6 +972,7 @@ fn handle_advance_request(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
             let helper = crate::swap::helper(pid, spec)?;
+            let invocation_id = host_native::recovery_invocation(&helper)?;
             let target = crate::page_return::identity(target_pid, start_ticks, spec)?;
             let page = crate::page_return::page_size()?;
             ensure!(
@@ -997,6 +1037,7 @@ fn handle_advance_request(
             if reply.waiting.is_none() {
                 ledger.recovery = Some(crate::recovery::RecoveryLease {
                     identity: helper,
+                    invocation_id: Some(invocation_id),
                     action: crate::recovery::RecoveryAction::Pages {
                         target,
                         address,

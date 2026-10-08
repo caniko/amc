@@ -106,6 +106,7 @@ fn policy() -> HostPolicy {
         preparations: vec![],
         reserve_swap_return: false,
         swap_recovery: None,
+        namespace_runner_bytes: 0,
         version: 1,
         budget_bytes: 80,
         reserve_bytes: 20,
