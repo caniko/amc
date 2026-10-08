@@ -217,6 +217,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
                                 layout: page_discovery::layout(pid)?,
                                 maps_offset: 0,
                                 address: 0,
+                                maps_fingerprint: None,
                             })
                         })() {
                             Ok(cursor) => {

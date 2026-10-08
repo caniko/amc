@@ -5,10 +5,11 @@
 use crate::{host::Identity, page_return, recovery::RecoveryPolicy};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     os::unix::fs::FileExt,
     path::Path,
 };
@@ -21,6 +22,9 @@ pub struct ProcessCursor {
     pub layout: String,
     pub maps_offset: u64,
     pub address: u64,
+    /// Exact maps-stream digest. Old snapshots must rescan their entire prefix.
+    #[serde(default)]
+    pub maps_fingerprint: Option<[u8; 32]>,
 }
 
 impl ProcessCursor {
@@ -31,6 +35,7 @@ impl ProcessCursor {
                 layout,
                 maps_offset: 0,
                 address: 0,
+                maps_fingerprint: None,
             };
         }
     }
@@ -180,12 +185,24 @@ pub enum Scan {
     Complete,
 }
 
-/// The maps byte offset is only a restart hint. Churn at that position can
-/// invalidate it; reset without faulting and revisit on this or a later sweep.
+/// Byte offsets apply only to the exact mapping snapshot that produced them.
+/// mmap/munmap changes reset the entire process frontier before any resume.
 /// A found range stays at its first page until the caller proves settlement.
 pub fn scan(cursor: &mut ProcessCursor, pagemap: &File, bound: u64) -> Result<Scan> {
     let maps = File::open(format!("/proc/{}/maps", cursor.target.pid))?;
     scan_at(cursor, maps, pagemap, bound, 8192, 8_388_608)
+}
+
+fn mapping_snapshot(mut maps: File) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    maps.seek(SeekFrom::Start(0))?;
+    let mut snapshot = Vec::new();
+    maps.take(LIMIT + 1).read_to_end(&mut snapshot)?;
+    ensure!(
+        snapshot.len() as u64 <= LIMIT,
+        "native mapping snapshot exceeds bound"
+    );
+    Ok(snapshot)
 }
 
 fn scan_at(
@@ -201,7 +218,15 @@ fn scan_at(
         bound >= page && bound <= 16 * 1024 * 1024,
         "invalid discovery batch"
     );
-    let mut maps = BufReader::new(maps);
+    let source = maps.try_clone()?;
+    let snapshot = mapping_snapshot(maps)?;
+    let fingerprint: [u8; 32] = Sha256::digest(&snapshot).into();
+    if cursor.maps_fingerprint != Some(fingerprint) {
+        cursor.maps_offset = 0;
+        cursor.address = 0;
+        cursor.maps_fingerprint = Some(fingerprint);
+    }
+    let mut maps = BufReader::new(Cursor::new(snapshot));
     maps.seek(SeekFrom::Start(cursor.maps_offset))?;
     let mut entries = [0u8; 4096];
     let mut scanned = 0;
@@ -211,6 +236,15 @@ fn scan_at(
         let count = (&mut maps).take(16385).read_line(&mut line)?;
         ensure!(count <= 16384, "native mapping exceeds line bound");
         if count == 0 {
+            // A stream read does not freeze mmap/munmap. An EOF from the
+            // snapshot is complete only while the current VMA sequence matches.
+            let current: [u8; 32] = Sha256::digest(mapping_snapshot(source)?).into();
+            if current != fingerprint {
+                cursor.maps_offset = 0;
+                cursor.address = 0;
+                cursor.maps_fingerprint = None;
+                return Ok(Scan::More);
+            }
             return Ok(Scan::Complete);
         }
         let mut fields = line.split_whitespace();
@@ -315,7 +349,65 @@ mod tests {
             layout: "layout".into(),
             maps_offset: 0,
             address: 0,
+            maps_fingerprint: None,
         }
+    }
+    #[test]
+    fn changed_vma_prefix_cannot_skip_a_swapped_mapping_at_a_valid_byte_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-vma-churn-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let page = page_return::page_size().unwrap();
+        let line = |first, last| format!("{first:016x}-{last:016x} rw-p 0 00:00 0\n");
+        fs::write(
+            root.join("maps"),
+            line(page, 2 * page) + &line(3 * page, 4 * page),
+        )
+        .unwrap();
+        let pagemap = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.join("pagemap"))
+            .unwrap();
+        pagemap.set_len(4 * 8).unwrap();
+        pagemap
+            .write_all_at(&(1u64 << 62).to_ne_bytes(), 0)
+            .unwrap();
+        let mut cursor = cursor();
+        assert_eq!(
+            scan_at(
+                &mut cursor,
+                File::open(root.join("maps")).unwrap(),
+                &pagemap,
+                page,
+                1,
+                8
+            )
+            .unwrap(),
+            Scan::More
+        );
+        // mmap/munmap replaced the already-scanned prefix with an equally long
+        // stream. The byte offset remains a valid boundary but has lost authority.
+        fs::write(root.join("maps"), line(0, page) + &line(3 * page, 4 * page)).unwrap();
+        assert_eq!(
+            scan_at(
+                &mut cursor,
+                File::open(root.join("maps")).unwrap(),
+                &pagemap,
+                page,
+                8,
+                8
+            )
+            .unwrap(),
+            Scan::Range {
+                address: 0,
+                bytes: page
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn swapped_pages_in_unreadable_or_shared_mappings_prevent_complete_discovery() {
