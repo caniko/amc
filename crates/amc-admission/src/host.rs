@@ -593,8 +593,8 @@ impl HostLedger {
                 "native identity or ceiling changed"
             );
             ensure!(
-                !r.granted || r.continuation == reservation.continuation,
-                "granted pool belongs to a different completion operation"
+                r.continuation == reservation.continuation,
+                "pool belongs to a different completion operation"
             );
             let owner = crate::ledger::ClientIdentity {
                 pid: reservation.identity.pid,
@@ -604,9 +604,6 @@ impl HostLedger {
                 ensure!(r.owners.len() < 256, "execution owner bound exceeded");
                 r.owners.push(owner);
                 r.owners_finished = false;
-            }
-            if !r.granted && reservation.continuation.is_some() {
-                r.continuation = reservation.continuation.clone();
             }
             return Ok(r.id.clone());
         }

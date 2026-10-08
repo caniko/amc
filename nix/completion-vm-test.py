@@ -44,6 +44,9 @@ while time.monotonic() < deadline:
     Path('/tmp/completion-parent-status.json').write_text(json.dumps(observation))
     if observation != last_wait:
         print('completion-parent-admission', json.dumps(observation), flush=True)
+        native = Path('/sys/fs/cgroup/builders.slice')
+        print('completion-parent-native', json.dumps({name:(native / name).read_text().strip()
+              for name in ('memory.max','memory.current','memory.swap.max','memory.swap.current','cgroup.events')}), flush=True)
         last_wait = observation
     if response['granted']:
         break
@@ -66,11 +69,13 @@ while not Path('/tmp/completion-parent-finish').exists():
     try:
         machine.wait_until_succeeds("test -s /tmp/completion-origin.json", timeout=75)
     except Exception:
-        machine.succeed(
-            "journalctl --no-pager _SYSTEMD_UNIT=completion-host.service + "
-            "_SYSTEMD_USER_UNIT=app-amc-job-completion-parent.service; "
-            "cat /tmp/completion-parent-status.json; "
-            "amc admission host-status --socket /run/amc-completion/admission.sock"
+        print(
+            machine.succeed(
+                "journalctl --no-pager _SYSTEMD_UNIT=completion-host.service + "
+                "_SYSTEMD_USER_UNIT=app-amc-job-completion-parent.service; "
+                "cat /tmp/completion-parent-status.json; "
+                "amc admission host-status --socket /run/amc-completion/admission.sock"
+            )
         )
         diagnostics = """import json
 from pathlib import Path
@@ -92,7 +97,7 @@ for line in Path('/proc/meminfo').read_text().splitlines():
         print(line, flush=True)
 """
         write_file("/tmp/completion-diagnostics.py", diagnostics)
-        machine.succeed("python3 /tmp/completion-diagnostics.py")
+        print(machine.succeed("python3 /tmp/completion-diagnostics.py"))
         raise
     parent_charge = completion_status()["committed_bytes"]
     assert parent_charge == 128 * 1048576, parent_charge

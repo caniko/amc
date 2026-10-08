@@ -28,7 +28,9 @@ impl HostLedger {
         operation: Option<u64>,
     ) -> bool {
         self.reservations.iter().any(|r| {
-            r.granted
+            // A queued, already-authorized continuation keeps its finite
+            // operation attribution even if the submitting parent exits.
+            (r.granted || self.is_continuation(r))
                 && r.domain == domain
                 && r.identity.uid == 0
                 && r.identity.cgroup == identity.cgroup

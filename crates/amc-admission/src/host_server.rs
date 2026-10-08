@@ -1,6 +1,6 @@
 //! Single root-owned host broker. Socket loss never releases native capacity.
 use crate::{
-    host::{HostLedger, HostPolicy, Reservation, WaitReason},
+    host::{HostLedger, HostPolicy, Identity, Reservation, WaitReason},
     host_native,
     protocol::{read_frame, write_frame},
     store::{Store, fresh_id, private_directory},
@@ -426,27 +426,19 @@ pub fn serve_supervised(
                             } else {
                                 request_id.clone()
                             };
-                            let continuation_parent = if let Some(capability) = continuation.take()
-                            {
-                                let owner_uid = ledger
-                                    .continuations
-                                    .iter()
-                                    .find(|c| c.capability.parent == capability.parent)
-                                    .map_or(credentials.uid(), |c| c.uid);
-                                Some(ledger.authorize_continuation(
-                                    &capability,
-                                    if credentials.uid() == 0 {
-                                        owner_uid
-                                    } else {
-                                        credentials.uid()
-                                    },
+                            let CompletionAdmission::Parent(continuation_parent) =
+                                acquire_completion(
+                                    ledger,
+                                    &identity,
                                     &domain,
-                                    memory_bytes,
-                                    swap_bytes,
+                                    operation,
+                                    (memory_bytes, swap_bytes),
                                     &call_id,
-                                )?)
-                            } else {
-                                None
+                                    continuation.take(),
+                                )?
+                            else {
+                                reply.waiting = Some(WaitReason::ContinuationSlot);
+                                return Ok(reply);
                             };
                             if continuation_parent.is_none()
                                 && (if credentials.uid() == 0 {
@@ -1122,6 +1114,65 @@ fn pool_join_wait(
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionAdmission {
+    Parent(Option<String>),
+    Waiting,
+}
+
+fn acquire_completion(
+    ledger: &mut HostLedger,
+    identity: &Identity,
+    domain: &str,
+    operation: Option<u64>,
+    envelope: (u64, u64),
+    call: &str,
+    capability: Option<crate::continuation::ContinuationCapability>,
+) -> Result<CompletionAdmission> {
+    let existing = ledger.reservations.iter().find(|r| {
+        r.domain == domain
+            && r.identity.cgroup == identity.cgroup
+            && r.identity.inode == identity.inode
+    });
+    if identity.uid == 0 && ledger.owns_pool_operation(domain, identity, operation) {
+        // Exact persisted Worker ownership, not the continued existence of its
+        // submitting process, authenticates a lost-response or dependency retry.
+        return Ok(CompletionAdmission::Parent(
+            existing.and_then(|r| r.continuation.clone()),
+        ));
+    }
+    if identity.uid == 0
+        && existing.is_some_and(|r| {
+            r.continuation.as_deref() != capability.as_ref().map(|c| c.parent.as_str())
+        })
+    {
+        // Waiting must neither reattribute queued owners nor consume a call.
+        return Ok(CompletionAdmission::Waiting);
+    }
+    let Some(capability) = capability else {
+        return Ok(CompletionAdmission::Parent(None));
+    };
+    let owner_uid = ledger
+        .continuations
+        .iter()
+        .find(|c| c.capability.parent == capability.parent)
+        .map_or(identity.uid, |c| c.uid);
+    Ok(CompletionAdmission::Parent(Some(
+        ledger.authorize_continuation(
+            &capability,
+            if identity.uid == 0 {
+                owner_uid
+            } else {
+                identity.uid
+            },
+            domain,
+            envelope.0,
+            envelope.1,
+            call,
+        )?,
+    )))
+}
+
 fn preparation_reply(
     ledger: &HostLedger,
     policy: &HostPolicy,
@@ -1152,6 +1203,54 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_pool_replay_preserves_its_parent_after_restart_and_parent_exit() {
+        let mut ledger = HostLedger::new("boot".into());
+        let pool: Reservation = serde_json::from_value(serde_json::json!({
+            "id":"pool", "domain":"builders", "memory_bytes":20, "swap_bytes":0,
+            "requested_ms":0, "deadline_ms":10000, "granted":true,
+            "identity":{"cgroup":"/builders", "inode":1,"uid":0,"pid":42,"start_ticks":7},
+            "owners":[{"pid":42,"start_ticks":7}], "continuation":"first"
+        }))
+        .unwrap();
+        ledger.reservations.push(pool.clone());
+        ledger
+            .bind_pool_operation("builders", &pool.identity, 1)
+            .unwrap();
+        let mut ledger: HostLedger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        ledger.validate().unwrap();
+        let before = serde_json::to_vec(&ledger).unwrap();
+        assert_eq!(
+            acquire_completion(
+                &mut ledger,
+                &pool.identity,
+                "builders",
+                Some(1),
+                (20, 0),
+                "owner-42-7-1",
+                None
+            )
+            .unwrap(),
+            CompletionAdmission::Parent(Some("first".into()))
+        );
+        assert_eq!(serde_json::to_vec(&ledger).unwrap(), before);
+        assert_eq!(
+            acquire_completion(
+                &mut ledger,
+                &pool.identity,
+                "builders",
+                Some(2),
+                (20, 0),
+                "owner-42-7-2",
+                None
+            )
+            .unwrap(),
+            CompletionAdmission::Waiting
+        );
+        assert_eq!(serde_json::to_vec(&ledger).unwrap(), before);
+    }
 
     #[test]
     fn finite_root_services_do_not_require_an_aggregate_worker_serial() {

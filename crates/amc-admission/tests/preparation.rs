@@ -341,6 +341,107 @@ fn finite_authenticated_children_finish_during_drain_without_admitting_unrelated
 }
 
 #[test]
+fn pending_root_pools_cannot_change_their_first_completion_parent() {
+    use amc_admission::continuation::ContinuationPolicy;
+    let mut p = policy();
+    p.domains[0].continuation = Some(ContinuationPolicy {
+        parent_max_bytes: 20,
+        memory_bytes: 20,
+        swap_bytes: 0,
+        max_calls: 2,
+        domains: vec!["builders".into()],
+    });
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    for parent in ["first", "second"] {
+        l.request(job(parent, "work", 1000, 20), &p).unwrap();
+    }
+    advance(&mut l, &p, 250);
+    let first = l.continuation_capability("first", &p).unwrap().unwrap();
+    let second = l.continuation_capability("second", &p).unwrap().unwrap();
+    let mut pool = job("pool", "builders", 0, 20);
+    pool.identity.cgroup = "/builders".into();
+    pool.continuation = Some(
+        l.authorize_continuation(&first, 1000, "builders", 20, 0, "pool")
+            .unwrap(),
+    );
+    l.request(pool.clone(), &p).unwrap();
+    assert!(
+        !l.reservations
+            .iter()
+            .find(|r| r.id == "pool")
+            .unwrap()
+            .granted
+    );
+    let mut other = pool.clone();
+    other.identity.pid = 43;
+    other.continuation = Some(
+        l.authorize_continuation(&second, 1000, "builders", 20, 0, "other")
+            .unwrap(),
+    );
+    let before = serde_json::to_vec(&l).unwrap();
+    assert!(l.request(other, &p).is_err());
+    assert_eq!(serde_json::to_vec(&l).unwrap(), before);
+    pool.identity.pid = 44;
+    l.request(pool, &p).unwrap();
+    let held = l.reservations.iter().find(|r| r.id == "pool").unwrap();
+    assert_eq!(held.continuation.as_deref(), Some("first"));
+    assert_eq!(held.owners.len(), 2);
+    let identity = held.identity.clone();
+    l.bind_pool_operation("builders", &identity, 1).unwrap();
+    l.reconcile(|r| Some(r.id == "first"));
+    let restored: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+    assert!(restored.owns_pool_operation("builders", &identity, Some(1)));
+    assert!(!restored.owns_pool_operation("builders", &identity, Some(2)));
+}
+
+#[test]
+fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
+    use amc_admission::continuation::ContinuationPolicy;
+    let mut p = policy();
+    p.domains[0].continuation = Some(ContinuationPolicy {
+        parent_max_bytes: 10,
+        memory_bytes: 20,
+        swap_bytes: 0,
+        max_calls: 1,
+        domains: vec!["builders".into()],
+    });
+    p.domains[1].cgroup = "/shared/game.slice".into();
+    p.domains[2].cgroup = "/shared/builders.slice".into();
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    let collision = "escrow-parent-builders";
+    l.prepare(collision.into(), "key".into(), 1000, "game", 0, &p)
+        .unwrap();
+    advance(&mut l, &p, 250);
+    let mut native = job(collision, "game", 1000, 40);
+    native.identity.cgroup = format!("/shared/game.slice/app-amc-prepared-{collision}.scope");
+    l.consume(collision, "key", 1000, native, 300).unwrap();
+    l.request(job("parent", "work", 1000, 10), &p).unwrap();
+    let waits = l.advance(
+        500,
+        &p,
+        capacity(),
+        &mut BTreeMap::from([("work".into(), 0)]),
+        |r, claims| {
+            Some(if r.domain == "builders" {
+                50u64.saturating_sub(
+                    claims
+                        .iter()
+                        .filter(|r| r.granted && r.identity.cgroup.starts_with("/shared/"))
+                        .map(|r| r.memory_bytes)
+                        .sum::<u64>(),
+                )
+            } else {
+                u64::MAX
+            })
+        },
+    );
+    assert_eq!(waits.get("parent"), Some(&WaitReason::AncestorHeadroom));
+    assert_eq!(l.committed(), 40);
+}
+
+#[test]
 fn queued_child_keeps_its_obligation_after_parent_exit_and_aged_new_work_cannot_deadlock_drain() {
     use amc_admission::continuation::ContinuationPolicy;
     let mut p = policy();

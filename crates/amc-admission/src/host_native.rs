@@ -388,8 +388,29 @@ fn ancestor_headroom_at(
                 continue;
             }
             let max: u64 = max.trim().parse().ok()?;
+            // A synthetic lane spanning the entire enforced native pool also
+            // covers that pool's residual cache/kernel charges. Its ceiling is
+            // a total envelope, not additional allocation on top of those bytes.
+            // Partial lanes and sibling usage receive no such credit.
+            let ceiling = if swap {
+                reservation.swap_bytes
+            } else {
+                reservation.memory_bytes
+            };
+            let covered = if envelope
+                && fs::read_to_string(directory.join(max_file))
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    == Some(ceiling)
+            {
+                number(&directory, current_file).ok()?.min(ceiling)
+            } else {
+                0
+            };
             let remaining = max
-                .saturating_sub(number(ancestor, current_file).ok()?)
+                .saturating_sub(number(ancestor, current_file).ok()?.saturating_sub(covered))
                 .saturating_sub(committed);
             if swap {
                 if reservation.swap_bytes > remaining {
@@ -456,6 +477,44 @@ fn psi(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_native_completion_envelope_covers_its_residual_charge_but_not_siblings() {
+        use crate::host::Reservation;
+        let root = std::env::temp_dir().join(format!(
+            "amc-envelope-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("parent/builders")).unwrap();
+        for (group, max, current) in [("parent", 100, 15), ("parent/builders", 96, 12)] {
+            for (file, value) in [
+                ("memory.max", max),
+                ("memory.current", current),
+                ("memory.swap.max", 0),
+                ("memory.swap.current", 0),
+            ] {
+                fs::write(root.join(group).join(file), value.to_string()).unwrap();
+            }
+        }
+        let lane: Reservation = serde_json::from_value(serde_json::json!({
+            "id":"escrow", "domain":"builders", "memory_bytes":96,"swap_bytes":0,
+            "requested_ms":0,"deadline_ms":10000,"granted":true,"owners":[],
+            "identity":{"cgroup":"/parent/builders","inode":0,"uid":0,"pid":0,"start_ticks":0}
+        }))
+        .unwrap();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[]), Some(96));
+        fs::write(root.join("parent/memory.current"), "17").unwrap();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[]), Some(95));
+        // A partial lane cannot cover unrelated usage of an entire native pool.
+        let mut partial = lane.clone();
+        partial.memory_bytes = 90;
+        assert_eq!(ancestor_headroom_at(&root, &partial, &[]), Some(83));
+        fs::write(root.join("parent/memory.current"), "15").unwrap();
+        let mut peer = lane.clone();
+        peer.id = "other-lane".into();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[peer]), Some(0));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn consumed_replay_uses_the_persisted_grant_and_rejects_changed_native_peers() {

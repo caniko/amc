@@ -250,6 +250,7 @@ impl HostLedger {
                 lanes.push(lane);
             }
         }
+        let first_lane = claims.len();
         claims.extend(lanes.iter().cloned());
         match ancestry(r, &claims) {
             None => return Some(WaitReason::Unknown),
@@ -259,11 +260,12 @@ impl HostLedger {
         let mut parent = r.clone();
         parent.granted = true;
         claims.push(parent);
-        for lane in &lanes {
+        for (index, lane) in lanes.iter().enumerate() {
             let others: Vec<_> = claims
                 .iter()
-                .filter(|claim| claim.id != lane.id)
-                .cloned()
+                .enumerate()
+                .filter(|(position, _)| *position != first_lane + index)
+                .map(|(_, claim)| claim.clone())
                 .collect();
             match ancestry(lane, &others) {
                 None => return Some(WaitReason::Unknown),
