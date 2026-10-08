@@ -867,7 +867,7 @@ fn handle_advance_request(
                 return Ok(());
             }
             let capacity = observe(ledger, policy, health_file);
-            let native_safe = crate::swap::native_return_safe(ledger)?;
+            let native_safe = crate::swap::native_return_safe(ledger, policy)?;
             reply.waiting = ledger.recovery_wait(
                 policy,
                 capacity,

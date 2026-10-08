@@ -1,6 +1,6 @@
 //! Source-backed swap return demand and conservative whole-device feasibility.
 use crate::{
-    host::{HostLedger, Identity},
+    host::{HostLedger, HostPolicy, Identity},
     recovery::{RecoveryPolicy, RecoveryTarget},
 };
 use anyhow::{Context, Result, ensure};
@@ -202,11 +202,14 @@ pub fn helper(pid: i32, policy: &RecoveryPolicy) -> Result<Identity> {
 
 /// swapoff faults pages into their original memory domains. Host headroom alone
 /// is insufficient: every finite leaf and ancestor must fit its own swap return.
-pub fn native_return_safe(ledger: &HostLedger) -> Result<bool> {
-    native_return_safe_at(Path::new("/sys/fs/cgroup"), ledger)
+pub fn native_return_safe(ledger: &HostLedger, policy: &HostPolicy) -> Result<bool> {
+    native_return_safe_at(Path::new("/sys/fs/cgroup"), ledger, policy)
 }
 
-fn native_return_safe_at(root: &Path, ledger: &HostLedger) -> Result<bool> {
+fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) -> Result<bool> {
+    let claims = ledger
+        .native_claims(policy, None)
+        .context("native recovery claims are unproven")?;
     let mut pending = vec![root.to_owned()];
     let mut seen = 0usize;
     while let Some(directory) = pending.pop() {
@@ -234,8 +237,7 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger) -> Result<bool> {
             .trim()
             .parse()?;
         let group = format!("/{}", directory.strip_prefix(root)?.display());
-        let committed = ledger
-            .reservations
+        let committed = claims
             .iter()
             .filter(|r| {
                 r.granted
@@ -253,6 +255,18 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn return_policy() -> HostPolicy {
+        serde_json::from_value(serde_json::json!({
+            "version":1, "budget_bytes":100, "reserve_bytes":10, "swap_reserve_bytes":0,
+            "max_memory_full_psi":100.0, "max_io_full_psi":100.0,
+            "resume_ms":250, "aging_ms":1000, "queue_limit":32,
+            "domains":[{"name":"target", "uid":1000,
+                "cgroup":"/parent/target.slice", "ceiling_bytes":40,
+                "swap_bytes":0, "fair_share_bytes":40}]
+        }))
+        .unwrap()
+    }
     #[test]
     fn resident_swap_cache_is_not_an_additional_ram_obligation() {
         let ledger = HostLedger::new("boot".into());
@@ -344,11 +358,64 @@ mod tests {
             }
         }
         let ledger = HostLedger::new("boot".into());
-        assert!(!native_return_safe_at(&root, &ledger).unwrap());
+        let policy = return_policy();
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
         fs::write(root.join("parent/leaf/memory.max"), "40").unwrap();
-        assert!(native_return_safe_at(&root, &ledger).unwrap());
+        assert!(native_return_safe_at(&root, &ledger, &policy).unwrap());
         fs::write(root.join("parent/memory.max"), "39").unwrap();
-        assert!(!native_return_safe_at(&root, &ledger).unwrap());
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn whole_device_return_preserves_ready_and_completion_capacity_in_native_ancestors() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-return-claims-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("parent/target.slice")).unwrap();
+        for group in ["parent", "parent/target.slice"] {
+            for (name, value) in [
+                ("memory.max", "79"),
+                ("memory.current", "20"),
+                ("memory.swap.current", "20"),
+                ("memory.stat", "swapcached 0\n"),
+            ] {
+                fs::write(root.join(group).join(name), value).unwrap();
+            }
+        }
+        let policy = return_policy();
+        let mut ledger = HostLedger::new("boot".into());
+        assert!(native_return_safe_at(&root, &ledger, &policy).unwrap());
+        ledger.preparations.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"intent", "key":"secret", "uid":1000, "profile":"game",
+                "domain":"target", "memory_bytes":40, "swap_bytes":0,
+                "requested_ms":0, "expires_ms":10000, "ready_ms":15000,
+                "phase":"ready", "drain":[], "waiting":null
+            }))
+            .unwrap(),
+        );
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        ledger.preparations.clear();
+        ledger.continuations.push(
+            serde_json::from_value(serde_json::json!({
+                "capability":{"parent":"operation", "key":"secret"}, "uid":1000,
+                "policy":{"parent_max_bytes":20, "memory_bytes":40, "swap_bytes":0,
+                    "max_calls":2, "domains":["target"]}, "calls":[]
+            }))
+            .unwrap(),
+        );
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        // Both the returning leaf and its finite parent must retain the lane.
+        fs::write(root.join("parent/target.slice/memory.max"), "80").unwrap();
+        assert!(!native_return_safe_at(&root, &ledger, &policy).unwrap());
+        fs::write(root.join("parent/memory.max"), "80").unwrap();
+        assert!(native_return_safe_at(&root, &ledger, &policy).unwrap());
+        // A removed policy domain cannot turn a persisted lane into free capacity.
+        let mut missing = policy.clone();
+        missing.domains.clear();
+        assert!(native_return_safe_at(&root, &ledger, &missing).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
