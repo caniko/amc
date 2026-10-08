@@ -417,7 +417,7 @@ impl HostLedger {
                 && self
                     .pool_operations
                     .keys()
-                    .all(|k| crate::ledger::valid_name(k)),
+                    .all(|k| crate::root_pool::valid_operation_key(k)),
             "invalid root operation ownership"
         );
         Ok(())

@@ -448,6 +448,38 @@ fn nested_root_workers_keep_the_outer_operation_live_across_restart() {
 }
 
 #[test]
+fn operation_keys_cover_the_longest_valid_root_pool_domain_and_native_identity() {
+    let domain = "d".repeat(80);
+    let mut p = policy();
+    p.domains[2].name = domain.clone();
+    p.preparations[0].drain_domains[1] = domain.clone();
+    p.validate().unwrap();
+    let mut l = HostLedger::new("boot".into());
+    l.swap_return_bytes = Some(0);
+    let mut root = job("root", &domain, 0, 50);
+    root.identity.cgroup = "/builders".into();
+    root.identity.pid = i32::MAX;
+    root.identity.start_ticks = u64::MAX;
+    l.request(root.clone(), &p).unwrap();
+    l.advance(
+        250,
+        &p,
+        capacity(),
+        &mut BTreeMap::from([(domain.clone(), 0)]),
+        |_, _| Some(200),
+    );
+    assert!(l.reservations[0].granted);
+    l.bind_pool_operation(&domain, &root.identity, u64::MAX)
+        .unwrap();
+    let mut l: HostLedger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+    l.validate().unwrap();
+    assert!(l.owns_pool_operation(&domain, &root.identity, Some(u64::MAX)));
+    assert!(!l.owns_pool_operation(&domain, &root.identity, Some(1)));
+    l.release_pool_operation(&domain, &root.identity, u64::MAX);
+    assert!(l.reservations[0].owners.is_empty() && l.reservations[0].owners_finished);
+}
+
+#[test]
 fn a_ready_claim_is_native_backing_until_its_once_only_consume_transfer() {
     let p = policy();
     let mut l = HostLedger::new("boot".into());

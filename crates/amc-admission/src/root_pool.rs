@@ -10,6 +10,16 @@ fn owner_key(domain: &str, identity: &Identity) -> String {
     )
 }
 
+/// Composite internal keys include an 80-byte domain plus bounded native
+/// PID/start-time/operation identifiers; they are not external 80-byte names.
+pub(crate) fn valid_operation_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 160
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 impl HostLedger {
     pub fn owns_pool_operation(
         &self,
@@ -41,7 +51,10 @@ impl HostLedger {
     ) -> Result<()> {
         let key = format!("{}-{operation}", owner_key(domain, identity));
         ensure!(
-            identity.uid == 0 && operation > 0 && crate::ledger::valid_name(&key),
+            identity.uid == 0
+                && operation > 0
+                && crate::ledger::valid_name(domain)
+                && valid_operation_key(&key),
             "invalid root worker operation"
         );
         ensure!(
