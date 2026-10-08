@@ -310,19 +310,12 @@ fn recovery_unit(identity: &Identity) -> Result<String> {
         unit.ends_with(".service"),
         "recovery requires a native service boundary"
     );
-    let output = std::process::Command::new("systemctl")
-        .args([
-            "show",
-            "--property=ControlGroup,MainPID,Restart,KillMode,InvocationID",
-            "--",
-            unit,
-        ])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "recovery manager observation unavailable"
-    );
-    Ok(String::from_utf8(output.stdout)?)
+    amc_runner::systemd::capture(std::process::Command::new("systemctl").args([
+        "show",
+        "--property=ControlGroup,MainPID,Restart,KillMode,InvocationID",
+        "--",
+        unit,
+    ]))
 }
 
 fn verified_recovery_unit(text: &str, cgroup: &str) -> Result<(i32, String)> {
@@ -359,14 +352,16 @@ pub fn recovery_invocation(identity: &Identity) -> Result<String> {
 /// after the previous invocation's processes have been stopped. Same-invocation
 /// descendants, legacy leases and unavailable observations remain charged.
 pub fn recovery_replaced(lease: &crate::recovery::RecoveryLease) -> Option<bool> {
-    recovery_replaced_at(
-        lease,
-        &recovery_unit(&lease.identity).ok()?,
-        owner_alive(&crate::ledger::ClientIdentity {
-            pid: lease.identity.pid,
-            start_ticks: lease.identity.start_ticks,
-        }),
-    )
+    let alive = owner_alive(&crate::ledger::ClientIdentity {
+        pid: lease.identity.pid,
+        start_ticks: lease.identity.start_ticks,
+    });
+    // Normal live-helper ticks need no manager subprocess. Unknown liveness
+    // and legacy leases also retain capacity without querying a replacement.
+    if alive != Some(false) || lease.invocation_id.is_none() {
+        return Some(false);
+    }
+    recovery_replaced_at(lease, &recovery_unit(&lease.identity).ok()?, alive)
 }
 
 fn recovery_replaced_at(
