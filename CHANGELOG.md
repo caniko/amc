@@ -32,6 +32,13 @@
 
 ### Fixed
 
+- Resume bounded discovery without treating an interrupted scan prefix as proof
+  of current residency; back original swap owners and the remote reader fallback.
+- Give complete charge-owner inventories a bounded maintenance RPC window and
+  refuse truncated inventories without faulting pages.
+- Require root completion lanes and recovery helpers to match their native limits.
+- Restore declared swap targets from a trusted local manifest when the broker is
+  unavailable, and reject active targets at the wrong priority.
 - Keep finite completion calls available after rejected enqueue attempts, bound
   aggregate admission snapshots, and retain existing obligations on rejected growth.
 - Include parents that can launch future completion children in preparation drains
