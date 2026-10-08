@@ -205,17 +205,23 @@ checks the range before settling its claim. Occupied swap slots and resident
 back into RAM while Linux retains its swap slot: slot deletion is not RAM return.
 
 Linux keeps the original swap-entry memcg charge when a process migrates. If
-that memcg is offline, swap-in falls back to the faulting mm's current memcg.
+that memcg is offline, the direct fault path can use the target mm, but
+`__read_swap_cache_async` passes a null mm and falls back to the current reader's
+memcg. For a remote `/proc/PID/mem` read, that is the finite recovery helper.
 A frozen cgroup can still be migrated. A swapped PTE does not expose its charge
 owner to this userspace API, and a single mm can contain mixed-origin pages.
 Consequently each batch conservatively checks every online cgroup with swap
-charges, plus the current target/fallback and the helper, against its own native
+charges, plus both the current target and reader fallbacks, against their native
 ancestors and commitments. This can wait for an unrelated charged domain to
 gain headroom; it cannot borrow the destination grant to cover another owner.
 The native VM requires separate proofs of online original charging, frozen
-migration, offlining fallback and both headroom denials with zero OOM events. See Linux
+migration, offlining fallback charge attribution and all headroom denials with zero OOM events. See Linux
 [`mem_cgroup_swapin_charge_folio`](https://github.com/gregkh/linux/blob/v6.18.48/mm/memcontrol.c#L4779-L4799)
 and [cgroup memory ownership](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-ownership).
+The [swap-cache call site](https://github.com/gregkh/linux/blob/v6.18.48/mm/swap_state.c#L480)
+is essential: a remote target's placement alone does not identify the fallback
+owner. Returned pages must fit the helper's remaining native resident allowance
+as well as its bounded working memory; successive batches wait when it is full.
 
 Discovery keeps private, locked, atomically saved hints in
 `/var/lib/amc-page-return` (`--state` overrides the directory). Campaigns resume

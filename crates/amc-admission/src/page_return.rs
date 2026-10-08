@@ -91,14 +91,15 @@ fn recovery_headroom_at(
 ) -> Result<bool> {
     let mut claims = claims.to_vec();
     claims.push(crate::recovery::helper_claim(helper, helper_bytes));
-    Ok(native_headroom_at(root, helper, &claims, 0)?
+    Ok(native_headroom_at(root, helper, &claims, bytes)?
         && native_headroom_at(root, target, &claims, bytes)?
         && charge_owner_headroom_at(root, &claims, bytes)?)
 }
 
 /// A swapped PTE does not expose its recorded memcg to userspace. Moving a
-/// process does not move its swap charge; an offlined owner instead falls back
-/// to the faulting mm. Back the target fallback AND every online possible
+/// process does not move its swap charge. For an offlined owner, the direct
+/// fault path can use the target mm, while swap-cache reads pass NULL and charge
+/// the current helper mm. Back BOTH fallbacks AND every online possible
 /// original owner, including shared/mixed-origin pages. Never credit a target's
 /// grant as proof that another memcg owns these particular swap entries.
 fn charge_owner_headroom_at(root: &Path, claims: &[Reservation], bytes: u64) -> Result<bool> {
@@ -452,11 +453,11 @@ mod tests {
         ));
         for (group, max, current) in [
             ("target", 40, 20),
-            ("helper-parent", 9, 5),
-            ("helper-parent/helper", 10, 5),
+            ("helper-parent", 24, 5),
+            ("helper-parent/helper", 25, 5),
             ("shared", 49, 25),
             ("shared/target", 40, 20),
-            ("shared/helper", 10, 5),
+            ("shared/helper", 25, 5),
         ] {
             fs::create_dir_all(root.join(group)).unwrap();
             fs::write(root.join(group).join("memory.max"), max.to_string()).unwrap();
@@ -472,15 +473,39 @@ mod tests {
         let target = identity("target", 42);
         let helper = identity("helper-parent/helper", 43);
         assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
-        fs::write(root.join("helper-parent/memory.max"), "10").unwrap();
+        fs::write(root.join("helper-parent/memory.max"), "25").unwrap();
         assert!(recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
-        fs::write(root.join("helper-parent/helper/memory.max"), "9").unwrap();
+        fs::write(root.join("helper-parent/helper/memory.max"), "24").unwrap();
         assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
         let target = identity("shared/target", 42);
         let helper = identity("shared/helper", 43);
         assert!(!recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
         fs::write(root.join("shared/memory.max"), "50").unwrap();
         assert!(recovery_headroom_at(&root, &target, &helper, &[], 20, 10).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn remote_swapcache_fallback_must_fit_unused_helper_resident_capacity() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-helper-fallback-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (group, current) in [("target", 0), ("helper", 90)] {
+            fs::create_dir_all(root.join(group)).unwrap();
+            fs::write(root.join(group).join("memory.max"), "100").unwrap();
+            fs::write(root.join(group).join("memory.current"), current.to_string()).unwrap();
+        }
+        let identity = |group: &str, pid| Identity {
+            cgroup: format!("/{group}"),
+            inode: fs::metadata(root.join(group)).unwrap().ino(),
+            uid: 0,
+            pid,
+            start_ticks: 7,
+        };
+        let target = identity("target", 42);
+        let helper = identity("helper", 43);
+        assert!(recovery_headroom_at(&root, &target, &helper, &[], 10, 100).unwrap());
+        assert!(!recovery_headroom_at(&root, &target, &helper, &[], 11, 100).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

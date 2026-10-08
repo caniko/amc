@@ -32,6 +32,27 @@ def batch():
     address = target[sys.argv[2]]
     pid = target["pid"]
     start = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19])
+    helper = Path("/sys/fs/cgroup") / Path(
+        "/proc/self/cgroup"
+    ).read_text().strip().removeprefix("0::/")
+    target_group = ROOT / "moved"
+    hold = None
+    size = 2 * MIB
+    if sys.argv[3:] == ["--helper-tight"]:
+        size = 8 * MIB
+        # Leave a 4 MiB working-memory margin, less than the requested return.
+        # The native ceiling stays exactly equal to the broker's helper claim.
+        padding = (
+            (128 * MIB - observe(helper)["memory"] - 4 * MIB)
+            // mmap.PAGESIZE
+            * mmap.PAGESIZE
+        )
+        assert padding > 0
+        hold = mmap.mmap(-1, padding, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        for offset in range(0, padding, mmap.PAGESIZE):
+            hold[offset] = 1
+        wait(lambda: 128 * MIB - observe(helper)["memory"] < size)
+    before = {"helper": observe(helper), "target": observe(target_group)}
     reply = request(
         {
             "op": "acquire_page_return",
@@ -39,18 +60,65 @@ def batch():
             "pid": pid,
             "start_ticks": start,
             "address": address,
-            "bytes": 2 * MIB,
+            "bytes": size,
         }
     )
     if reply["granted"]:
         with open(f"/proc/{pid}/mem", "rb", buffering=0) as memory:
-            for offset in range(0, 2 * MIB, mmap.PAGESIZE):
+            for offset in range(0, size, mmap.PAGESIZE):
                 assert (
                     len(os.pread(memory.fileno(), mmap.PAGESIZE, address + offset))
                     == mmap.PAGESIZE
                 )
         reply = request({"op": "finish_page_return", "version": 1})
-        assert reply["granted"] and reply["resident_bytes"] == 2 * MIB, reply
+        assert reply["granted"] and reply["resident_bytes"] == size, reply
+        owners = {helper.stat().st_ino: "helper", target_group.stat().st_ino: "target"}
+        if (ROOT / sys.argv[2]).exists():
+            owners[(ROOT / sys.argv[2]).stat().st_ino] = "original"
+        charged = {}
+        pfns = set()
+        with (
+            open(f"/proc/{pid}/pagemap", "rb", buffering=0) as pagemap,
+            open("/proc/kpagecgroup", "rb", buffering=0) as charges,
+        ):
+            for offset in range(0, size, mmap.PAGESIZE):
+                entry = int.from_bytes(
+                    os.pread(
+                        pagemap.fileno(), 8, (address + offset) // mmap.PAGESIZE * 8
+                    ),
+                    sys.byteorder,
+                )
+                assert entry & ((1 << 63) | (1 << 62)) == 1 << 63, entry
+                pfn = entry & ((1 << 55) - 1)
+                assert pfn != 0
+                pfns.add(pfn)
+                inode = int.from_bytes(
+                    os.pread(charges.fileno(), 8, pfn * 8), sys.byteorder
+                )
+                assert inode in owners, {
+                    "unexpectedChargeInode": inode,
+                    "allowed": owners,
+                }
+                name = owners[inode]
+                charged[name] = charged.get(name, 0) + mmap.PAGESIZE
+        assert len(pfns) * mmap.PAGESIZE == size
+        reply["chargedBytes"] = charged
+        reply["uniqueResidentBytes"] = len(pfns) * mmap.PAGESIZE
+        reply["chargeInodes"] = {name: inode for inode, name in owners.items()}
+    reply["observationsBefore"] = before
+    reply["observationsAfter"] = {
+        "helper": observe(helper),
+        "target": observe(target_group),
+    }
+    reply["requestedBytes"] = size
+    reply["helperEvents"] = dict(
+        line.split() for line in (helper / "memory.events").read_text().splitlines()
+    )
+    assert all(int(reply["helperEvents"][key]) == 0 for key in ("oom", "oom_kill")), (
+        reply
+    )
+    if hold is not None:
+        hold.close()
     Path("/tmp/charge-batch.json").write_text(json.dumps(reply))
 
 
@@ -74,7 +142,7 @@ def wait(predicate):
     raise AssertionError("charge-owner native setup timed out")
 
 
-def run_batch(which):
+def run_batch(which, *options):
     wait(lambda: request({"op": "status", "version": 1}).get("recovery") is None)
     subprocess.run(
         [
@@ -88,10 +156,15 @@ def run_batch(which):
             __file__,
             "--batch",
             which,
+            *options,
         ],
         check=True,
     )
-    return json.loads(Path("/tmp/charge-batch.json").read_text())
+    result = json.loads(Path("/tmp/charge-batch.json").read_text())
+    print(
+        json.dumps({"range": which, "options": options, "result": result}), flush=True
+    )
+    return result
 
 
 def proof():
@@ -159,6 +232,7 @@ def proof():
         assert observe(ROOT / "moved")["swap"] == 0
         policy = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
         policy["swap_recovery"]["page_cgroups"] = ["/amc-charge-proof"]
+        policy["swap_recovery"]["batch_bytes"] = 8 * MIB
         Path("/tmp/charge-policy.json").write_text(json.dumps(policy))
         subprocess.run(
             [
@@ -187,6 +261,11 @@ def proof():
         (ROOT / "a" / "memory.max").write_text(str(128 * MIB))
         # The original memcg becomes offline while its swapped mm survives.
         (ROOT / "a").rmdir()
+        denied_helper = run_batch("a", "--helper-tight")
+        assert (
+            not denied_helper["granted"]
+            and denied_helper["waiting"] == "ancestor_headroom"
+        ), denied_helper
         moved_before = observe(ROOT / "moved")
         (ROOT / "moved" / "memory.max").write_text(str(moved_before["memory"] + MIB))
         denied_fallback = run_batch("a")
@@ -195,27 +274,33 @@ def proof():
             and denied_fallback["waiting"] == "ancestor_headroom"
         ), denied_fallback
         (ROOT / "moved" / "memory.max").write_text(str(128 * MIB))
-        assert run_batch("a")["resident_bytes"] == 2 * MIB
-        wait(
-            lambda: (
-                observe(ROOT / "moved")["memory"] >= moved_before["memory"] + 2 * MIB
-            )
-        )
+        fallback = run_batch("a")
+        assert fallback["resident_bytes"] == 2 * MIB
+        assert sum(fallback["chargedBytes"].values()) == 2 * MIB and set(
+            fallback["chargedBytes"]
+        ) <= {"helper", "target"}, fallback
         moved_after = observe(ROOT / "moved")
         b_before = observe(ROOT / "b")
-        assert run_batch("b")["resident_bytes"] == 2 * MIB
-        wait(lambda: observe(ROOT / "b")["memory"] >= b_before["memory"] + 2 * MIB)
+        online = run_batch("b")
+        assert online["resident_bytes"] == 2 * MIB and online["chargedBytes"] == {
+            "original": 2 * MIB
+        }, online
         b_after = observe(ROOT / "b")
         events = dict(
             line.split() for line in (ROOT / "memory.events").read_text().splitlines()
         )
         assert int(events["oom"]) == 0 and int(events["oom_kill"]) == 0, events
         receipt = {
+            "schemaVersion": 2,
             "kernel": os.uname().release,
             "before": before,
             "frozenMigration": True,
             "originalOwnerDenied": True,
             "offlineFallbackDenied": True,
+            "helperFallbackDenied": True,
+            "helperDenial": denied_helper,
+            "fallbackCharge": fallback,
+            "onlineCharge": online,
             "batchBytes": 2 * MIB,
             "fallbackResidentBytes": 2 * MIB,
             "onlineResidentBytes": 2 * MIB,
@@ -227,6 +312,21 @@ def proof():
             "oomKill": int(events["oom_kill"]),
         }
         Path("/tmp/charge-owner-evidence.json").write_text(json.dumps(receipt))
+    except BaseException:
+        print(
+            json.dumps(
+                {
+                    "stage": "failure",
+                    "groups": {
+                        group.name: observe(group)
+                        for group in ROOT.iterdir()
+                        if group.is_dir()
+                    },
+                }
+            ),
+            flush=True,
+        )
+        raise
     finally:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)

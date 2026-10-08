@@ -19,10 +19,35 @@ class NativeEvidenceTests(unittest.TestCase):
     ):
         receipt = {
             "chargeOwner": {
+                "schemaVersion": 2,
                 "kernel": "fixture",
                 "frozenMigration": True,
                 "originalOwnerDenied": True,
                 "offlineFallbackDenied": True,
+                "helperFallbackDenied": True,
+                "helperDenial": {
+                    "granted": False,
+                    "waiting": "ancestor_headroom",
+                    "requestedBytes": 8 * 1048576,
+                    "observationsBefore": {"helper": {"memory": 124 * 1048576}},
+                    "helperEvents": {"oom": "0", "oom_kill": "0"},
+                },
+                "fallbackCharge": {
+                    "granted": True,
+                    "resident_bytes": 2 * 1048576,
+                    "uniqueResidentBytes": 2 * 1048576,
+                    "chargedBytes": {"helper": 2 * 1048576},
+                    "chargeInodes": {"helper": 123},
+                    "helperEvents": {"oom": "0", "oom_kill": "0"},
+                },
+                "onlineCharge": {
+                    "granted": True,
+                    "resident_bytes": 2 * 1048576,
+                    "uniqueResidentBytes": 2 * 1048576,
+                    "chargedBytes": {"original": 2 * 1048576},
+                    "chargeInodes": {"original": 456},
+                    "helperEvents": {"oom": "0", "oom_kill": "0"},
+                },
                 "batchBytes": 2 * 1048576,
                 "fallbackResidentBytes": 2 * 1048576,
                 "onlineResidentBytes": 2 * 1048576,
@@ -81,14 +106,39 @@ class NativeEvidenceTests(unittest.TestCase):
                 ("frozenMigration", False),
                 ("originalOwnerDenied", False),
                 ("offlineFallbackDenied", False),
+                ("helperFallbackDenied", False),
                 ("fallbackResidentBytes", 0),
-                ("onlineAfter", {"memory": 0}),
+                ("fallbackCharge", {}),
+                ("onlineCharge", {}),
+                ("helperDenial", {}),
                 ("oomKill", 1),
             ]:
                 broken = json.loads(json.dumps(receipt))
                 broken["chargeOwner"][key] = value
                 path.write_text(json.dumps(broken))
                 with self.subTest(charge=key), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path)
+            for batch, key, value in [
+                ("helperDenial", "granted", True),
+                (
+                    "helperDenial",
+                    "observationsBefore",
+                    {"helper": {"memory": 100 * 1048576}},
+                ),
+                ("helperDenial", "helperEvents", {"oom": "1", "oom_kill": "0"}),
+                ("fallbackCharge", "chargedBytes", {"unbacked": 2 * 1048576}),
+                ("fallbackCharge", "chargeInodes", {}),
+                ("fallbackCharge", "uniqueResidentBytes", 1048576),
+                ("onlineCharge", "chargedBytes", {"helper": 2 * 1048576}),
+                ("onlineCharge", "chargedBytes", {"original": 1048576}),
+            ]:
+                broken = json.loads(json.dumps(receipt))
+                broken["chargeOwner"][batch][key] = value
+                path.write_text(json.dumps(broken))
+                with (
+                    self.subTest(batch=batch, key=key),
+                    self.assertRaises(RuntimeError),
+                ):
                     hosted.verify_foreground_evidence(path)
             for section, key, value in [
                 ("pageReturn", "beforeSwapBytes", 0),

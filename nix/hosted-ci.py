@@ -74,13 +74,15 @@ def verify_foreground_evidence(path):
     namespaces = receipt.get("nativeNamespaceCompletion", {})
     charge = receipt.get("chargeOwner", {})
     if (
-        not charge.get("kernel")
+        charge.get("schemaVersion") != 2
+        or not charge.get("kernel")
         or any(
             charge.get(key) is not True
             for key in (
                 "frozenMigration",
                 "originalOwnerDenied",
                 "offlineFallbackDenied",
+                "helperFallbackDenied",
             )
         )
         or any(
@@ -89,15 +91,6 @@ def verify_foreground_evidence(path):
         )
         or charge.get("oom") != 0
         or charge.get("oomKill") != 0
-        or any(
-            charge.get(after, {}).get("memory", 0)
-            - charge.get(before, {}).get("memory", 0)
-            < 2 * 1048576
-            for before, after in (
-                ("fallbackBefore", "fallbackAfter"),
-                ("onlineBefore", "onlineAfter"),
-            )
-        )
         or charge.get("before", {}).get("destination", {}).get("swap") != 0
         or any(
             charge.get("before", {}).get(owner, {}).get("swap", 0) < 32 * 1048576
@@ -108,6 +101,43 @@ def verify_foreground_evidence(path):
         raise RuntimeError(
             "Native charge-owner evidence lacks mixed-origin, migration or fallback backing"
         )
+    denial = charge.get("helperDenial", {})
+    if (
+        denial.get("granted") is not False
+        or denial.get("waiting") != "ancestor_headroom"
+        or denial.get("requestedBytes") != 8 * 1048576
+        or denial.get("observationsBefore", {}).get("helper", {}).get("memory", 0)
+        <= 120 * 1048576
+    ):
+        raise RuntimeError("Native reader fallback lacks a real unused-capacity denial")
+    for name, allowed in [
+        ("fallbackCharge", {"helper", "target"}),
+        ("onlineCharge", {"original"}),
+    ]:
+        batch = charge.get(name, {})
+        charged = batch.get("chargedBytes", {})
+        inodes = batch.get("chargeInodes", {})
+        if (
+            batch.get("granted") is not True
+            or batch.get("resident_bytes") != 2 * 1048576
+            or batch.get("uniqueResidentBytes") != 2 * 1048576
+            or not charged
+            or not set(charged) <= allowed
+            or any(type(value) is not int or value <= 0 for value in charged.values())
+            or sum(charged.values()) != 2 * 1048576
+            or any(
+                type(inodes.get(owner)) is not int or inodes[owner] <= 0
+                for owner in charged
+            )
+        ):
+            raise RuntimeError(
+                "Native returned pages lack per-page kpagecgroup charge attribution"
+            )
+    for batch in (denial, charge["fallbackCharge"], charge["onlineCharge"]):
+        if any(
+            batch.get("helperEvents", {}).get(key) != "0" for key in ("oom", "oom_kill")
+        ):
+            raise RuntimeError("Native reader fallback lacks zero-OOM counters")
     if set(namespaces) != {"private-pid", "private-pid-user"}:
         raise RuntimeError(
             "Native completion evidence lacks the required namespace variants"
