@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     NamespaceRunner {
@@ -321,6 +321,7 @@ pub fn serve_supervised(
     let mut tick = Instant::now();
     let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
+    let mut inventory: Option<PendingInventory> = None;
     while !stopping() {
         if tick.elapsed() >= Duration::from_millis(250) {
             let before = serde_json::to_vec(&ledger)?;
@@ -348,6 +349,66 @@ pub fn serve_supervised(
             }
             tick = Instant::now();
         }
+        if let Some(task) = take_finished_inventory(&mut inventory) {
+            let before = serde_json::to_vec(&ledger)?;
+            let mut stream = task.stream;
+            let result = task
+                .worker
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("native inventory worker failed")))
+                .and_then(|(mut reply, completed)| {
+                    if reply.granted {
+                        // Results authorize only one replay of the same authenticated
+                        // request. Never replace the current ledger with a scan clone.
+                        if !inventory_current(
+                            &task.owner,
+                            &task.backing,
+                            completed,
+                            &stream,
+                            &ledger,
+                            &policy,
+                        )? {
+                            reply.granted = false;
+                            reply.recovery = None;
+                            reply.waiting = Some(WaitReason::Unknown);
+                        } else {
+                            reply = ledger.transaction(|ledger| {
+                                let mut fresh = Response {
+                                    version: 1,
+                                    ..Default::default()
+                                };
+                                handle_advance_request(
+                                    task.request,
+                                    task.owner.pid,
+                                    0,
+                                    &policy,
+                                    ledger,
+                                    (health_file, Some(true)),
+                                    &mut fresh,
+                                )?;
+                                if fresh.granted {
+                                    ensure!(
+                                        serde_json::to_vec(&fresh.recovery)?
+                                            == serde_json::to_vec(&reply.recovery)?,
+                                        "recovery identity or demand changed during inventory"
+                                    );
+                                }
+                                Ok(fresh)
+                            })?;
+                        }
+                    }
+                    Ok(reply)
+                });
+            if before != serde_json::to_vec(&ledger)? {
+                store.save_snapshot(&ledger)?;
+            }
+            let reply = result.unwrap_or_else(|e| Response {
+                version: 1,
+                error: Some(e.to_string()),
+                ..Default::default()
+            });
+            let _ = write_frame(&mut stream, &reply);
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -356,6 +417,45 @@ pub fn serve_supervised(
                 let Ok(request) = read_frame::<Request>(&mut stream) else {
                     continue;
                 };
+                if credentials.uid() == 0
+                    && matches!(
+                        &request,
+                        Request::AcquirePageReturn { .. } | Request::AcquireRecovery { .. }
+                    )
+                {
+                    if inventory.is_some() {
+                        let _ = write_frame(
+                            &mut stream,
+                            &Response {
+                                version: 1,
+                                waiting: Some(WaitReason::Recovery),
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        match PendingInventory::start(
+                            stream.try_clone()?,
+                            request,
+                            credentials.pid(),
+                            &policy,
+                            &ledger,
+                            health_file,
+                        ) {
+                            Ok(task) => inventory = Some(task),
+                            Err(e) => {
+                                let _ = write_frame(
+                                    &mut stream,
+                                    &Response {
+                                        version: 1,
+                                        error: Some(e.to_string()),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let before = serde_json::to_vec(&ledger)?;
                 let result = ledger.transaction(|ledger| -> Result<Response> {
                     let mut reply = Response {
@@ -573,7 +673,7 @@ pub fn serve_supervised(
                                 credentials.uid(),
                                 &policy,
                                 ledger,
-                                health_file,
+                                (health_file, None),
                                 &mut reply,
                             )?;
                         }
@@ -598,6 +698,107 @@ pub fn serve_supervised(
     }
     fs::remove_file(socket)?;
     Ok(())
+}
+
+// One bounded inventory may run while the accept loop continues serving status,
+// existing-work completion and new waiters. It owns neither the store nor the
+// live ledger; only the main loop may persist a freshly revalidated lease.
+struct PendingInventory {
+    stream: UnixStream,
+    request: Request,
+    owner: crate::ledger::ClientIdentity,
+    backing: Vec<u8>,
+    worker: thread::JoinHandle<Result<(Response, Instant)>>,
+}
+
+fn take_finished_inventory(pending: &mut Option<PendingInventory>) -> Option<PendingInventory> {
+    if pending
+        .as_ref()
+        .is_some_and(|task| task.worker.is_finished())
+    {
+        pending.take()
+    } else {
+        None
+    }
+}
+
+fn inventory_current(
+    owner: &crate::ledger::ClientIdentity,
+    backing: &[u8],
+    completed: Instant,
+    stream: &UnixStream,
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+) -> Result<bool> {
+    Ok(completed.elapsed() <= Duration::from_secs(1)
+        && host_native::owner_alive(owner) == Some(true)
+        && inventory_peer_connected(stream)
+        && inventory_backing(ledger, policy)? == backing)
+}
+
+fn inventory_backing(ledger: &HostLedger, policy: &HostPolicy) -> Result<Vec<u8>> {
+    let claims = ledger
+        .native_claims(policy, None)
+        .ok_or_else(|| anyhow::anyhow!("native inventory backing unavailable"))?;
+    Ok(serde_json::to_vec(&(claims, &ledger.recovery))?)
+}
+
+fn inventory_peer_connected(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    matches!(
+        nix::sys::socket::recv(
+            stream.as_raw_fd(),
+            &mut [0u8; 1],
+            nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT
+        ),
+        Err(nix::errno::Errno::EAGAIN)
+    )
+}
+
+impl PendingInventory {
+    fn start(
+        stream: UnixStream,
+        request: Request,
+        pid: i32,
+        policy: &HostPolicy,
+        ledger: &HostLedger,
+        health_file: Option<&Path>,
+    ) -> Result<Self> {
+        let owner = crate::ledger::ClientIdentity {
+            pid,
+            start_ticks: host_native::process_start(pid)?,
+        };
+        let backing = inventory_backing(ledger, policy)?;
+        let scan_request = request.clone();
+        let scan_policy = policy.clone();
+        let mut scan_ledger = ledger.clone();
+        let health_file = health_file.map(Path::to_owned);
+        let worker = thread::Builder::new()
+            .name("amc-native-inventory".into())
+            .spawn(move || {
+                let mut reply = Response {
+                    version: 1,
+                    ..Default::default()
+                };
+                handle_advance_request(
+                    scan_request,
+                    pid,
+                    0,
+                    &scan_policy,
+                    &mut scan_ledger,
+                    (health_file.as_deref(), None),
+                    &mut reply,
+                )?;
+                Ok((reply, Instant::now()))
+            })?;
+        Ok(Self {
+            stream,
+            request,
+            owner,
+            backing,
+            worker,
+        })
+    }
 }
 
 fn public_preparation(p: &crate::preparation::Preparation) -> crate::preparation::Preparation {
@@ -755,10 +956,11 @@ fn handle_advance_request(
     uid: u32,
     policy: &HostPolicy,
     ledger: &mut HostLedger,
-    health_file: Option<&Path>,
+    evidence: (Option<&Path>, Option<bool>),
     reply: &mut Response,
 ) -> Result<()> {
     use crate::preparation::PreparationPhase;
+    let (health_file, inventory_proof) = evidence;
     let now = crate::clock::boot_ms()?;
     match request {
         Request::NamespaceRunner { version } => {
@@ -933,8 +1135,18 @@ fn handle_advance_request(
                 return Ok(());
             }
             let capacity = observe(ledger, policy, health_file);
-            let native_safe =
-                crate::swap::native_return_safe(ledger, policy, &identity, spec.helper_bytes)?;
+            let native_safe = match inventory_proof {
+                Some(proven) => {
+                    let mut claims = ledger
+                        .native_claims(policy, None)
+                        .ok_or_else(|| anyhow::anyhow!("native recovery claims are unproven"))?;
+                    claims.push(crate::recovery::helper_claim(&identity, spec.helper_bytes));
+                    proven && crate::page_return::native_headroom(&identity, &claims, 0)?
+                }
+                None => {
+                    crate::swap::native_return_safe(ledger, policy, &identity, spec.helper_bytes)?
+                }
+            };
             reply.waiting = ledger.recovery_wait(
                 policy,
                 capacity,
@@ -1018,13 +1230,22 @@ fn handle_advance_request(
             let claims = ledger
                 .native_claims(policy, None)
                 .ok_or_else(|| anyhow::anyhow!("completion native backing unavailable"))?;
-            let native_safe = crate::page_return::recovery_headroom(
-                &target,
-                &helper,
-                &claims,
-                bytes,
-                spec.helper_bytes,
-            )?;
+            let native_safe = match inventory_proof {
+                Some(proven) => {
+                    let mut fresh_claims = claims;
+                    fresh_claims.push(crate::recovery::helper_claim(&helper, spec.helper_bytes));
+                    proven
+                        && crate::page_return::native_headroom(&target, &fresh_claims, bytes)?
+                        && crate::page_return::native_headroom(&helper, &fresh_claims, bytes)?
+                }
+                None => crate::page_return::recovery_headroom(
+                    &target,
+                    &helper,
+                    &claims,
+                    bytes,
+                    spec.helper_bytes,
+                )?,
+            };
             let mut eligibility = ledger.clone();
             eligibility.recovery = None;
             reply.waiting = eligibility.page_return_wait(
@@ -1252,6 +1473,113 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_poll_never_waits_and_stale_or_disconnected_results_cannot_grant() {
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":100,"reserve_bytes":10,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "domains":[{"name":"builders","uid":0,"cgroup":"/builders","ceiling_bytes":20,"swap_bytes":0,"fair_share_bytes":20}]
+        })).unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        let (client, stream) = UnixStream::pair().unwrap();
+        let pid = std::process::id() as i32;
+        let owner = crate::ledger::ClientIdentity {
+            pid,
+            start_ticks: host_native::process_start(pid).unwrap(),
+        };
+        let backing = inventory_backing(&ledger, &policy).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok((
+                Response {
+                    version: 1,
+                    granted: true,
+                    ..Default::default()
+                },
+                Instant::now(),
+            ))
+        });
+        let mut pending = Some(PendingInventory {
+            stream,
+            request: Request::AcquireRecovery {
+                version: 1,
+                target: "swap".into(),
+            },
+            owner: owner.clone(),
+            backing: backing.clone(),
+            worker,
+        });
+        let began = Instant::now();
+        for _ in 0..10 {
+            assert!(take_finished_inventory(&mut pending).is_none());
+            let mut reply = Response {
+                version: 1,
+                ..Default::default()
+            };
+            populate_status(&mut reply, &ledger, 0);
+            assert!(reply.reservations.unwrap().is_empty());
+        }
+        assert!(began.elapsed() < Duration::from_millis(500));
+        release.send(()).unwrap();
+        let task = pending.take().unwrap();
+        task.worker.join().unwrap().unwrap();
+        assert!(
+            inventory_current(
+                &owner,
+                &backing,
+                Instant::now(),
+                &task.stream,
+                &ledger,
+                &policy
+            )
+            .unwrap()
+        );
+        ledger.reservations.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"pool", "domain":"builders", "memory_bytes":20, "swap_bytes":0,
+                "requested_ms":0, "deadline_ms":10000, "granted":true,
+                "identity":{"cgroup":"/builders", "inode":1,"uid":0,"pid":42,"start_ticks":7}
+            }))
+            .unwrap(),
+        );
+        assert!(
+            !inventory_current(
+                &owner,
+                &backing,
+                Instant::now(),
+                &task.stream,
+                &ledger,
+                &policy
+            )
+            .unwrap()
+        );
+        ledger.reservations.clear();
+        assert!(
+            !inventory_current(
+                &owner,
+                &backing,
+                Instant::now() - Duration::from_secs(2),
+                &task.stream,
+                &ledger,
+                &policy
+            )
+            .unwrap()
+        );
+        drop(client);
+        assert!(
+            !inventory_current(
+                &owner,
+                &backing,
+                Instant::now(),
+                &task.stream,
+                &ledger,
+                &policy
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn maintenance_inventory_reply_can_exceed_the_ordinary_two_second_deadline() {

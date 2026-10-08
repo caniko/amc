@@ -19,6 +19,7 @@ ALLOWED = {
 NATIVE_CASES = {
     "rapid native and admitted jobs preserve completion and fail closed on startup loss",
     "namespace runners share a host-reserve-backed aggregate ceiling",
+    "concurrent preparation helpers share the reserve-backed runner slice",
     "durable root pool tracks every potential execution owner",
     "helper cannot omit host capacity before private entry",
     "simultaneous users, restart persistence, and automatic lending",
@@ -75,6 +76,13 @@ def verify_foreground_evidence(path):
     namespaces = receipt.get("nativeNamespaceCompletion", {})
     charge = receipt.get("chargeOwner", {})
     runners = receipt.get("namespaceRunnerBacking", {})
+    helpers = receipt.get("preparationHelperBacking", {})
+    if (helpers.get("concurrentHelpers") != 2
+        or helpers.get("aggregateBytesPerUser") != 64 * 1048576
+        or helpers.get("reservedBytes") != 128 * 1048576
+        or helpers.get("restartPreserved") is not True
+        or helpers.get("payloadsEnteredAfterDrain") is not True):
+        raise RuntimeError("Native preparation helpers lack concurrent aggregate backing")
     if (runners.get("aggregateBytesPerUser") != 64 * 1048576
         or runners.get("reservedBytes") != 128 * 1048576
         or runners.get("concurrentRunners") != 2
@@ -146,6 +154,11 @@ def verify_foreground_evidence(path):
                 "Native returned pages lack per-page kpagecgroup charge attribution"
             )
     for batch in (denial, charge["fallbackCharge"], charge["onlineCharge"]):
+        if (type(batch.get("inventoryStatusReplies")) is not int
+            or batch["inventoryStatusReplies"] <= 0
+            or not isinstance(batch.get("inventoryMaxStatusLatencyMs"), (int, float))
+            or not 0 <= batch["inventoryMaxStatusLatencyMs"] < 2000):
+            raise RuntimeError("Native inventory blocked ordinary broker status replies")
         if any(
             batch.get("helperEvents", {}).get(key) != "0" for key in ("oom", "oom_kill")
         ):

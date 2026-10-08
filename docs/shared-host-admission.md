@@ -128,7 +128,8 @@ host-visible executable/working-directory paths. `amc prepare` instead registers
 the waiting payload in a host-native scope and preserves its namespaces.
 
 Shared namespace execution additionally requires `namespace_runner_bytes`
-(64 MiB–1 GiB per enrolled non-root UID). All of a user's host runners share
+(64 MiB–1 GiB per enrolled non-root UID). All of a user's host runners and
+preparation helpers share
 `app-amchostrunner.slice` at that exact aggregate RAM ceiling and zero swap;
 individual services retain their 64 MiB cap. The host module creates the slice.
 Policy validation requires the sum of these aggregate envelopes to fit inside
@@ -137,7 +138,8 @@ while runners wait, and the runner authenticates this allowance with the broker
 before submitting the inner shared job. They are static maintenance backing,
 so preparations do not wait for a runner that is itself waiting for admission.
 Host status reports `namespace_runner_reserved_bytes`; consumers can require
-`lib.admissionNamespaceRunnerVersion = 1`. Without an allowance, shared
+`lib.admissionNamespaceRunnerVersion = 2` for namespace runners and concurrent
+preparation helpers (version 1 covered only namespace runners). Without an allowance, shared
 namespace execution fails before payload submission.
 
 ```sh
@@ -243,6 +245,14 @@ an incomplete inventory rejects acquisition without faulting pages. Root recover
 acquisition RPCs allow 30 seconds so a complete wide scan is not discarded at
 the ordinary two-second program-call deadline. Device inventory also has a
 20-second deadline, within the same maintenance RPC budget.
+
+Both page and device inventories run in one bounded background task outside
+the broker accept loop. Ordinary status, preparation, and acquisition RPCs
+remain responsive. No scan clone can write the ledger or grant a lease: the
+broker rejects stale backing, replaced helpers, disconnected peers and results
+older than one second, then repeats native identity, host capacity and local
+fallback checks before persisting the same lease. Changed ownership or demand
+cannot be transferred from an abandoned scan.
 
 A stable zero `memory.swap.current` means a cgroup owns no swap-slot return
 obligation even when `memory.stat.swapcached` is positive: remote reads of

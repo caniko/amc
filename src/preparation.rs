@@ -211,6 +211,11 @@ mod tests {
         assert!(arguments.contains(&"prepared-host".into()));
         assert!(arguments.contains(&"game-$literal".into()));
         assert!(arguments.contains(&"no-env-expand".into()));
+        assert!(
+            arguments
+                .windows(3)
+                .any(|args| args == ["Slice", "s", "app-amchostrunner.slice"])
+        );
         assert!(!arguments.iter().any(|s| s.contains("payload-only")));
         let runtime_us: u64 = arguments
             .windows(3)

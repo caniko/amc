@@ -195,6 +195,11 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
         pid: peer.pid(),
         start_ticks: host_native::process_start(peer.pid())?,
     };
+    ensure!(
+        amc_admission::host_server::call(&args.socket, &Request::NamespaceRunner { version: 1 })?
+            .granted,
+        "preparation helper has no backed aggregate allowance"
+    );
     progress(&mut stream, &token, false, None)?;
     let result = (|| -> Result<()> {
         let intent = Intent {
@@ -297,7 +302,10 @@ pub(super) fn helper_command(
         .arg(format!("app-amc-prepare-helper-{id}.service"))
         .args([
             "fail",
-            "6",
+            "7",
+            "Slice",
+            "s",
+            "app-amchostrunner.slice",
             "Type",
             "s",
             "exec",

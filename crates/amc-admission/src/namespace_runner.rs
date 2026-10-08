@@ -1,5 +1,5 @@
 //! A static host-reserve-backed envelope bounds ALL waited namespace runners
-//! for one user, including their waiting periods. It is not a drainable job.
+//! and preparation helpers for one user. It is not a drainable job.
 use crate::host::{HostPolicy, Identity, Reservation};
 use anyhow::{Result, ensure};
 use std::{collections::BTreeSet, fs, path::Path};
@@ -103,7 +103,7 @@ pub fn verify(pid: i32, uid: u32, policy: &HostPolicy, claims: &[Reservation]) -
         .ok_or_else(|| anyhow::anyhow!("missing namespace runner placement"))?;
     let leaf = placement.strip_prefix(&format!("{group}/")).unwrap_or("");
     ensure!(
-        leaf.starts_with("app-amc-host-runner-")
+        (leaf.starts_with("app-amc-host-runner-") || leaf.starts_with("app-amc-prepare-helper-"))
             && leaf.ends_with(".service")
             && !leaf.contains('/'),
         "peer is outside its aggregate namespace runner boundary"

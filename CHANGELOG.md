@@ -39,6 +39,10 @@
   hide dead helpers, while surviving descendants retain backing.
 - Accept stable zero-owned-slot reader cache after offlined-owner recovery
   without assigning that resident cache as another owner's entitlement.
+- Share the reserve-backed runner slice with concurrent preparation helpers;
+  expose this stronger contract as namespace-runner capability version 2.
+- Run recovery inventories outside the broker accept loop, rejecting stale,
+  disconnected or changed-owner results before fresh transactional admission.
 - Resume bounded discovery without treating an interrupted scan prefix as proof
   of current residency; back original swap owners and the remote reader fallback.
 - Give complete charge-owner inventories a bounded maintenance RPC window and

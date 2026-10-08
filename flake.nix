@@ -99,7 +99,7 @@
     lib.admissionBurstVersion = 1;
     lib.admissionPreparationVersion = 2;
     lib.admissionContinuationEnvelopesVersion = 1;
-    lib.admissionNamespaceRunnerVersion = 1;
+    lib.admissionNamespaceRunnerVersion = 2;
     lib.swapReturnReservationVersion = 2;
     lib.swapRestorationManifestVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;

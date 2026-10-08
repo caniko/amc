@@ -186,6 +186,43 @@ with test_section("namespace runners share a host-reserve-backed aggregate ceili
         stop_scope(grant)
     wait_committed(0)
 
+with test_section("concurrent preparation helpers share the reserve-backed runner slice"):
+    launch("helper-drain", 1000, "small", "touch /tmp/helper-drain-entered; while ! test -e /tmp/helper-drain-finish; do sleep .1; done")
+    wait_entered("helper-drain")
+    for number in [1, 2]:
+        machine.succeed(
+            f"systemd-run --unit=helper-prepared-{number} --uid=1000 "
+            "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1000 -- "
+            "amc prepare --profile game -- /bin/sh -c "
+            + shlex.quote(f"touch /tmp/helper-prepared-{number}-entered; sleep 120")
+        )
+    machine.wait_until_succeeds(
+        "amc admission host-status | python3 -c " + shlex.quote(
+            'import sys,json; s=json.load(sys.stdin); assert len(s["preparations"]) == 2 and all(p["phase"] == "draining" for p in s["preparations"])'
+        )
+    )
+    runner_group = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-amchostrunner.slice"
+    machine.succeed(
+        f'test "$(cat {runner_group}/memory.max)" = 67108864; '
+        f'test "$(cat {runner_group}/memory.swap.max)" = 0; '
+        f'test "$(find {runner_group} -mindepth 1 -maxdepth 1 -type d -name "app-amc-prepare-helper-*.service" | wc -l)" = 2'
+    )
+    assert status()["namespace_runner_reserved_bytes"] == 128 * 1048576
+    machine.succeed("systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    assert len(status()["preparations"]) == 2
+    machine.succeed("touch /tmp/helper-drain-finish")
+    for number in [1, 2]:
+        wait_entered(f"helper-prepared-{number}", client_unit=f"helper-prepared-{number}")
+    evidence["preparationHelperBacking"] = {
+        "concurrentHelpers": 2, "aggregateBytesPerUser": 64 * 1048576,
+        "reservedBytes": 128 * 1048576, "restartPreserved": True,
+        "payloadsEnteredAfterDrain": True,
+    }
+    machine.succeed("systemctl stop helper-prepared-1 helper-prepared-2 helper-drain-client")
+    stop_prepared()
+    wait_committed(0)
+
 with test_section("durable root pool tracks every potential execution owner"):
     # Owners are outside this empty bounded slice, just like Nix's handlers.
     write_file(

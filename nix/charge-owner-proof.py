@@ -19,7 +19,7 @@ SOCKET = "/run/amc-charge/admission.sock"
 
 def request(payload):
     with socket.socket(socket.AF_UNIX) as connection:
-        connection.settimeout(5)
+        connection.settimeout(30 if payload["op"] in ("acquire_page_return", "acquire_recovery") else 2)
         connection.connect(SOCKET)
         connection.sendall((json.dumps(payload) + "\n").encode())
         reply = json.loads(connection.makefile().readline())
@@ -144,7 +144,7 @@ def wait(predicate):
 
 def run_batch(which, *options):
     wait(lambda: request({"op": "status", "version": 1}).get("recovery") is None)
-    subprocess.run(
+    process = subprocess.Popen(
         [
             "systemd-run",
             "--unit=page-return",
@@ -158,9 +158,18 @@ def run_batch(which, *options):
             which,
             *options,
         ],
-        check=True,
     )
+    latencies = []
+    while process.poll() is None:
+        began = time.monotonic()
+        request({"op": "status", "version": 1})
+        latencies.append((time.monotonic() - began) * 1000)
+        time.sleep(0.01)
+    assert process.returncode == 0, process.returncode
+    assert latencies and max(latencies) < 2000, latencies
     result = json.loads(Path("/tmp/charge-batch.json").read_text())
+    result["inventoryStatusReplies"] = len(latencies)
+    result["inventoryMaxStatusLatencyMs"] = max(latencies)
     print(
         json.dumps({"range": which, "options": options, "result": result}), flush=True
     )
