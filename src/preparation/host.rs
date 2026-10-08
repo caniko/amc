@@ -309,7 +309,9 @@ pub(super) fn helper_command(
             "0",
             "RuntimeMaxUSec",
             "t",
-            "3600000000",
+            // Maximum one-hour wait, one-minute ready window, and two minutes
+            // of startup/registration/consume grace remain natively bounded.
+            "3780000000",
             "CollectMode",
             "s",
             "inactive-or-failed",

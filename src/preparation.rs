@@ -212,6 +212,15 @@ mod tests {
         assert!(arguments.contains(&"game-$literal".into()));
         assert!(arguments.contains(&"no-env-expand".into()));
         assert!(!arguments.iter().any(|s| s.contains("payload-only")));
+        let runtime_us: u64 = arguments
+            .windows(3)
+            .find(|args| args[0] == "RuntimeMaxUSec" && args[1] == "t")
+            .unwrap()[2]
+            .parse()
+            .unwrap();
+        // A valid one-hour intent and its one-minute ready window must both
+        // fit after helper startup and broker registration.
+        assert!(runtime_us > (3_600_000 + 60_000) * 1000);
         assert!(host::helper_command(&args, Path::new("relative/amc-intent"), "intent").is_err());
         assert!(
             host::helper_command(&args, Path::new("/run/user/4321/amc-intent"), "bad/name")
