@@ -265,6 +265,13 @@ fallback checks before persisting the same lease. Changed ownership or demand
 cannot be transferred from an abandoned scan.
 Inventory backing includes granted native obligations and Ready/continuation
 escrow, while ungranted queue churn cannot discard a valid scan.
+Whole-device replay also verifies the complete scanned cgroup frontier and
+recalculates headroom from live limits, resident bytes and uncovered swap demand,
+including groups with zero demand in the earlier scan. This final replay has a
+250 ms bound and rejects incomplete or unsafe observations before durable grant.
+Burst manager evidence is refreshed in a separate single background task and
+expires after one second; missing evidence delays admission while kernel limits
+remain directly rechecked. Manager latency cannot hold ordinary broker RPCs.
 
 ### Kernel page-return guard (version 1)
 

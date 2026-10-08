@@ -420,6 +420,12 @@ with test_section(
     assert state["committed_bytes"] > state["budget_bytes"]
     assert state["burst_committed_bytes"] == 32 * 1048576
     assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
+    machine.succeed("touch /tmp/amc-burst-observation-slow")
+    machine.wait_until_succeeds("test -e /tmp/amc-burst-observation-entered")
+    responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    assert json.loads(result.stdout)['ok']\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
+    assert responsive["elapsedSeconds"] < 1, responsive
+    machine.succeed("rm /tmp/amc-burst-observation-slow")
+    evidence["burstManagerResponsiveness"] = responsive
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
     restored = status()
@@ -1025,8 +1031,9 @@ with test_section(
         "amc recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
     )
     machine.succeed("chown 0 /tmp/page-restore-manifest.json")
+    machine.succeed("mkdir -p /tmp/device-systemctl; ln -s /etc/amc-fixture-systemctl /tmp/device-systemctl/systemctl")
     machine.succeed(
-        "systemd-run --unit=device-host -- amc admission host-serve --policy /tmp/page-device-policy.json "
+        "systemd-run --unit=device-host --setenv=PATH=/tmp/device-systemctl:/run/current-system/sw/bin -- amc admission host-serve --policy /tmp/page-device-policy.json "
         "--socket /run/amc-device/admission.sock --state /var/lib/amc-device"
     )
     machine.wait_until_succeeds("test -S /run/amc-device/admission.sock")
@@ -1041,6 +1048,27 @@ with test_section(
     before_device = int(
         machine.succeed("awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps")
     )
+    # Delay the post-scan manager identity reply, then reduce the target's native
+    # ceiling while the logical reservation set is unchanged. The replay must
+    # use new resident-plus-return demand before publishing any device lease.
+    write_file("/tmp/device-stale-demand.py", """import json, socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect('/run/amc-device/admission.sock')
+    connection.sendall(b'{"op":"acquire_recovery","version":1,"target":"vm"}\\n')
+    response = json.loads(connection.makefile().readline())
+assert not response['granted'], response
+assert 'native device demand or frontier changed' in response['error'], response
+with open('/tmp/device-stale-demand-denied', 'w') as receipt:
+    json.dump(response, receipt)
+""")
+    machine.succeed("touch /tmp/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/device-stale-demand.py")
+    machine.wait_until_succeeds("test -e /tmp/amc-device-inventory-observed")
+    machine.succeed("systemctl set-property --runtime page-target MemoryMax=32M")
+    machine.wait_until_succeeds("test -e /tmp/device-stale-demand-denied")
+    machine.succeed("systemctl set-property --runtime page-target MemoryMax=128M")
+    stale_status = json.loads(machine.succeed("amc admission host-status --socket /run/amc-device/admission.sock"))
+    assert stale_status["recovery"] is None, stale_status
+    machine.succeed("systemctl stop page-return")
     machine.succeed(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- "
         "amc recover-swap --whole-device --socket /run/amc-device/admission.sock"
@@ -1118,6 +1146,7 @@ time.sleep(120)
         "restoredPriority": 10,
         "interruptedRestored": True,
         "brokerUnavailableRestored": True,
+        "postScanNativeDemandDenied": True,
     }
     machine.succeed("systemctl stop page-target device-host")
     machine.succeed("swapoff /dev/vdb; swapon --priority 7 /dev/vdb")

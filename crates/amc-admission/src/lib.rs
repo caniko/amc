@@ -1,6 +1,7 @@
 //! Durable, per-user admission. Native systemd units own workload lifetimes.
 #![forbid(unsafe_code)]
 
+mod burst_manager;
 pub mod clock;
 pub mod continuation;
 pub mod health;

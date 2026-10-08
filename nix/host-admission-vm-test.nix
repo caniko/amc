@@ -37,11 +37,26 @@
       };
     };
   });
-  observer = pkgs.writeShellScript "amc-fixture-systemctl" ''
+  observer = pkgs.writeShellScriptBin "systemctl" ''
     # Simulate loss of manager observations without changing native enforcement.
     if test -e /tmp/amc-observation-unavailable; then
       exit 1
     fi
+    case "$*" in
+      *InvocationID*)
+        if test -e /tmp/amc-device-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /tmp/amc-device-inventory-pause
+          ${pkgs.coreutils}/bin/touch /tmp/amc-device-inventory-observed
+          ${pkgs.coreutils}/bin/sleep 1.5
+        fi
+        ;;
+      *RuntimeMaxUSec*)
+        if test -e /tmp/amc-burst-observation-slow; then
+          ${pkgs.coreutils}/bin/touch /tmp/amc-burst-observation-entered
+          ${pkgs.coreutils}/bin/sleep 1.5
+        fi
+        ;;
+    esac
     exec ${pkgs.systemd}/bin/systemctl "$@"
   '';
   guardLifetime =
@@ -55,7 +70,11 @@ in
   assert import ./test-page-return-guard-module.nix {inherit (pkgs) lib;};
     (pkgs.testers.runNixOSTest {
       inherit name;
-      nodes.machine = {config, ...}: {
+      nodes.machine = {
+        config,
+        lib,
+        ...
+      }: {
         imports = [./host-admission-module.nix];
         boot.kernelPackages = kernelPackages;
         services.amc.hostAdmission = {
@@ -165,12 +184,13 @@ in
         };
         systemd.services.amc-host-admission.requires = ["builders.slice"];
         systemd.services.amc-host-admission.after = ["builders.slice"];
+        systemd.services.amc-host-admission.path = lib.mkBefore [observer];
         systemd.user.services.amc-admission = {
           wantedBy = ["default.target"];
           requires = ["agent-tools.slice" "agent-burst.slice"];
           after = ["agent-tools.slice" "agent-burst.slice"];
           serviceConfig = {
-            ExecStart = "${package}/bin/amc admission serve --policy ${userPolicy} --systemctl ${observer} --host-socket /run/amc-host/admission.sock";
+            ExecStart = "${package}/bin/amc admission serve --policy ${userPolicy} --systemctl ${observer}/bin/systemctl --host-socket /run/amc-host/admission.sock";
             Restart = "on-failure";
           };
           path = [pkgs.systemd];
@@ -181,6 +201,7 @@ in
         environment.etc."page-return-guard-proof.py".source = ./page-return-guard-proof.py;
         environment.etc."amc-test-user-policy.json".source = userPolicy;
         environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
+        environment.etc."amc-fixture-systemctl".source = "${observer}/bin/systemctl";
         environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
         virtualisation.memorySize = 2048;
         virtualisation.emptyDiskImages = [512];

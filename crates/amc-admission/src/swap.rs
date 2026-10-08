@@ -5,9 +5,11 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// Resident swap-cache pages already consume RAM (and memory.current). Only
@@ -259,108 +261,304 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) 
     native_return_safe_claims_at(root, &claims)
 }
 
+/// Bind async device approval to native counters and the complete cgroup
+/// frontier, including groups whose return demand was zero during the scan.
+pub(crate) fn native_return_inventory(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    helper: &Identity,
+    helper_bytes: u64,
+) -> Result<(bool, NativeReturnInventory)> {
+    let root = Path::new("/sys/fs/cgroup");
+    let mut claims = ledger
+        .native_claims(policy, None)
+        .context("native recovery claims are unproven")?;
+    claims.push(crate::recovery::helper_claim(helper, helper_bytes));
+    let inventory = NativeReturnInventory::scan(root, &claims)?;
+    let safe =
+        crate::page_return::native_headroom_at(root, helper, &claims, 0)? && inventory.safe()?;
+    Ok((safe, inventory))
+}
+
 fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]) -> Result<bool> {
-    let deadline = std::time::Instant::now() + crate::page_return::INVENTORY_TIMEOUT;
-    let mut pending = vec![root.to_owned()];
-    let mut seen = 0usize;
-    while let Some(directory) = pending.pop() {
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "device return inventory incomplete: time bound exceeded"
-        );
-        seen += 1;
-        ensure!(seen <= 8192, "swap feasibility scan exceeds bound");
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
+    NativeReturnInventory::scan(root, claims)?.safe()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeDemand {
+    max: Option<u64>,
+    current: u64,
+    swap: SwapUsage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeDirectory {
+    inode: u64,
+    children: Vec<PathBuf>,
+    demand: Option<NativeDemand>,
+}
+
+impl NativeDirectory {
+    fn read(directory: &Path, root: &Path, deadline: Instant) -> Result<Self> {
+        let inode = fs::metadata(directory)?.ino();
+        let mut children = Vec::new();
+        for entry in fs::read_dir(directory)? {
             ensure!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
+                "device inventory observation exceeded time bound"
+            );
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                ensure!(
+                    children.len() < 8192,
+                    "device inventory frontier exceeded bound"
+                );
+                children.push(entry.path());
+            }
+        }
+        children.sort_unstable();
+        let demand = if directory != root && directory.join("memory.swap.current").try_exists()? {
+            let max = fs::read_to_string(directory.join("memory.max"))?;
+            Some(NativeDemand {
+                max: if max.trim() == "max" {
+                    None
+                } else {
+                    Some(max.trim().parse()?)
+                },
+                current: fs::read_to_string(directory.join("memory.current"))?
+                    .trim()
+                    .parse()?,
+                swap: cgroup_usage(directory)?,
+            })
+        } else {
+            None
+        };
+        ensure!(
+            Instant::now() < deadline && fs::metadata(directory)?.ino() == inode,
+            "device inventory native identity or time bound changed"
+        );
+        Ok(Self {
+            inode,
+            children,
+            demand,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeReturnInventory {
+    root: PathBuf,
+    directories: BTreeMap<PathBuf, NativeDirectory>,
+    claims: Vec<crate::host::Reservation>,
+}
+
+impl NativeReturnInventory {
+    fn scan(root: &Path, claims: &[crate::host::Reservation]) -> Result<Self> {
+        let deadline = Instant::now() + crate::page_return::INVENTORY_TIMEOUT;
+        let mut pending = vec![root.to_owned()];
+        let mut directories = BTreeMap::new();
+        while let Some(directory) = pending.pop() {
+            ensure!(
+                Instant::now() < deadline,
                 "device return inventory incomplete: time bound exceeded"
             );
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
+            ensure!(
+                directories.len() + pending.len() < 8192,
+                "swap feasibility scan exceeds bound"
+            );
+            let observed = NativeDirectory::read(&directory, root, deadline)?;
+            pending.extend(observed.children.iter().cloned());
+            directories.insert(directory, observed);
+        }
+        Ok(Self {
+            root: root.to_owned(),
+            directories,
+            claims: claims.to_owned(),
+        })
+    }
+
+    /// Fast, complete replay of the actual inputs, never a bare cached boolean.
+    /// Changed or oversized observations reject instead of blocking ordinary RPCs
+    /// behind another 20-second inventory in the single accept loop.
+    pub(crate) fn current(&self) -> Result<bool> {
+        self.current_until(Instant::now() + Duration::from_millis(250))
+    }
+
+    fn current_until(&self, deadline: Instant) -> Result<bool> {
+        let mut fresh = Self {
+            root: self.root.clone(),
+            directories: BTreeMap::new(),
+            claims: self.claims.clone(),
+        };
+        for (directory, scanned) in &self.directories {
+            ensure!(
+                Instant::now() < deadline,
+                "device inventory replay exceeded time bound"
+            );
+            let observed = NativeDirectory::read(directory, &self.root, deadline)?;
+            if observed.inode != scanned.inode || observed.children != scanned.children {
+                return Ok(false);
             }
+            fresh.directories.insert(directory.clone(), observed);
         }
-        if directory == root || !directory.join("memory.swap.current").exists() {
-            continue;
-        }
-        let swap = cgroup_usage(&directory)?.return_bytes();
-        if swap == 0 {
-            continue;
-        }
-        let max = fs::read_to_string(directory.join("memory.max"))?;
-        if max.trim() == "max" {
-            continue;
-        }
-        let max: u64 = max.trim().parse()?;
-        let current: u64 = fs::read_to_string(directory.join("memory.current"))?
-            .trim()
-            .parse()?;
-        let group = format!("/{}", directory.strip_prefix(root)?.display());
-        let mut committed = 0u64;
-        let mut covered_current = 0u64;
-        let mut covered_return = 0u64;
-        for r in claims.iter().filter(|r| {
-            r.granted
-                && (r.identity.cgroup == group
-                    || r.identity.cgroup.starts_with(&format!("{group}/")))
-        }) {
-            if r.identity.inode == 0 && r.identity.pid == 0 {
-                // Ready/escrow envelopes have no resident pages to credit.
-                committed = committed.saturating_add(r.memory_bytes);
+        let safe = fresh.safe_until(deadline)?;
+        Ok(safe && Instant::now() < deadline)
+    }
+
+    fn safe(&self) -> Result<bool> {
+        self.safe_until(Instant::now() + crate::page_return::INVENTORY_TIMEOUT)
+    }
+
+    fn safe_until(&self, deadline: Instant) -> Result<bool> {
+        let root = &self.root;
+        let claims = &self.claims;
+        let disjoint: Vec<_> = claims
+            .iter()
+            .filter(|r| r.granted)
+            .map(|r| {
+                let overlaps = claims.iter().any(|other| {
+                    other.granted
+                        && other.id != r.id
+                        && other.identity.inode != 0
+                        && (other.identity.cgroup == r.identity.cgroup
+                            || other
+                                .identity
+                                .cgroup
+                                .starts_with(&format!("{}/", r.identity.cgroup))
+                            || r.identity
+                                .cgroup
+                                .starts_with(&format!("{}/", other.identity.cgroup)))
+                });
+                (r, !overlaps)
+            })
+            .collect();
+        for (directory, observed) in &self.directories {
+            ensure!(
+                Instant::now() < deadline,
+                "device headroom replay exceeded time bound"
+            );
+            let Some(demand) = &observed.demand else {
+                continue;
+            };
+            let Some(max) = demand.max else {
+                continue;
+            };
+            let swap = demand.swap.return_bytes();
+            if swap == 0 {
                 continue;
             }
-            let boundary = root.join(r.identity.cgroup.trim_start_matches('/'));
-            ensure!(
-                fs::metadata(&boundary)?.ino() == r.identity.inode,
-                "device return entitlement identity changed"
-            );
-            let resident: u64 = fs::read_to_string(boundary.join("memory.current"))?
-                .trim()
-                .parse()?;
-            committed = committed.saturating_add(r.memory_bytes.max(resident));
-            // Hierarchical observations overlap. Without a disjoint grant
-            // boundary, neither its resident pages nor its return can be
-            // credited again. Synthetic envelopes never supply such credit.
-            let overlaps = claims.iter().any(|other| {
-                other.granted
-                    && other.id != r.id
-                    && other.identity.inode != 0
-                    && (other.identity.cgroup == r.identity.cgroup
-                        || other
-                            .identity
-                            .cgroup
-                            .starts_with(&format!("{}/", r.identity.cgroup))
-                        || r.identity
-                            .cgroup
-                            .starts_with(&format!("{}/", other.identity.cgroup)))
-            });
-            if !overlaps {
-                covered_current = covered_current.saturating_add(resident);
-                covered_return = covered_return.saturating_add(
-                    cgroup_usage(&boundary)?
-                        .return_bytes()
-                        .min(r.memory_bytes.saturating_sub(resident)),
+            let current = demand.current;
+            let group = format!("/{}", directory.strip_prefix(root)?.display());
+            let mut committed = 0u64;
+            let mut covered_current = 0u64;
+            let mut covered_return = 0u64;
+            for &(r, independent) in disjoint.iter().filter(|(r, _)| {
+                r.identity.cgroup == group || r.identity.cgroup.starts_with(&format!("{group}/"))
+            }) {
+                if r.identity.inode == 0 && r.identity.pid == 0 {
+                    // Ready/escrow envelopes have no resident pages to credit.
+                    committed = committed.saturating_add(r.memory_bytes);
+                    continue;
+                }
+                let boundary = root.join(r.identity.cgroup.trim_start_matches('/'));
+                let observed = self
+                    .directories
+                    .get(&boundary)
+                    .context("device return entitlement was not inventoried")?;
+                ensure!(
+                    observed.inode == r.identity.inode,
+                    "device return entitlement identity changed"
                 );
+                let demand = observed
+                    .demand
+                    .as_ref()
+                    .context("device return entitlement demand is unavailable")?;
+                let resident = demand.current;
+                committed = committed.saturating_add(r.memory_bytes.max(resident));
+                // Hierarchical observations overlap. Without a disjoint grant
+                // boundary, neither its resident pages nor its return can be
+                // credited again. Synthetic envelopes never supply such credit.
+                if independent {
+                    covered_current = covered_current.saturating_add(resident);
+                    covered_return = covered_return.saturating_add(
+                        demand
+                            .swap
+                            .return_bytes()
+                            .min(r.memory_bytes.saturating_sub(resident)),
+                    );
+                }
+            }
+            let obligation = current
+                .saturating_sub(covered_current)
+                .saturating_add(committed)
+                .saturating_add(swap.saturating_sub(covered_return));
+            if obligation > max {
+                return Ok(false);
             }
         }
-        let obligation = current
-            .saturating_sub(covered_current)
-            .saturating_add(committed)
-            .saturating_add(swap.saturating_sub(covered_return));
-        if obligation > max {
-            return Ok(false);
-        }
+        Ok(true)
     }
-    ensure!(
-        std::time::Instant::now() < deadline,
-        "device return inventory incomplete: time bound exceeded"
-    );
-    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_device_inventory_rechecks_post_scan_demand_without_logical_grant_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-device-demand-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let directory = root.join("work");
+        fs::create_dir_all(&directory).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "5"),
+            ("memory.swap.current", "0"),
+            ("memory.stat", "swapcached 0\n"),
+        ] {
+            fs::write(directory.join(name), value).unwrap();
+        }
+        let claim = crate::recovery::helper_claim(
+            &Identity {
+                cgroup: "/work".into(),
+                inode: fs::metadata(&directory).unwrap().ino(),
+                uid: 1000,
+                pid: 42,
+                start_ticks: 7,
+            },
+            10,
+        );
+        let proof = NativeReturnInventory::scan(&root, &[claim]).unwrap();
+        assert!(proof.safe().unwrap());
+        assert!(proof.current().unwrap());
+        // This group had no return demand at all in the approved scan.
+        fs::write(directory.join("memory.swap.current"), "6").unwrap();
+        assert!(
+            !proof.current().unwrap(),
+            "logical grants alone reused stale native demand"
+        );
+        // Harmless telemetry growth may still fit: recalculate, don't invalidate
+        // every scan because a background service changed one resident counter.
+        fs::write(directory.join("memory.swap.current"), "4").unwrap();
+        assert!(proof.current().unwrap());
+        fs::write(directory.join("memory.current"), "7").unwrap();
+        assert!(!proof.current().unwrap());
+        fs::write(directory.join("memory.current"), "5").unwrap();
+        fs::write(directory.join("memory.max"), "8").unwrap();
+        assert!(!proof.current().unwrap());
+        fs::write(directory.join("memory.max"), "10").unwrap();
+        fs::create_dir(root.join("new-owner")).unwrap();
+        assert!(
+            !proof.current().unwrap(),
+            "changed native frontier reused an incomplete scan"
+        );
+        fs::remove_dir(root.join("new-owner")).unwrap();
+        assert!(proof.current_until(Instant::now()).is_err());
+        fs::remove_file(directory.join("memory.current")).unwrap();
+        assert!(proof.current().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn unrelated_unresolvable_swap_entry_does_not_hide_a_healthy_target() {
         let root = std::env::temp_dir().join(format!(

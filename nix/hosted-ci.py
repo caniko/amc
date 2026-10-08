@@ -107,10 +107,17 @@ def verify_foreground_evidence(path, kernel_series=None):
     verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
+    if device.get("postScanNativeDemandDenied") is not True:
+        raise RuntimeError("Native device recovery reused stale post-scan demand")
     completion = receipt.get("completion", {})
     namespaces = receipt.get("nativeNamespaceCompletion", {})
     charge = receipt.get("chargeOwner", {})
     runners = receipt.get("namespaceRunnerBacking", {})
+    responsive = receipt.get("burstManagerResponsiveness", {})
+    if (responsive.get("responses") != 3
+        or type(responsive.get("elapsedSeconds")) not in (int, float)
+        or not 0 <= responsive["elapsedSeconds"] < 1):
+        raise RuntimeError("burst manager blocked native broker RPCs")
     helpers = receipt.get("preparationHelperBacking", {})
     if (helpers.get("concurrentHelpers") != 2
         or helpers.get("aggregateBytesPerUser") != 64 * 1048576

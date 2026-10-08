@@ -324,7 +324,10 @@ pub fn serve_supervised(
     let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
+    let mut burst_manager = crate::burst_manager::Cache::default();
     while !stopping() {
+        burst_manager.refresh(&ledger)?;
+        let burst_evidence = burst_manager.snapshot();
         if tick.elapsed() >= Duration::from_millis(250) {
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
@@ -338,7 +341,7 @@ pub fn serve_supervised(
                 }
             }
             reconcile_recovery(&mut ledger);
-            let capacity = observe(&mut ledger, &policy, health_file);
+            let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
             waiting = ledger.advance(
                 crate::clock::boot_ms()?,
                 &policy,
@@ -358,7 +361,7 @@ pub fn serve_supervised(
                 .worker
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("native inventory worker failed")))
-                .and_then(|(mut reply, completed)| {
+                .and_then(|(mut reply, native_demand, completed)| {
                     if reply.granted {
                         // Results authorize only one replay of the same authenticated
                         // request. Never replace the current ledger with a scan clone.
@@ -385,10 +388,14 @@ pub fn serve_supervised(
                                     0,
                                     &policy,
                                     ledger,
-                                    (health_file, Some(true)),
+                                    (health_file, Some(true), &burst_evidence),
                                     &mut fresh,
                                 )?;
                                 if fresh.granted {
+                                    ensure!(
+                                        native_demand.as_ref().map_or(Ok(true), crate::swap::NativeReturnInventory::current)?,
+                                        "native device demand or frontier changed during inventory replay"
+                                    );
                                     ensure!(
                                         inventory_recovery_matches(
                                             &fresh.recovery,
@@ -444,6 +451,7 @@ pub fn serve_supervised(
                             &policy,
                             &ledger,
                             health_file,
+                            &burst_evidence,
                         ) {
                             Ok(task) => inventory = Some(task),
                             Err(e) => {
@@ -509,6 +517,17 @@ pub fn serve_supervised(
                                     )?
                                 };
                             let now = crate::clock::boot_ms()?;
+                            let burst = policy.domains.iter().any(|d| d.name == domain && d.burst);
+                            let runtime_max_ms = if burst {
+                                burst_manager.register(&identity)?;
+                                let Some(runtime) = burst_manager.runtime(&identity) else {
+                                    reply.waiting = Some(WaitReason::Unknown);
+                                    return Ok(reply);
+                                };
+                                Some(runtime)
+                            } else {
+                                None
+                            };
                             let owner_key =
                                 format!("owner-{}-{}", identity.pid, identity.start_ticks);
                             let operation = root_operation(
@@ -538,7 +557,7 @@ pub fn serve_supervised(
                                             credentials.uid() == 0,
                                             "only root execution owners can nominate an origin"
                                         );
-                                        origin_continuation(origin, ledger)?
+                                        origin_continuation(origin, ledger, &burst_evidence)?
                                     }
                                     _ => None,
                                 }
@@ -607,7 +626,8 @@ pub fn serve_supervised(
                                 && !old_owner
                                 && continuation_parent.is_none()
                             {
-                                let capacity = observe(ledger, &policy, health_file);
+                                let capacity =
+                                    observe(ledger, &policy, health_file, &burst_evidence);
                                 let d = policy
                                     .domains
                                     .iter()
@@ -626,16 +646,6 @@ pub fn serve_supervised(
                                     return Ok(reply);
                                 }
                             }
-                            let burst = policy
-                                .domains
-                                .iter()
-                                .find(|d| d.name == domain)
-                                .is_some_and(|d| d.burst);
-                            let runtime_max_ms = if burst {
-                                Some(host_native::burst_runtime(&identity)?)
-                            } else {
-                                None
-                            };
                             if let Some(operation) = operation {
                                 ledger.bind_pool_operation(&domain, &identity, operation)?;
                             }
@@ -679,7 +689,7 @@ pub fn serve_supervised(
                                 credentials.uid(),
                                 &policy,
                                 ledger,
-                                (health_file, None),
+                                (health_file, None, &burst_evidence),
                                 &mut reply,
                             )?;
                         }
@@ -714,7 +724,13 @@ struct PendingInventory {
     request: Request,
     owner: crate::ledger::ClientIdentity,
     backing: Vec<u8>,
-    worker: thread::JoinHandle<Result<(Response, Instant)>>,
+    worker: thread::JoinHandle<
+        Result<(
+            Response,
+            Option<crate::swap::NativeReturnInventory>,
+            Instant,
+        )>,
+    >,
 }
 
 fn take_finished_inventory(pending: &mut Option<PendingInventory>) -> Option<PendingInventory> {
@@ -819,6 +835,7 @@ impl PendingInventory {
         policy: &HostPolicy,
         ledger: &HostLedger,
         health_file: Option<&Path>,
+        burst_evidence: &crate::burst_manager::Snapshot,
     ) -> Result<Self> {
         let owner = crate::ledger::ClientIdentity {
             pid,
@@ -829,6 +846,7 @@ impl PendingInventory {
         let scan_policy = policy.clone();
         let mut scan_ledger = ledger.clone();
         let health_file = health_file.map(Path::to_owned);
+        let burst_evidence = burst_evidence.clone();
         let worker = thread::Builder::new()
             .name("amc-native-inventory".into())
             .spawn(move || {
@@ -836,16 +854,33 @@ impl PendingInventory {
                     version: 1,
                     ..Default::default()
                 };
+                let (inventory_proof, native_demand) =
+                    if matches!(&scan_request, Request::AcquireRecovery { .. }) {
+                        let spec = scan_policy
+                            .swap_recovery
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
+                        let helper = crate::swap::helper(pid, spec)?;
+                        let (safe, proof) = crate::swap::native_return_inventory(
+                            &scan_ledger,
+                            &scan_policy,
+                            &helper,
+                            spec.helper_bytes,
+                        )?;
+                        (Some(safe), Some(proof))
+                    } else {
+                        (None, None)
+                    };
                 handle_advance_request(
                     scan_request,
                     pid,
                     0,
                     &scan_policy,
                     &mut scan_ledger,
-                    (health_file.as_deref(), None),
+                    (health_file.as_deref(), inventory_proof, &burst_evidence),
                     &mut reply,
                 )?;
-                Ok((reply, Instant::now()))
+                Ok((reply, native_demand, Instant::now()))
             })?;
         Ok(Self {
             stream,
@@ -906,6 +941,7 @@ fn populate_status(reply: &mut Response, ledger: &HostLedger, uid: u32) {
 fn origin_continuation(
     origin: &crate::ledger::ClientIdentity,
     ledger: &HostLedger,
+    burst_evidence: &crate::burst_manager::Snapshot,
 ) -> Result<Option<crate::continuation::ContinuationCapability>> {
     ensure!(
         host_native::process_start(origin.pid)? == origin.start_ticks,
@@ -926,7 +962,7 @@ fn origin_continuation(
         return Ok(None);
     };
     ensure!(
-        host_native::enforcement(r).is_some()
+        cached_enforcement(r, burst_evidence)
             && host_native::process_start(origin.pid)? == origin.start_ticks,
         "Nix origin native boundary changed"
     );
@@ -942,6 +978,7 @@ fn observe(
     ledger: &mut HostLedger,
     policy: &HostPolicy,
     health_file: Option<&Path>,
+    burst_evidence: &crate::burst_manager::Snapshot,
 ) -> Option<crate::host::Capacity> {
     // A nested scope can move the last process out of its previous boundary
     // between readiness and Consume. Settle positively empty native owners
@@ -968,7 +1005,7 @@ fn observe(
             .reservations
             .iter()
             .filter(|r| r.granted)
-            .all(|r| host_native::enforcement(r).is_some())
+            .all(|r| cached_enforcement(r, burst_evidence))
     {
         host_native::capacity().ok().filter(|_| {
             health_file.is_none_or(|path| crate::health::permits(path).unwrap_or(false))
@@ -976,6 +1013,14 @@ fn observe(
     } else {
         None
     }
+}
+
+fn cached_enforcement(r: &Reservation, evidence: &crate::burst_manager::Snapshot) -> bool {
+    host_native::memory_enforcement(r).is_some()
+        && (!r.burst
+            || evidence
+                .runtime(&r.identity)
+                .is_some_and(|runtime| Some(runtime) == r.runtime_max_ms))
 }
 
 fn reconcile_recovery(ledger: &mut HostLedger) {
@@ -1013,11 +1058,11 @@ fn handle_advance_request(
     uid: u32,
     policy: &HostPolicy,
     ledger: &mut HostLedger,
-    evidence: (Option<&Path>, Option<bool>),
+    evidence: (Option<&Path>, Option<bool>, &crate::burst_manager::Snapshot),
     reply: &mut Response,
 ) -> Result<()> {
     use crate::preparation::PreparationPhase;
-    let (health_file, inventory_proof) = evidence;
+    let (health_file, inventory_proof, burst_evidence) = evidence;
     let now = crate::clock::boot_ms()?;
     match request {
         Request::NamespaceRunner { version } => {
@@ -1113,7 +1158,7 @@ fn handle_advance_request(
                         && spec.swap_bytes == p.swap_bytes),
                     "preparation policy changed"
                 );
-                let capacity = observe(ledger, policy, health_file)
+                let capacity = observe(ledger, policy, health_file, burst_evidence)
                     .ok_or_else(|| anyhow::anyhow!("fresh host evidence unavailable"))?;
                 ensure!(
                     ledger.recovery.is_none()
@@ -1191,7 +1236,7 @@ fn handle_advance_request(
                 reply.waiting = Some(WaitReason::SwapReturn);
                 return Ok(());
             }
-            let capacity = observe(ledger, policy, health_file);
+            let capacity = observe(ledger, policy, health_file, burst_evidence);
             let native_safe = match inventory_proof {
                 Some(proven) => {
                     let mut claims = ledger
@@ -1290,7 +1335,7 @@ fn handle_advance_request(
                 reply.waiting = Some(WaitReason::SwapReturn);
                 return Ok(());
             }
-            let capacity = observe(ledger, policy, health_file);
+            let capacity = observe(ledger, policy, health_file, burst_evidence);
             let claims = ledger
                 .native_claims(policy, None)
                 .ok_or_else(|| anyhow::anyhow!("completion native backing unavailable"))?;
@@ -1575,6 +1620,7 @@ mod tests {
                     granted: true,
                     ..Default::default()
                 },
+                None,
                 Instant::now(),
             ))
         });

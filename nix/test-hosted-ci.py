@@ -83,6 +83,7 @@ class NativeEvidenceTests(unittest.TestCase):
                 "excessReserveDenied": True,
                 "retiredUserReleasedAfterCleanup": True,
             },
+            "burstManagerResponsiveness": {"responses": 3, "elapsedSeconds": 0.2},
             "preparationHelperBacking": {
                 "concurrentHelpers": 2, "aggregateBytesPerUser": 64 * 1048576,
                 "reservedBytes": 128 * 1048576, "restartPreserved": True,
@@ -110,6 +111,7 @@ class NativeEvidenceTests(unittest.TestCase):
                 "replacementBatchBytes": 2 * 1048576,
             },
             "deviceReturn": {
+                "postScanNativeDemandDenied": True,
                 "beforeUsedKiB": 65536,
                 "afterUsedKiB": 0,
                 "restoredPriority": 10,
@@ -208,6 +210,9 @@ class NativeEvidenceTests(unittest.TestCase):
                 ("namespaceRunnerBacking", "removedUserRetained", False),
                 ("namespaceRunnerBacking", "excessReserveDenied", False),
                 ("namespaceRunnerBacking", "retiredUserReleasedAfterCleanup", False),
+                ("burstManagerResponsiveness", "responses", 0),
+                ("burstManagerResponsiveness", "elapsedSeconds", 2),
+                ("deviceReturn", "postScanNativeDemandDenied", False),
                 ("preparationHelperBacking", "concurrentHelpers", 1),
                 ("preparationHelperBacking", "aggregateBytesPerUser", 0),
                 ("preparationHelperBacking", "reservedBytes", 0),

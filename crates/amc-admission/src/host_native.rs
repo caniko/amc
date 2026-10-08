@@ -238,14 +238,21 @@ pub fn empty_reservation(r: &crate::host::Reservation) -> Option<bool> {
 
 /// Any changed or unreadable granted boundary inhibits every new grant.
 pub fn enforcement(r: &crate::host::Reservation) -> Option<()> {
+    memory_enforcement(r)?;
+    if r.burst && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
+        return None;
+    }
+    Some(())
+}
+
+/// Broker-safe kernel observations. Manager properties are refreshed separately
+/// and asynchronously; this function never runs a subprocess.
+pub(crate) fn memory_enforcement(r: &crate::host::Reservation) -> Option<()> {
     let path = crate::native::cgroup_directory(&r.identity.cgroup).ok()?;
     if fs::metadata(&path).ok()?.ino() != r.identity.inode
         || number(&path, "memory.max").ok()? != r.memory_bytes
         || number(&path, "memory.swap.max").ok()? != r.swap_bytes
     {
-        return None;
-    }
-    if r.burst && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
         return None;
     }
     Some(())
