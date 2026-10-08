@@ -123,6 +123,10 @@ pub struct Response {
     pub continuation: Option<crate::continuation::ContinuationCapability>,
     #[serde(default)]
     pub returned_bytes: Option<u64>,
+    #[serde(default)]
+    pub resident_bytes: Option<u64>,
+    #[serde(default)]
+    pub return_demand_reduction_bytes: Option<u64>,
 }
 
 pub fn call(socket: &Path, request: &Request) -> Result<Response> {
@@ -924,8 +928,17 @@ fn handle_advance_request(
                     return Ok(());
                 }
             }
-            let before_swap_bytes = crate::page_return::target_swap(&target)?;
+            let usage = crate::page_return::target_usage(&target)?;
+            let before_swap_bytes = usage.used_bytes;
             if before_swap_bytes == 0 {
+                reply.waiting = Some(WaitReason::SwapReturn);
+                return Ok(());
+            }
+            if !crate::page_return::range_swapped(
+                &crate::page_return::open_pagemap(&target)?,
+                address,
+                bytes,
+            )? {
                 reply.waiting = Some(WaitReason::SwapReturn);
                 return Ok(());
             }
@@ -951,6 +964,7 @@ fn handle_advance_request(
                         address,
                         bytes,
                         before_swap_bytes,
+                        before_return_bytes: Some(usage.return_bytes()),
                         settled: false,
                     },
                     return_bytes: bytes,
@@ -975,14 +989,38 @@ fn handle_advance_request(
             let crate::recovery::RecoveryAction::Pages {
                 target,
                 before_swap_bytes,
+                before_return_bytes,
+                bytes,
+                address,
                 settled,
                 ..
             } = &mut lease.action
             else {
                 anyhow::bail!("native recovery is not a page return");
             };
-            let after = crate::page_return::target_swap(target)?;
-            reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after));
+            ensure!(
+                crate::page_return::identity(target.pid, target.start_ticks, spec)? == *target,
+                "page return target changed before settlement"
+            );
+            let after = crate::page_return::target_usage(target)?;
+            reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after.used_bytes));
+            reply.return_demand_reduction_bytes =
+                before_return_bytes.map(|before| before.saturating_sub(after.return_bytes()));
+            reply.resident_bytes = Some(
+                if crate::page_return::range_resident(
+                    &crate::page_return::open_pagemap(target)?,
+                    *address,
+                    *bytes,
+                )? {
+                    *bytes
+                } else {
+                    0
+                },
+            );
+            if reply.resident_bytes != Some(*bytes) {
+                reply.waiting = Some(WaitReason::Unknown);
+                return Ok(());
+            }
             *settled = true;
             lease.return_bytes = 0;
             reply.granted = true;

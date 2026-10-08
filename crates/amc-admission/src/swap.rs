@@ -10,8 +10,80 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Resident swap-cache pages already consume RAM (and memory.current). Only
+/// the remaining occupied slots need additional RAM to return their pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapUsage {
+    pub(crate) used_bytes: u64,
+    pub(crate) resident_cache_bytes: u64,
+}
+
+impl SwapUsage {
+    fn new(used_bytes: u64, resident_cache_bytes: u64) -> Result<Self> {
+        ensure!(
+            resident_cache_bytes <= used_bytes,
+            "inconsistent native swap cache accounting"
+        );
+        Ok(Self {
+            used_bytes,
+            resident_cache_bytes,
+        })
+    }
+
+    pub fn return_bytes(self) -> u64 {
+        self.used_bytes - self.resident_cache_bytes
+    }
+
+    pub fn used_bytes(self) -> u64 {
+        self.used_bytes
+    }
+}
+
+fn stat_value(text: &str, key: &str) -> Result<u64> {
+    let mut matches = text.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some(key)).then_some(fields)
+    });
+    let mut fields = matches.next().context("missing native swap accounting")?;
+    ensure!(matches.next().is_none(), "duplicate native swap accounting");
+    let value = fields.next().context("missing swap value")?.parse()?;
+    ensure!(fields.next().is_none(), "invalid native swap value");
+    Ok(value)
+}
+
+pub fn cgroup_usage(directory: &Path) -> Result<SwapUsage> {
+    let current = || -> Result<u64> {
+        Ok(fs::read_to_string(directory.join("memory.swap.current"))?
+            .trim()
+            .parse()?)
+    };
+    let cached = || -> Result<u64> {
+        stat_value(
+            &fs::read_to_string(directory.join("memory.stat"))?,
+            "swapcached",
+        )
+    };
+    // memory.stat flushes hierarchical rstat counters. Require stable readings
+    // on both sides of each flush; an inconsistent sample inhibits new work.
+    for _ in 0..3 {
+        let first = current()?;
+        let cache = cached()?;
+        let middle = current()?;
+        let next_cache = cached()?;
+        let last = current()?;
+        if first == middle && middle == last && cache == next_cache && cache <= last {
+            return SwapUsage::new(last, cache);
+        }
+    }
+    anyhow::bail!("unstable native swap cache accounting")
+}
+
 pub fn return_bytes(ledger: &HostLedger) -> Result<u64> {
     let text = fs::read_to_string("/proc/meminfo")?;
+    return_bytes_at(ledger, &text, Path::new("/sys/fs/cgroup"))
+}
+
+fn return_bytes_at(ledger: &HostLedger, text: &str, root: &Path) -> Result<u64> {
     let value = |key: &str| -> Result<u64> {
         let mut fields = text
             .lines()
@@ -25,19 +97,34 @@ pub fn return_bytes(ledger: &HostLedger) -> Result<u64> {
     let used = value("SwapTotal:")?
         .checked_sub(value("SwapFree:")?)
         .context("invalid host swap occupancy")?;
+    let demand = SwapUsage::new(used, value("SwapCached:")?)?.return_bytes();
     let mut covered = 0u64;
     for r in ledger.reservations.iter().filter(|r| r.granted) {
-        let directory = Path::new("/sys/fs/cgroup").join(r.identity.cgroup.trim_start_matches('/'));
+        let directory = root.join(r.identity.cgroup.trim_start_matches('/'));
         ensure!(
             fs::metadata(&directory)?.ino() == r.identity.inode,
             "swap target identity changed"
         );
-        let swap: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
+        // Use disjoint native boundaries: a parent's observation includes its
+        // children and cannot provide a second credit for their same pages.
+        if ledger.reservations.iter().any(|other| {
+            other.granted
+                && other.id != r.id
+                && (other.identity.cgroup == r.identity.cgroup
+                    || other
+                        .identity
+                        .cgroup
+                        .starts_with(&format!("{}/", r.identity.cgroup)))
+        }) {
+            continue;
+        }
+        let swap = cgroup_usage(&directory)?.return_bytes();
+        let resident: u64 = fs::read_to_string(directory.join("memory.current"))?
             .trim()
             .parse()?;
-        covered = covered.saturating_add(swap.min(r.memory_bytes));
+        covered = covered.saturating_add(swap.min(r.memory_bytes.saturating_sub(resident)));
     }
-    Ok(used.saturating_sub(covered))
+    Ok(demand.saturating_sub(covered))
 }
 
 #[derive(Debug)]
@@ -132,9 +219,7 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger) -> Result<bool> {
         if directory == root || !directory.join("memory.swap.current").exists() {
             continue;
         }
-        let swap: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
-            .trim()
-            .parse()?;
+        let swap = cgroup_usage(&directory)?.return_bytes();
         if swap == 0 {
             continue;
         }
@@ -167,11 +252,87 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger) -> Result<bool> {
 mod tests {
     use super::*;
     #[test]
+    fn resident_swap_cache_is_not_an_additional_ram_obligation() {
+        let ledger = HostLedger::new("boot".into());
+        let info = "SwapTotal: 100 kB\nSwapFree: 20 kB\nSwapCached: 30 kB\n";
+        assert_eq!(
+            return_bytes_at(&ledger, info, Path::new("/unused")).unwrap(),
+            50 * 1024
+        );
+        for invalid in [
+            "SwapTotal: 100 kB\nSwapFree: 20 kB\n",
+            "SwapTotal: 100 kB\nSwapFree: 20 kB\nSwapCached: 81 kB\n",
+        ] {
+            assert!(return_bytes_at(&ledger, invalid, Path::new("/unused")).is_err());
+        }
+    }
+
+    #[test]
+    fn a_native_grant_only_covers_return_within_its_unused_resident_ceiling() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-return-credit-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(
+            root.join("target/memory.swap.current"),
+            (40 * 1024).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("target/memory.stat"),
+            format!("swapcached {}\n", 10 * 1024),
+        )
+        .unwrap();
+        fs::write(root.join("target/memory.current"), (58 * 1024).to_string()).unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.reservations.push(crate::host::Reservation {
+            id: "grant".into(),
+            domain: "target".into(),
+            identity: Identity {
+                cgroup: "/target".into(),
+                inode: fs::metadata(root.join("target")).unwrap().ino(),
+                uid: 1000,
+                pid: 42,
+                start_ticks: 7,
+            },
+            memory_bytes: 60 * 1024,
+            swap_bytes: 40 * 1024,
+            requested_ms: 0,
+            deadline_ms: 1000,
+            granted: true,
+            owners: vec![],
+            owners_finished: false,
+            burst: false,
+            runtime_max_ms: None,
+            continuation: None,
+        });
+        let info = "SwapTotal: 100 kB\nSwapFree: 20 kB\nSwapCached: 30 kB\n";
+        assert_eq!(return_bytes_at(&ledger, info, &root).unwrap(), 48 * 1024);
+        // Overlapping observations must not cover the same return twice.
+        let mut duplicate = ledger.reservations[0].clone();
+        duplicate.id = "duplicate".into();
+        ledger.reservations.push(duplicate);
+        assert_eq!(return_bytes_at(&ledger, info, &root).unwrap(), 50 * 1024);
+        for invalid in [
+            "",
+            "swapcached nope\n",
+            "swapcached 999999\n",
+            "swapcached 0\nswapcached 0\n",
+        ] {
+            fs::write(root.join("target/memory.stat"), invalid).unwrap();
+            assert!(cgroup_usage(&root.join("target")).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn return_feasibility_checks_the_pages_leaf_even_when_the_helper_and_host_fit() {
         let root =
             std::env::temp_dir().join(format!("amc-swap-{}", crate::store::fresh_id().unwrap()));
         fs::create_dir_all(root.join("parent/leaf")).unwrap();
         for (group, max, current, swap) in [("parent", 100, 20, 20), ("parent/leaf", 30, 20, 20)] {
+            fs::write(root.join(group).join("memory.stat"), "swapcached 0\n").unwrap();
             for (name, value) in [
                 ("memory.max", max),
                 ("memory.current", current),

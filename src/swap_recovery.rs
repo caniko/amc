@@ -91,12 +91,19 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
         return Ok(0);
     }
     if !args.restore && !args.whole_device {
-        return return_pages(
+        let result = return_pages(
             &args.socket,
             reply
                 .recovery_policy
                 .context("missing page return policy")?,
         );
+        return match result {
+            Ok(code) => Ok(code),
+            Err(_) => {
+                eprintln!("page return incomplete: native backing or residency proof unavailable");
+                Ok(75)
+            }
+        };
     }
     Ok(if waiting { 75 } else { 0 })
 }
@@ -104,6 +111,7 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
 fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut returned = 0u64;
+    let mut unproven = false;
     for _ in 0..1024 {
         if Instant::now() >= deadline {
             break;
@@ -116,19 +124,30 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
             let target = (|| -> Result<_> {
                 let start = amc_admission::host_native::process_start(pid)?;
                 let identity = amc_admission::page_return::identity(pid, start, &policy)?;
-                if amc_admission::page_return::target_swap(&identity)? == 0 {
+                if amc_admission::page_return::target_usage(&identity)?.used_bytes() == 0 {
                     return Ok(None);
                 }
                 let memory = amc_admission::page_return::open_memory(&identity)?;
-                Ok(Some((identity, memory)))
+                let pagemap = amc_admission::page_return::open_pagemap(&identity)?;
+                Ok(Some((identity, memory, pagemap)))
             })();
-            let Ok(Some((target, memory))) = target else {
-                continue;
+            let (target, memory, pagemap) = match target {
+                Ok(Some(target)) => target,
+                Ok(None) => continue,
+                Err(_) => {
+                    unproven = true;
+                    continue;
+                }
             };
             let range =
                 amc_admission::page_return::first_swapped_range(&target, policy.batch_bytes);
-            let Ok(Some((address, bytes))) = range else {
-                continue;
+            let (address, bytes) = match range {
+                Ok(Some(range)) => range,
+                Ok(None) => continue,
+                Err(_) => {
+                    unproven = true;
+                    continue;
+                }
             };
             let reply = call(
                 socket,
@@ -145,16 +164,15 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
                 return Ok(75);
             }
             amc_admission::page_return::read_batch(&memory, address, bytes)?;
+            let resident = amc_admission::page_return::range_resident(&pagemap, address, bytes)?;
             drop(memory);
             thread::sleep(Duration::from_millis(10));
-            let progress = call(socket, &Request::FinishPageReturn { version: 1 })?
-                .returned_bytes
-                .unwrap_or(0);
-            if progress == 0 {
-                eprintln!("page return stalled: no observed target swap reduction");
+            let reply = call(socket, &Request::FinishPageReturn { version: 1 })?;
+            if !resident || reply.resident_bytes != Some(bytes) {
+                eprintln!("page return stalled: batch residency is unproven");
                 return Ok(75);
             }
-            returned = returned.saturating_add(progress);
+            returned = returned.saturating_add(bytes);
             progressed = true;
             break;
         }
@@ -162,11 +180,11 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
             break;
         }
     }
-    let remaining = amc_admission::page_return::selected_swap_bytes(&policy)?;
+    let remaining = amc_admission::page_return::selected_return_bytes(&policy)?;
     eprintln!(
-        "page return: observed {returned} bytes of target swap reduction, {remaining} bytes remain in selected subtrees"
+        "page return: proved {returned} bytes resident, {remaining} nonresident return bytes remain in selected subtrees"
     );
     // Partial progress, unreadable/unsupported pages and campaign cutoffs remain
     // stalled. The next timer can resume, but this invocation did not complete.
-    Ok(if remaining == 0 { 0 } else { 75 })
+    Ok(if remaining == 0 && !unproven { 0 } else { 75 })
 }

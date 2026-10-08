@@ -694,7 +694,10 @@ with test_section(
     machine.wait_until_succeeds("test -e /tmp/page-target-ready")
     group = "/sys/fs/cgroup/system.slice/page-target.service"
     machine.wait_until_succeeds(f"test $(cat {group}/memory.swap.current) -ge 33554432")
-    before = int(machine.succeed(f"cat {group}/memory.swap.current"))
+    before_native = json.loads(
+        machine.succeed("python3 /etc/page-return-target.py --snapshot")
+    )
+    assert before_native["returnBytes"] >= 32 * 1048576, before_native
     # The recovery helper's 128 MiB reservation cannot fit behind this live
     # 64 MiB operation in the 160 MiB broker budget. A wait is not success.
     machine.succeed(
@@ -726,6 +729,11 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
     connection.sendall((json.dumps(request)+'\\n').encode())
     response = json.loads(connection.makefile().readline())
 assert response['granted'] and response['error'] is None, response
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect('/run/amc-host/admission.sock')
+    connection.sendall(b'{"op":"finish_page_return","version":1}\\n')
+    response = json.loads(connection.makefile().readline())
+assert response['error'] is None and not response['granted'] and response['resident_bytes'] == 0, response
 open('/tmp/page-return-held','w').close()
 time.sleep(120)
 """
@@ -749,19 +757,38 @@ time.sleep(120)
     machine.succeed(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- amc recover-swap"
     )
-    after = int(machine.succeed(f"cat {group}/memory.swap.current"))
-    assert before > after and after == 0, (before, after)
+    # Capture native residency before the target checks its bytes: that probe
+    # must not perform the return that AMC claims to prove.
+    after_native = json.loads(
+        machine.succeed("python3 /etc/page-return-target.py --snapshot")
+    )
+    assert after_native["returnBytes"] == 0 and after_native["swappedBytes"] == 0, (
+        after_native
+    )
+    assert after_native["presentBytes"] == after_native["mappingBytes"], after_native
     evidence["pageReturn"] = {
-        "beforeSwapBytes": before,
-        "afterSwapBytes": after,
+        "schemaVersion": 2,
+        "beforeSwapBytes": before_native["swapBytes"],
+        "afterSwapBytes": after_native["swapBytes"],
+        "beforeCachedBytes": before_native["cachedBytes"],
+        "afterCachedBytes": after_native["cachedBytes"],
+        "beforeReturnBytes": before_native["returnBytes"],
+        "afterReturnBytes": after_native["returnBytes"],
+        "mappingBytes": after_native["mappingBytes"],
+        "beforePresentBytes": before_native["presentBytes"],
+        "beforeSwappedBytes": before_native["swappedBytes"],
+        "afterPresentBytes": after_native["presentBytes"],
+        "afterSwappedBytes": after_native["swappedBytes"],
         "waitExitCode": 75,
         "interruptedBatchBytes": 2097152,
+        "unreadBatchSettlementDenied": True,
     }
     machine.succeed(
         "grep -q '^/dev/vdb' /proc/swaps; systemctl is-active page-target.service"
     )
     machine.succeed("touch /tmp/page-target-probe")
     machine.wait_until_succeeds("test -e /tmp/page-target-intact")
+    evidence["pageReturn"]["dataIntact"] = True
     machine.succeed("systemctl stop page-target.service")
     wait_committed(0)
 

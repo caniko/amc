@@ -70,13 +70,40 @@ def verify_foreground_evidence(path):
     page = receipt.get("pageReturn", {})
     device = receipt.get("deviceReturn", {})
     completion = receipt.get("completion", {})
+    page_fields = [
+        "beforeSwapBytes",
+        "afterSwapBytes",
+        "beforeCachedBytes",
+        "afterCachedBytes",
+        "beforeReturnBytes",
+        "afterReturnBytes",
+        "mappingBytes",
+        "beforePresentBytes",
+        "beforeSwappedBytes",
+        "afterPresentBytes",
+        "afterSwappedBytes",
+    ]
     if (
-        type(page.get("beforeSwapBytes")) is not int
-        or type(page.get("afterSwapBytes")) is not int
+        page.get("schemaVersion") != 2
+        or any(type(page.get(key)) is not int or page[key] < 0 for key in page_fields)
         or page["beforeSwapBytes"] < 32 * 1048576
-        or page.get("afterSwapBytes") != 0
+        or page["beforeReturnBytes"] < 32 * 1048576
+        or page["beforeCachedBytes"] > page["beforeSwapBytes"]
+        or page["afterCachedBytes"] > page["afterSwapBytes"]
+        or page["beforeReturnBytes"]
+        != page["beforeSwapBytes"] - page["beforeCachedBytes"]
+        or page["afterReturnBytes"] != page["afterSwapBytes"] - page["afterCachedBytes"]
+        or page["afterReturnBytes"] != 0
+        or page["mappingBytes"] != 64 * 1048576
+        or page["beforeSwappedBytes"] < 32 * 1048576
+        or page["beforePresentBytes"] + page["beforeSwappedBytes"]
+        != page["mappingBytes"]
+        or page["afterPresentBytes"] != page["mappingBytes"]
+        or page["afterSwappedBytes"] != 0
+        or page.get("dataIntact") is not True
         or page.get("waitExitCode") != 75
         or page.get("interruptedBatchBytes") != 2 * 1048576
+        or page.get("unreadBatchSettlementDenied") is not True
     ):
         raise RuntimeError(
             "Native page-return evidence lacks complete progress and safe interruption"

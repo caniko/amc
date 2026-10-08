@@ -93,6 +93,8 @@ pub enum RecoveryAction {
         address: u64,
         bytes: u64,
         before_swap_bytes: u64,
+        #[serde(default)]
+        before_return_bytes: Option<u64>,
         settled: bool,
     },
 }
@@ -126,6 +128,8 @@ impl RecoveryLease {
                 target,
                 address,
                 bytes,
+                before_swap_bytes,
+                before_return_bytes,
                 settled,
                 ..
             } => {
@@ -141,6 +145,7 @@ impl RecoveryLease {
                             *bytes == self.return_bytes
                         })
                         && *bytes <= 16 * 1024 * 1024
+                        && before_return_bytes.is_none_or(|demand| demand <= *before_swap_bytes)
                         && address.checked_add(*bytes).is_some(),
                     "invalid page return demand"
                 );

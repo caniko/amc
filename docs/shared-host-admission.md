@@ -168,18 +168,24 @@ Root Nix clients bind these rights to the original socket peer's kernel identity
 
 ## Swap-return priority and recovery
 
-`reserve_swap_return = true` charges observed host swap occupancy not already
-covered by native grants before allowing new memory growth. Unknown return
-accounting blocks admission. The capability is
-`lib.swapReturnReservationVersion = 1` (also exported on the package).
+`reserve_swap_return = true` charges observed nonresident host swap demand not
+covered by spare resident capacity inside native grants before new memory growth.
+Resident swap cache is already in RAM and in `memory.current`; counting it again
+would reserve that RAM twice. Overlapping native boundaries cannot credit the
+same pages twice. Unknown or inconsistent return accounting blocks admission.
+The capability is
+`lib.swapReturnReservationVersion = 2` (also exported on the package).
 
 A root-only `swap_recovery` policy selects a finite maintenance unit, helper
 ceiling, nonoverlapping `page_cgroups`, `batch_bytes` (4 KiB–16 MiB), and optional
 device `targets`. The default recovery faults bounded private readable page
 ranges through a pinned `/proc/<pid>/mem` descriptor, with process identity and
 leaf/ancestor headroom checks. It never writes target memory or reports payload
-bytes. A batch is backed before reads; target `memory.swap.current` reduction,
-rather than a successful advice call or bytes read, establishes progress.
+bytes. A batch is backed before reads. Pinned native pagemap observations must
+prove every requested page resident after reading; the broker independently
+checks the range before settling its claim. Occupied swap slots and resident
+`memory.stat` swap cache are separate telemetry. Read faults can bring a page
+back into RAM while Linux retains its swap slot: slot deletion is not RAM return.
 
 ```sh
 amc recover-swap                 # bounded incremental return, devices stay on
@@ -193,9 +199,12 @@ batches can start even when the entire return debt cannot fit. Other admission
 waits while a campaign owns recovery; cancellation, read failure and broker
 restart retain the claim until native cleanup. Exit 75 means waiting, stalled or
 incomplete return, including partial progress or unreadable pages. Exit 0 for
-page recovery requires zero remaining swap in the selected subtrees, not a claim
-about all swap on the host. Whole-device recovery needs backing for the full
-device and all affected native domains, and restores it before reporting success.
+page recovery requires zero remaining nonresident return demand in the selected
+subtrees. The hosted receipt additionally proves the entire fixture mapping is
+resident before the target's own probe and that its bytes remain intact. Retained
+resident swap slots are allowed and recorded. Whole-device recovery needs backing
+for the full device and all affected native domains, and restores it before
+reporting success.
 Consumers should install `--restore` as maintenance-unit `ExecStopPost` and keep
 device restoration separate from admission release.
 

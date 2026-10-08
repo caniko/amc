@@ -1,6 +1,7 @@
 //! Bounded reads through an mm-bound /proc/<pid>/mem descriptor fault actual
 //! pages in. No advice-success assumption, process writes, signals, or payload
-//! contents in diagnostics. Native swap counters decide whether progress occurred.
+//! contents in diagnostics. Native PTEs prove each batch's residency; swap cache
+//! and occupied slots remain separate from outstanding RAM-return demand.
 use crate::{
     host::{Identity, Reservation},
     recovery::RecoveryPolicy,
@@ -45,15 +46,18 @@ pub fn identity(pid: i32, start_ticks: u64, policy: &RecoveryPolicy) -> Result<I
     Ok(result)
 }
 
-pub fn target_swap(target: &Identity) -> Result<u64> {
+pub fn target_usage(target: &Identity) -> Result<crate::swap::SwapUsage> {
     let directory = crate::native::cgroup_directory(&target.cgroup)?;
     ensure!(
         fs::metadata(&directory)?.ino() == target.inode,
         "page return cgroup changed"
     );
-    Ok(fs::read_to_string(directory.join("memory.swap.current"))?
-        .trim()
-        .parse()?)
+    let usage = crate::swap::cgroup_usage(&directory)?;
+    ensure!(
+        fs::metadata(&directory)?.ino() == target.inode,
+        "page return cgroup changed"
+    );
+    Ok(usage)
 }
 
 pub fn native_headroom(target: &Identity, claims: &[Reservation], bytes: u64) -> Result<bool> {
@@ -160,7 +164,7 @@ pub fn candidates(policy: &RecoveryPolicy) -> Result<Vec<i32>> {
 
 /// Count the selected subtrees even when no readable process remains. An
 /// unreadable mm or a bounded discovery cutoff must never look like recovery.
-pub fn selected_swap_bytes(policy: &RecoveryPolicy) -> Result<u64> {
+pub fn selected_return_bytes(policy: &RecoveryPolicy) -> Result<u64> {
     let mut bytes = 0u64;
     for group in &policy.page_cgroups {
         let directory = crate::native::cgroup_directory(group)?;
@@ -170,9 +174,7 @@ pub fn selected_swap_bytes(policy: &RecoveryPolicy) -> Result<u64> {
                 result?;
             }
         }
-        let used: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
-            .trim()
-            .parse()?;
+        let used = crate::swap::cgroup_usage(&directory)?.return_bytes();
         bytes = bytes
             .checked_add(used)
             .context("selected swap occupancy overflow")?;
@@ -189,6 +191,56 @@ pub fn open_memory(target: &Identity) -> Result<File> {
         "page return process changed"
     );
     Ok(file)
+}
+
+/// Like proc mem, an opened pagemap pins its original mm across exec/PID reuse.
+pub fn open_pagemap(target: &Identity) -> Result<File> {
+    let file = File::open(format!("/proc/{}/pagemap", target.pid))?;
+    ensure!(
+        crate::host_native::process_start(target.pid)? == target.start_ticks,
+        "page return process changed"
+    );
+    Ok(file)
+}
+
+pub fn range_resident(pagemap: &File, address: u64, bytes: u64) -> Result<bool> {
+    range_matches(pagemap, address, bytes, 1 << 63)
+}
+
+pub fn range_swapped(pagemap: &File, address: u64, bytes: u64) -> Result<bool> {
+    range_matches(pagemap, address, bytes, 1 << 62)
+}
+
+fn range_matches(pagemap: &File, address: u64, bytes: u64, expected: u64) -> Result<bool> {
+    let page = page_size()?;
+    ensure!(
+        bytes > 0
+            && bytes <= 16 * 1024 * 1024
+            && bytes.is_multiple_of(page)
+            && address.is_multiple_of(page)
+            && address.checked_add(bytes).is_some(),
+        "invalid pagemap proof bound"
+    );
+    let mut entries = [0u8; 4096];
+    let mut pages = bytes / page;
+    let mut offset = (address / page)
+        .checked_mul(8)
+        .context("pagemap overflow")?;
+    while pages > 0 {
+        let count = pages.min((entries.len() / 8) as u64) as usize;
+        pagemap.read_exact_at(&mut entries[..count * 8], offset)?;
+        if entries[..count * 8].chunks_exact(8).any(|entry| {
+            let entry = u64::from_ne_bytes(entry.try_into().expect("eight-byte pagemap entry"));
+            entry & ((1 << 63) | (1 << 62)) != expected
+        }) {
+            return Ok(false);
+        }
+        pages -= count as u64;
+        offset = offset
+            .checked_add(count as u64 * 8)
+            .context("pagemap overflow")?;
+    }
+    Ok(true)
 }
 
 pub fn page_size() -> Result<u64> {
@@ -332,5 +384,30 @@ mod tests {
         );
         assert!(read_batch(&memory, 0, u64::MAX).is_err());
         assert_eq!(data[4095], 9);
+    }
+
+    #[test]
+    fn native_residency_requires_every_page_and_rejects_missing_or_conflicting_ptes() {
+        let root =
+            std::env::temp_dir().join(format!("amc-pagemap-{}", crate::store::fresh_id().unwrap()));
+        let present = (1u64 << 63).to_ne_bytes();
+        let swapped = (1u64 << 62).to_ne_bytes();
+        fs::write(&root, [present, present].concat()).unwrap();
+        let pagemap = File::open(&root).unwrap();
+        let page = page_size().unwrap();
+        assert!(range_resident(&pagemap, 0, page * 2).unwrap());
+        assert!(!range_swapped(&pagemap, 0, page * 2).unwrap());
+        for second in [swapped, [0; 8], ((1u64 << 63) | (1u64 << 62)).to_ne_bytes()] {
+            fs::write(&root, [present, second].concat()).unwrap();
+            assert!(!range_resident(&pagemap, 0, page * 2).unwrap());
+        }
+        fs::write(&root, [swapped, swapped].concat()).unwrap();
+        assert!(range_swapped(&pagemap, 0, page * 2).unwrap());
+        fs::write(&root, swapped).unwrap();
+        assert!(range_swapped(&pagemap, 0, page * 2).is_err());
+        assert!(range_resident(&pagemap, 1, page).is_err());
+        assert!(range_resident(&pagemap, 0, 0).is_err());
+        assert!(range_resident(&pagemap, 0, 32 * 1024 * 1024).is_err());
+        fs::remove_file(root).unwrap();
     }
 }

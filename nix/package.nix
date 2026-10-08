@@ -39,7 +39,7 @@ rustPlatform.buildRustPackage {
   passthru.nativeExecVersion = 1;
   passthru.admissionSizingVersion = 1;
   passthru.admissionPreparationVersion = 2;
-  passthru.swapReturnReservationVersion = 1;
+  passthru.swapReturnReservationVersion = 2;
   nativeBuildInputs = [makeWrapper python3];
   postInstall = ''
     mkdir -p $out/share/amc/examples
