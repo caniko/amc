@@ -45,10 +45,28 @@ fn restore(target: &RecoveryTarget) -> Result<()> {
 pub fn execute(args: RecoveryArgs) -> Result<i32> {
     let reply = call(&args.socket, &Request::RecoveryTargets { version: 1 })?;
     let targets = reply.recovery_targets.context("missing recovery targets")?;
-    let mut waiting = false;
-    for target in targets {
-        restore(&target)?;
-        if args.restore || !args.whole_device {
+    for target in &targets {
+        restore(target)?;
+    }
+    if args.restore {
+        return Ok(0);
+    }
+    if !args.whole_device {
+        return match return_pages(
+            &args.socket,
+            reply
+                .recovery_policy
+                .context("missing page return policy")?,
+        ) {
+            Ok(code) => Ok(code),
+            Err(_) => {
+                eprintln!("page return incomplete: native backing or residency proof unavailable");
+                Ok(75)
+            }
+        };
+    }
+    for target in &targets {
+        if amc_admission::swap::device(target)?.is_some_and(|device| device.used_bytes == 0) {
             continue;
         }
         let reply = call(
@@ -60,7 +78,6 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
         )?;
         if !reply.granted {
             eprintln!("swap recovery {} waiting: {:?}", target.name, reply.waiting);
-            waiting = true;
             continue;
         }
         let lease = reply.recovery.context("missing native recovery lease")?;
@@ -88,27 +105,31 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
             "swap recovery {}: used {} -> {} bytes",
             target.name, before_used_bytes, after.used_bytes
         );
-        return Ok(0);
+        break;
     }
-    if !args.restore && !args.whole_device {
-        let result = return_pages(
-            &args.socket,
-            reply
-                .recovery_policy
-                .context("missing page return policy")?,
-        );
-        return match result {
-            Ok(code) => Ok(code),
-            Err(_) => {
-                eprintln!("page return incomplete: native backing or residency proof unavailable");
-                Ok(75)
-            }
-        };
+    whole_device_status(&targets, |target| {
+        Ok(amc_admission::swap::device(target)?.map(|device| device.used_bytes))
+    })
+}
+
+fn whole_device_status(
+    targets: &[RecoveryTarget],
+    mut observe: impl FnMut(&RecoveryTarget) -> Result<Option<u64>>,
+) -> Result<i32> {
+    let mut incomplete = false;
+    // A single successful lease is not a receipt for the remaining devices.
+    // Reobserve all configured devices, including earlier waits and later work.
+    for target in targets {
+        incomplete |= observe(target)?.is_none_or(|bytes| bytes > 0);
     }
-    Ok(if waiting { 75 } else { 0 })
+    Ok(if incomplete { 75 } else { 0 })
 }
 
 fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
+    if policy.page_cgroups.is_empty() {
+        eprintln!("page return incomplete: no page-return subtrees are configured");
+        return Ok(75);
+    }
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut returned = 0u64;
     let mut unproven = false;
@@ -197,4 +218,44 @@ fn return_pages(socket: &Path, policy: RecoveryPolicy) -> Result<i32> {
     // Partial progress, unreadable/unsupported pages and campaign cutoffs remain
     // stalled. The next timer can resume, but this invocation did not complete.
     Ok(if remaining == 0 && !unproven { 0 } else { 75 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_recovery_cannot_succeed_without_selected_page_return_subtrees() {
+        let policy: RecoveryPolicy = serde_json::from_value(serde_json::json!({
+            "cgroup":"/recovery", "helper_bytes":1048576, "minimum_bytes":1,
+            "targets":[{"name":"device", "path":"/swap", "priority":10}],
+            "page_cgroups":[], "batch_bytes":4096
+        }))
+        .unwrap();
+        policy.validate().unwrap();
+        assert_eq!(return_pages(Path::new("/unused"), policy).unwrap(), 75);
+    }
+
+    #[test]
+    fn whole_device_success_requires_every_configured_device_to_be_observed_empty() {
+        let targets: Vec<RecoveryTarget> = ["blocked", "returned", "later"]
+            .into_iter()
+            .map(|name| RecoveryTarget {
+                name: name.into(),
+                path: format!("/swap-{name}"),
+                priority: 10,
+            })
+            .collect();
+        let mut examined = Vec::new();
+        let code = whole_device_status(&targets, |target| {
+            examined.push(target.name.clone());
+            Ok(Some(if target.name == "returned" { 0 } else { 4096 }))
+        })
+        .unwrap();
+        assert_eq!(code, 75);
+        assert_eq!(examined, ["blocked", "returned", "later"]);
+        assert_eq!(whole_device_status(&targets, |_| Ok(Some(0))).unwrap(), 0);
+        assert_eq!(whole_device_status(&targets, |_| Ok(None)).unwrap(), 75);
+        assert!(whole_device_status(&targets, |_| anyhow::bail!("unavailable")).is_err());
+    }
 }
