@@ -356,28 +356,7 @@ pub fn serve_supervised(
                     match request {
                         Request::Status { version } => {
                             ensure!(version == 1, "unsupported host protocol");
-                            reply.reservations = Some(
-                                ledger
-                                    .reservations
-                                    .iter()
-                                    .filter(|r| {
-                                        credentials.uid() == 0
-                                            || r.identity.uid == credentials.uid()
-                                    })
-                                    .cloned()
-                                    .collect(),
-                            );
-                            reply.preparations = Some(
-                                ledger
-                                    .preparations
-                                    .iter()
-                                    .filter(|p| {
-                                        credentials.uid() == 0 || p.uid == credentials.uid()
-                                    })
-                                    .map(public_preparation)
-                                    .collect(),
-                            );
-                            reply.recovery = ledger.recovery.clone();
+                            populate_status(&mut reply, &ledger, credentials.uid());
                         }
                         Request::Acquire {
                             version, wait_ms, ..
@@ -602,6 +581,32 @@ fn public_preparation(p: &crate::preparation::Preparation) -> crate::preparation
     let mut public = p.clone();
     public.key.clear();
     public
+}
+
+fn populate_status(reply: &mut Response, ledger: &HostLedger, uid: u32) {
+    reply.reservations = Some(
+        ledger
+            .reservations
+            .iter()
+            .filter(|r| uid == 0 || r.identity.uid == uid)
+            .cloned()
+            .collect(),
+    );
+    reply.preparations = Some(
+        ledger
+            .preparations
+            .iter()
+            .filter(|p| uid == 0 || p.uid == uid)
+            .map(public_preparation)
+            .collect(),
+    );
+    // The public socket must not expose another process's identity or address
+    // space through the root-owned recovery lease.
+    reply.recovery = if uid == 0 {
+        ledger.recovery.clone()
+    } else {
+        None
+    };
 }
 
 fn origin_continuation(
@@ -1109,4 +1114,40 @@ fn preparation_reply(
         .and_then(|name| name.to_str())
         .map(str::to_owned);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_return_target_identity_and_addresses_are_only_visible_to_root() {
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.recovery = Some(
+            serde_json::from_value(serde_json::json!({
+                "identity":{"uid":0,"pid":42,"start_ticks":7,"inode":1,
+                    "cgroup":"/recovery"},
+                "return_bytes":4096,"helper_bytes":1048576,
+                "action":{"kind":"pages", "target":{"uid":2000,"pid":99,
+                    "start_ticks":11,"inode":2,"cgroup":"/private-target"},
+                    "address":305418240,"bytes":4096,"before_swap_bytes":4096,
+                    "before_return_bytes":4096,"settled":false}
+            }))
+            .unwrap(),
+        );
+        let mut reply = Response::default();
+        populate_status(&mut reply, &ledger, 0);
+        assert!(
+            serde_json::to_string(&reply)
+                .unwrap()
+                .contains("private-target")
+        );
+        // Reusing a root response must clear every recovery identity field.
+        for uid in [1000, 2000] {
+            populate_status(&mut reply, &ledger, uid);
+            assert!(reply.recovery.is_none());
+            let wire = serde_json::to_string(&reply).unwrap();
+            assert!(!wire.contains("private-target") && !wire.contains("305418240"));
+        }
+    }
 }
