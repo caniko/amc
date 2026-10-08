@@ -75,8 +75,10 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
                 .context("missing page return policy")?,
         ) {
             Ok(code) => Ok(code),
-            Err(_) => {
-                eprintln!("page return incomplete: native backing or residency proof unavailable");
+            Err(error) => {
+                eprintln!(
+                    "page return incomplete: native backing or residency proof unavailable: {error:#}"
+                );
                 Ok(75)
             }
         };
