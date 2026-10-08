@@ -193,6 +193,39 @@ fn payload_environment(value: &str) -> std::result::Result<String, String> {
 mod tests {
     use super::*;
     #[test]
+    fn helper_registration_uses_the_host_runtime_bus_without_forwarding_payload() {
+        let args = PrepareArgs {
+            socket: "/run/amc-host/admission.sock".into(),
+            profile: "game-$literal".into(),
+            payload_env: vec!["LD_PRELOAD=payload-only".into()],
+            command: vec!["payload-only-command".into()],
+        };
+        let command =
+            host::helper_command(&args, Path::new("/run/user/4321/amc-intent"), "intent").unwrap();
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.contains(&"--address=unix:path=/run/user/4321/bus".into()));
+        assert!(arguments.windows(2).any(|args| args == ["--", "call"]));
+        assert!(arguments.contains(&"prepared-host".into()));
+        assert!(arguments.contains(&"game-$literal".into()));
+        assert!(arguments.contains(&"no-env-expand".into()));
+        assert!(!arguments.iter().any(|s| s.contains("payload-only")));
+        assert!(host::helper_command(&args, Path::new("relative/amc-intent"), "intent").is_err());
+        assert!(
+            host::helper_command(&args, Path::new("/run/user/4321/amc-intent"), "bad/name")
+                .is_err()
+        );
+        let escaped =
+            host::helper_command(&args, Path::new("/run/user/a,b;%/amc-intent"), "intent").unwrap();
+        assert_eq!(
+            escaped.get_args().next().unwrap(),
+            "--address=unix:path=/run/user/a%2cb%3b%25/bus"
+        );
+    }
+
+    #[test]
     fn native_registration_uses_the_waiting_host_pid_and_only_the_broker_envelope() {
         let reply: Response = serde_json::from_value(serde_json::json!({
             "version":1,"granted":true,"ticket":"intent","waiting":null,"committed_bytes":64,"reservations":null,"error":null,

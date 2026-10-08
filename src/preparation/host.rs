@@ -17,6 +17,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::{
+        ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
@@ -107,29 +108,8 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
     listener.set_nonblocking(true)?;
     // No payload, loader environment, or preparation capability is sent through
     // the manager. Its helper obtains the waiting peer's host PID from the kernel.
-    crate::control::capture(
-        Command::new("systemd-run")
-            .args([
-                "--user",
-                "--quiet",
-                "--collect",
-                "--service-type=exec",
-                "--expand-environment=no",
-                "--property=MemoryMax=64M",
-                "--property=MemorySwapMax=0",
-                "--property=RuntimeMaxSec=3600",
-            ])
-            .arg(format!("--unit=app-amc-prepare-helper-{id}.service"))
-            .arg("--")
-            .arg(std::env::current_exe()?)
-            .arg("prepared-host")
-            .arg("--rendezvous")
-            .arg(&rendezvous.0)
-            .arg("--socket")
-            .arg(&args.socket)
-            .arg("--profile")
-            .arg(&args.profile),
-    )?;
+    crate::control::capture(&mut helper_command(&args, &rendezvous.0, &id)?)
+        .context("start prepared helper through the host user bus")?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut stream = loop {
         if let Some(signal) = signals.cancelled() {
@@ -269,6 +249,88 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
     result.map(|()| 0)
 }
 
+fn manager_command(runtime: &std::path::Path) -> Command {
+    // An explicit session-bus connection also works inside a private PID
+    // namespace, where systemd's automatic private-peer credential check cannot
+    // see the manager's PID. Escape the pathname as one D-Bus address value.
+    let mut address = String::from("--address=unix:path=");
+    for byte in runtime.join("bus").as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/_-.".contains(byte) {
+            address.push(char::from(*byte));
+        } else {
+            const HEX: &[u8] = b"0123456789abcdef";
+            address.push('%');
+            address.push(char::from(HEX[usize::from(byte >> 4)]));
+            address.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    let mut command = Command::new("busctl");
+    command.arg(address).args([
+        "--timeout=5s",
+        // Stop busctl option parsing before the helper's literal --arguments.
+        "--",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "StartTransientUnit",
+        "ssa(sv)a(sa(sv))",
+    ]);
+    command
+}
+
+pub(super) fn helper_command(
+    args: &PrepareArgs,
+    rendezvous: &std::path::Path,
+    id: &str,
+) -> Result<Command> {
+    let runtime = rendezvous
+        .parent()
+        .context("missing prepared runtime directory")?;
+    ensure!(
+        runtime.is_absolute() && amc_admission::ledger::valid_name(id),
+        "invalid prepared helper registration"
+    );
+    let executable = std::env::current_exe()?;
+    let mut command = manager_command(runtime);
+    command
+        .arg(format!("app-amc-prepare-helper-{id}.service"))
+        .args([
+            "fail",
+            "6",
+            "Type",
+            "s",
+            "exec",
+            "MemoryMax",
+            "t",
+            "67108864",
+            "MemorySwapMax",
+            "t",
+            "0",
+            "RuntimeMaxUSec",
+            "t",
+            "3600000000",
+            "CollectMode",
+            "s",
+            "inactive-or-failed",
+            "ExecStartEx",
+            "a(sasas)",
+            "1",
+        ])
+        .arg(&executable)
+        .arg("8")
+        .arg(&executable)
+        .arg("prepared-host")
+        .arg("--rendezvous")
+        .arg(rendezvous)
+        .arg("--socket")
+        .arg(&args.socket)
+        .arg("--profile")
+        .arg(&args.profile)
+        .args(["1", "no-env-expand", "0"]);
+    Ok(command)
+}
+
 pub(super) fn scope_command(reply: &Response, id: &str, pid: i32) -> Result<Command> {
     let p = reply
         .preparation
@@ -286,20 +348,8 @@ pub(super) fn scope_command(reply: &Response, id: &str, pid: i32) -> Result<Comm
                 .is_some_and(amc_admission::ledger::valid_name),
         "invalid prepared native registration"
     );
-    let mut command = Command::new("busctl");
-    // busctl uses the D-Bus bus-client protocol (including Hello). The manager's
-    // systemd/private socket is a peer endpoint and rejects those requests.
+    let mut command = manager_command(&PathBuf::from(format!("/run/user/{}", geteuid())));
     command
-        .arg(format!("--address=unix:path=/run/user/{}/bus", geteuid()))
-        .args([
-            "--timeout=5s",
-            "call",
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-            "StartTransientUnit",
-            "ssa(sv)a(sa(sv))",
-        ])
         .arg(format!("app-amc-prepared-{id}.scope"))
         .args(["fail", "8", "Slice", "s", slice, "MemoryMax", "t"])
         .arg(p.memory_bytes.to_string())

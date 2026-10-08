@@ -146,6 +146,12 @@ whose paths exist only inside their runtime. `--payload-env NAME=VALUE` applies
 loader and GameMode settings after admission, so the waiting helper does not
 quiesce the old work it needs to drain. Prepared execution needs a reachable
 local user manager and a writable, host-shared `XDG_RUNTIME_DIR` rendezvous.
+Helper creation and scope registration use explicit `StartTransientUnit` calls
+through the host-shared runtime directory's session bus. Automatic private-peer
+manager connections cannot observe the manager's PID from a private PID namespace.
+The helper has a 64 MiB memory cap, zero swap and a one-hour runtime bound; its
+literal argv contains only rendezvous/broker paths and the profile, with environment
+expansion disabled. The payload command and loader settings stay with the caller.
 The helper uses the host cgroup-v2 view, so the payload need not see host PIDs.
 Namespace configurations that cannot register their native scope fail before
 the payload; they do not fall back to uncontained execution.
