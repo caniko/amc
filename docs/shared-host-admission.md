@@ -133,7 +133,13 @@ preparation helpers share
 `app-amchostrunner.slice` at that exact aggregate RAM ceiling and zero swap;
 individual services retain their 64 MiB cap. The host module creates the slice.
 Policy validation requires the sum of these aggregate envelopes to fit inside
-`reserve_bytes`. Native projections back them in finite ancestors, including
+`reserve_bytes`. The ledger retains previously enrolled UIDs and their ceilings
+across restart, user removal and allowance reductions until the aggregate is
+positively empty. Startup also discovers surviving aggregate slices from older
+snapshots. If retained plus current allowances exceed a reduced host reserve,
+new admission waits while existing native work completes.
+
+Native projections back them in finite ancestors, including
 while runners wait, and the runner authenticates this allowance with the broker
 before submitting the inner shared job. They are static maintenance backing,
 so preparations do not wait for a runner that is itself waiting for admission.

@@ -260,6 +260,10 @@ pub struct HostLedger {
     /// Root pool ownership is bound to one finite native Nix worker operation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pool_operations: BTreeMap<String, u64>,
+    /// Aggregate runner ceilings survive enrollment/allowance reductions until
+    /// native cleanup is positively observed, including across broker restart.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub namespace_runners: BTreeMap<u32, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -304,10 +308,18 @@ impl HostLedger {
             recovery: None,
             continuations: vec![],
             pool_operations: BTreeMap::new(),
+            namespace_runners: BTreeMap::new(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.namespace_runners.len() <= 256
+                && self.namespace_runners.iter().all(|(uid, bytes)| *uid != 0
+                    && (crate::namespace_runner::SERVICE_BYTES..=1024 * 1024 * 1024)
+                        .contains(bytes)),
+            "invalid durable namespace runner backing"
+        );
         ensure!(
             self.version == 1
                 && self.reservations.len() <= 256

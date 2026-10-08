@@ -173,6 +173,29 @@ with test_section("namespace runners share a host-reserve-backed aggregate ceili
     machine.fail("test -e /tmp/runner-cap-denied-entered")
     machine.succeed(f"echo 67108864 > {runner_group}/memory.max")
     wait_entered("runner-cap-denied")
+    # Retire Alice while two already-verified host runners are still live. The
+    # reduced reserve fits Bob alone, so reusing Alice's backing would admit him.
+    retired = json.loads(machine.succeed("cat /etc/amc-test-host-policy.json"))
+    retired["domains"] = [d for d in retired["domains"] if d["uid"] != 1000]
+    retired["preparations"] = []
+    retired["reserve_bytes"] = 64 * 1048576
+    write_file("/tmp/runner-retired-policy.json", json.dumps(retired))
+    machine.succeed("mkdir -p /run/systemd/system/amc-host-admission.service.d")
+    write_file("/run/systemd/system/amc-host-admission.service.d/retired.conf", "[Service]\nExecStart=\nExecStart=/run/current-system/sw/bin/amc admission host-serve --policy /tmp/runner-retired-policy.json\n")
+    machine.succeed("systemctl daemon-reload; systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    assert status()["namespace_runner_reserved_bytes"] == 128 * 1048576
+    launch("runner-retired-denied", 1001, "small", "touch /tmp/runner-retired-denied-entered; sleep 120")
+    machine.succeed("sleep 1")
+    machine.fail("test -e /tmp/runner-retired-denied-entered")
+    machine.succeed("systemctl stop namespace-held-1 namespace-held-2")
+    for grant in status()["reservations"]:
+        if grant["identity"]["uid"] == 1000:
+            stop_scope(grant)
+    wait_entered("runner-retired-denied")
+    assert status()["namespace_runner_reserved_bytes"] == 64 * 1048576
+    machine.succeed("rm /run/systemd/system/amc-host-admission.service.d/retired.conf; systemctl daemon-reload; systemctl restart amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
     evidence["namespaceRunnerBacking"] = {
         "aggregateBytesPerUser": 64 * 1048576,
         "reservedBytes": held["namespace_runner_reserved_bytes"],
@@ -180,8 +203,11 @@ with test_section("namespace runners share a host-reserve-backed aggregate ceili
         "innerCommittedBytes": held["committed_bytes"],
         "restartPreserved": True,
         "changedCeilingDenied": True,
+        "removedUserRetained": True,
+        "excessReserveDenied": True,
+        "retiredUserReleasedAfterCleanup": True,
     }
-    machine.succeed("systemctl stop namespace-held-1 namespace-held-2 runner-cap-denied-client")
+    machine.succeed("systemctl stop runner-retired-denied-client runner-cap-denied-client")
     for grant in status()["reservations"]:
         stop_scope(grant)
     wait_committed(0)

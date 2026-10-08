@@ -287,6 +287,8 @@ pub fn serve_supervised(
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
     ledger.swap_return_bytes = None;
+    crate::namespace_runner::discover(&mut ledger)?;
+    crate::namespace_runner::reconcile(&mut ledger, &policy);
     let parent = socket
         .parent()
         .ok_or_else(|| anyhow::anyhow!("socket has no parent"))?;
@@ -464,10 +466,12 @@ pub fn serve_supervised(
                         version: 1,
                         committed_bytes: ledger.committed(),
                         budget_bytes: policy.budget_bytes,
-                        namespace_runner_reserved_bytes: crate::namespace_runner::claims(&policy)
-                            .iter()
-                            .map(|r| r.memory_bytes)
-                            .sum(),
+                        namespace_runner_reserved_bytes: crate::namespace_runner::retained_claims(
+                            ledger, &policy,
+                        )
+                        .iter()
+                        .map(|r| r.memory_bytes)
+                        .sum(),
                         burst_budget_bytes: policy.burst.as_ref().map_or(0, |b| b.budget_bytes),
                         burst_committed_bytes: ledger.burst_committed(),
                         swap_return_bytes: ledger.swap_return_bytes,
@@ -946,6 +950,7 @@ fn observe(
     // Unknown cleanup and surviving descendants retain their claims.
     ledger.reconcile(host_native::empty_reservation);
     ledger.retain_pool_operations();
+    crate::namespace_runner::reconcile(ledger, policy);
     if ledger.recovery.is_none()
         && policy.swap_recovery.as_ref().is_some_and(|p| {
             p.targets
@@ -958,7 +963,7 @@ fn observe(
     if policy.reserve_swap_return {
         ledger.swap_return_bytes = crate::swap::return_bytes(ledger).ok();
     }
-    if crate::namespace_runner::enforcement(policy) == Some(true)
+    if crate::namespace_runner::enforcement(ledger, policy) == Some(true)
         && ledger
             .reservations
             .iter()

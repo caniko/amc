@@ -124,7 +124,10 @@ def verify_foreground_evidence(path, kernel_series=None):
         or runners.get("concurrentRunners") != 2
         or runners.get("innerCommittedBytes") != 64 * 1048576
         or runners.get("restartPreserved") is not True
-        or runners.get("changedCeilingDenied") is not True):
+        or runners.get("changedCeilingDenied") is not True
+        or runners.get("removedUserRetained") is not True
+        or runners.get("excessReserveDenied") is not True
+        or runners.get("retiredUserReleasedAfterCleanup") is not True):
         raise RuntimeError("Native namespace runners lack aggregate host/native backing")
     if (page.get("replacementInvocationReclaimed") is not True
         or page.get("replacementBatchBytes") != 2 * 1048576):
