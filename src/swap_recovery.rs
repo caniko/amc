@@ -25,6 +25,9 @@ pub struct RecoveryArgs {
     /// Explicitly use whole-device swapoff instead of bounded page returns.
     #[arg(long, conflicts_with = "restore")]
     whole_device: bool,
+    /// Broker-independent, root-owned JSON target list for emergency restoration.
+    #[arg(long, requires = "restore")]
+    restore_manifest: Option<PathBuf>,
 }
 
 fn restore(target: &RecoveryTarget) -> Result<()> {
@@ -39,14 +42,22 @@ fn restore(target: &RecoveryTarget) -> Result<()> {
         );
     }
     ensure!(
-        amc_admission::swap::device(target)?.is_some(),
-        "swap {} remains inactive",
-        target.name
+        amc_admission::swap::device(target)?
+            .is_some_and(|device| device.priority == target.priority),
+        "swap {} is inactive or differs from declared priority {}",
+        target.name,
+        target.priority
     );
     Ok(())
 }
 
 pub fn execute(args: RecoveryArgs) -> Result<i32> {
+    if let Some(manifest) = &args.restore_manifest {
+        for target in restoration_manifest(manifest)? {
+            restore(&target)?;
+        }
+        return Ok(0);
+    }
     let reply = call(&args.socket, &Request::RecoveryTargets { version: 1 })?;
     let targets = reply.recovery_targets.context("missing recovery targets")?;
     for target in &targets {
@@ -117,6 +128,31 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
     })
 }
 
+fn restoration_manifest(path: &Path) -> Result<Vec<RecoveryTarget>> {
+    use std::{
+        fs::OpenOptions,
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    ensure!(path.is_absolute(), "restoration manifest must be absolute");
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+        "restoration manifest must be root-owned and not group/other writable"
+    );
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "restoration manifest exceeds bound");
+    let targets: Vec<RecoveryTarget> = serde_json::from_slice(&bytes)?;
+    ensure!(!targets.is_empty(), "restoration manifest has no targets");
+    amc_admission::recovery::validate_targets(&targets)?;
+    Ok(targets)
+}
+
 fn whole_device_status(
     targets: &[RecoveryTarget],
     mut observe: impl FnMut(&RecoveryTarget) -> Result<Option<u64>>,
@@ -143,6 +179,9 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     let mut returned = 0u64;
     let mut unproven = false;
     let mut sweep_complete = false;
+    // Durable cursors are progress hints, not a residency proof for the prefix
+    // that a previous (possibly interrupted or failed) campaign visited.
+    let mut sweep = page_discovery::Sweep::new(&discovery);
     for _ in 0..1024 {
         if Instant::now() >= deadline {
             break;
@@ -150,9 +189,10 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         if discovery.active.is_none() {
             let candidates = page_discovery::candidates(discovery.after_pid)?;
             if candidates.is_empty() {
+                let complete = sweep.wrap();
                 discovery.wrap();
                 store.save_discovery(&discovery)?;
-                if amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
+                if complete && amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
                     sweep_complete = true;
                     break;
                 }

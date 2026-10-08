@@ -182,6 +182,9 @@ their limits are persisted with the parent and survive policy reloads. Consumers
 require `admissionContinuationEnvelopesVersion >= 1` before emitting overrides.
 Use `amc admission host-policy-check --policy FILE` to validate the actual emitted
 policy without starting a broker.
+Root completion domains use fixed native pool requests: their effective envelope
+must equal the domain's RAM and swap ceilings. Smaller overrides only apply to
+individually enforced non-root children.
 
 ## Swap-return priority and recovery
 
@@ -222,6 +225,11 @@ The [swap-cache call site](https://github.com/gregkh/linux/blob/v6.18.48/mm/swap
 is essential: a remote target's placement alone does not identify the fallback
 owner. Returned pages must fit the helper's remaining native resident allowance
 as well as its bounded working memory; successive batches wait when it is full.
+Charge-owner inventory is bounded to 65,536 groups, depth 256 and 20 seconds;
+an incomplete inventory rejects acquisition without faulting pages. Root recovery
+acquisition RPCs allow 30 seconds so a complete wide scan is not discarded at
+the ordinary two-second program-call deadline. Device inventory also has a
+20-second deadline, within the same maintenance RPC budget.
 
 Discovery keeps private, locked, atomically saved hints in
 `/var/lib/amc-page-return` (`--state` overrides the directory). Campaigns resume
@@ -233,12 +241,25 @@ reset the target hint; full sweeps wrap to revisit mapping churn and same-layout
 exec. Waits/interruption retain the first unread range. A scan-budget cutoff is
 distinct from end-of-mm and cannot establish successful recovery, even with zero
 destination swap counters. Kernel counters must also show zero selected demand.
+On restart, completing an inherited suffix only advances discovery: success
+requires a complete new PID sweep within the current campaign. Old cursor hints
+cannot certify that an interrupted prefix remains resident.
 
 ```sh
 amc recover-swap                 # bounded incremental return, devices stay on
 amc recover-swap --whole-device  # explicit conservative swapoff/restore
 amc recover-swap --restore       # restore declared devices after interruption
+amc recover-swap --restore --restore-manifest /etc/amc-swap-restoration.json
 ```
+
+Emergency units pass a root-owned, non-writable JSON array of declared recovery
+targets through `--restore-manifest`. This path restores missing devices without
+contacting the broker, including after broker shutdown. The reader rejects
+symlinks, oversized/empty or invalid manifests and writable/foreign-owned files.
+Consumers require `swapRestorationManifestVersion >= 1`. An already-active device
+at the wrong priority is an error, never a restoration success; this path does
+not perform an unbacked swapoff to change that priority. Recovery helpers must
+match the configured native RAM ceiling exactly, with zero swap.
 
 Recovery can enter below the ordinary free-swap floor, but retains the host RAM
 reserve, pressure gates, helper backing and native ancestor checks. Bounded

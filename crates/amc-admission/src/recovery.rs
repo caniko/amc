@@ -66,19 +66,7 @@ impl RecoveryPolicy {
                 && self.batch_bytes >= page_size,
             "invalid recovery policy"
         );
-        let mut names = BTreeSet::new();
-        let mut paths = BTreeSet::new();
-        for target in &self.targets {
-            ensure!(
-                crate::ledger::valid_name(&target.name)
-                    && names.insert(&target.name)
-                    && paths.insert(&target.path)
-                    && target.path.starts_with('/')
-                    && !target.path.chars().any(char::is_whitespace)
-                    && (0..=32767).contains(&target.priority),
-                "invalid or duplicate recovery target"
-            );
-        }
+        validate_targets(&self.targets)?;
         for (index, group) in self.page_cgroups.iter().enumerate() {
             crate::native::cgroup_directory(group)?;
             ensure!(
@@ -92,6 +80,26 @@ impl RecoveryPolicy {
         }
         Ok(())
     }
+}
+
+/// Shared by broker policy and the broker-independent restoration manifest.
+pub fn validate_targets(targets: &[RecoveryTarget]) -> Result<()> {
+    ensure!(targets.len() <= 16, "too many recovery targets");
+    let mut names = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for target in targets {
+        ensure!(
+            crate::ledger::valid_name(&target.name)
+                && names.insert(&target.name)
+                && paths.insert(&target.path)
+                && target.path.starts_with('/')
+                && !target.path.chars().any(char::is_whitespace)
+                && !target.path.contains('\0')
+                && (0..=32767).contains(&target.priority),
+            "invalid or duplicate recovery target"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

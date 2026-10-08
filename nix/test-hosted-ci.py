@@ -87,6 +87,8 @@ class NativeEvidenceTests(unittest.TestCase):
                 "afterUsedKiB": 0,
                 "restoredPriority": 10,
                 "interruptedRestored": True,
+                "brokerUnavailableRestored": True,
+                "wrongActivePriorityDenied": True,
             },
             "completion": {
                 "parentAndEscrowBytes": 128 * 1048576,
@@ -158,6 +160,8 @@ class NativeEvidenceTests(unittest.TestCase):
                 ("deviceReturn", "afterUsedKiB", 65536),
                 ("deviceReturn", "restoredPriority", -1),
                 ("deviceReturn", "interruptedRestored", False),
+                ("deviceReturn", "brokerUnavailableRestored", False),
+                ("deviceReturn", "wrongActivePriorityDenied", False),
                 ("completion", "transferredBytes", 224 * 1048576),
                 ("completion", "postParentBytes", 0),
                 ("completion", "outerRetainedAcrossRestart", False),

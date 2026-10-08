@@ -11,7 +11,14 @@ use std::{
     fs::{self, File},
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+// Root maintenance RPCs allow 30 seconds; inventory must finish earlier and
+// never grant from a truncated prefix. Normal program calls keep their 2s I/O
+// deadline. These limits cover wide native trees without an endless RPC.
+pub(crate) const INVENTORY_TIMEOUT: Duration = Duration::from_secs(20);
+const INVENTORY_GROUP_LIMIT: usize = 65_536;
 
 pub fn identity(pid: i32, start_ticks: u64, policy: &RecoveryPolicy) -> Result<Identity> {
     ensure!(
@@ -103,17 +110,40 @@ fn recovery_headroom_at(
 /// original owner, including shared/mixed-origin pages. Never credit a target's
 /// grant as proof that another memcg owns these particular swap entries.
 fn charge_owner_headroom_at(root: &Path, claims: &[Reservation], bytes: u64) -> Result<bool> {
+    charge_owner_headroom_with_budget_at(
+        root,
+        claims,
+        bytes,
+        INVENTORY_GROUP_LIMIT,
+        Instant::now() + INVENTORY_TIMEOUT,
+    )
+}
+
+fn charge_owner_headroom_with_budget_at(
+    root: &Path,
+    claims: &[Reservation],
+    bytes: u64,
+    mut remaining: usize,
+    deadline: Instant,
+) -> Result<bool> {
     fn visit(
         directory: &Path,
         root: &Path,
         claims: &[Reservation],
         bytes: u64,
         depth: usize,
+        remaining: &mut usize,
+        deadline: Instant,
     ) -> Result<bool> {
         ensure!(
             depth <= 256,
             "native charge-owner hierarchy exceeds depth bound"
         );
+        ensure!(
+            *remaining > 0 && Instant::now() < deadline,
+            "native charge-owner inventory incomplete: group/time bound exceeded"
+        );
+        *remaining -= 1;
         if directory != root && directory.join("memory.swap.current").exists() {
             let swap: u64 = fs::read_to_string(directory.join("memory.swap.current"))?
                 .trim()
@@ -135,14 +165,31 @@ fn charge_owner_headroom_at(root: &Path, claims: &[Reservation], bytes: u64) -> 
         }
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() && !visit(&entry.path(), root, claims, bytes, depth + 1)?
+            ensure!(
+                Instant::now() < deadline,
+                "native charge-owner inventory incomplete: time bound exceeded"
+            );
+            if entry.file_type()?.is_dir()
+                && !visit(
+                    &entry.path(),
+                    root,
+                    claims,
+                    bytes,
+                    depth + 1,
+                    remaining,
+                    deadline,
+                )?
             {
                 return Ok(false);
             }
         }
+        ensure!(
+            Instant::now() < deadline,
+            "native charge-owner inventory incomplete: time bound exceeded"
+        );
         Ok(true)
     }
-    visit(root, root, claims, bytes, 0)
+    visit(root, root, claims, bytes, 0, &mut remaining, deadline)
 }
 
 pub(crate) fn native_headroom_at(
@@ -357,6 +404,26 @@ mod tests {
         assert!(!charge_owner_headroom_at(&root, &[], 1).unwrap());
         fs::write(owner.join("memory.max"), "11").unwrap();
         assert!(charge_owner_headroom_at(&root, &[], 1).unwrap());
+        assert!(
+            charge_owner_headroom_with_budget_at(
+                &root,
+                &[],
+                1,
+                8194,
+                Instant::now() + INVENTORY_TIMEOUT
+            )
+            .is_err()
+        );
+        assert!(
+            charge_owner_headroom_with_budget_at(
+                &root,
+                &[],
+                1,
+                INVENTORY_GROUP_LIMIT,
+                Instant::now()
+            )
+            .is_err()
+        );
         fs::write(owner.join("memory.swap.current"), "unproven").unwrap();
         assert!(charge_owner_headroom_at(&root, &[], 1).is_err());
         fs::remove_dir_all(root).unwrap();

@@ -100,6 +100,7 @@
     lib.admissionPreparationVersion = 2;
     lib.admissionContinuationEnvelopesVersion = 1;
     lib.swapReturnReservationVersion = 2;
+    lib.swapRestorationManifestVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;

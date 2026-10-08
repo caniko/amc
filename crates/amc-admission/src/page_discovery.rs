@@ -45,6 +45,23 @@ pub struct Discovery {
     pub active: Option<ProcessCursor>,
 }
 
+/// This campaign must revisit the complete PID frontier before declaring
+/// success. An inherited cursor says nothing about the old prefix's residency.
+pub struct Sweep {
+    began_at_start: bool,
+}
+
+impl Sweep {
+    pub fn new(discovery: &Discovery) -> Self {
+        Self {
+            began_at_start: discovery.after_pid == 0 && discovery.active.is_none(),
+        }
+    }
+    pub fn wrap(&mut self) -> bool {
+        std::mem::replace(&mut self.began_at_start, true)
+    }
+}
+
 impl crate::store::Snapshot for Discovery {
     fn validate(&self) -> Result<()> {
         ensure!(
@@ -348,6 +365,14 @@ mod tests {
             candidates_at(&root, restored.after_pid).unwrap(),
             (513..=600).collect::<Vec<_>>()
         );
+        let mut sweep = Sweep::new(&restored);
+        // Reaching EOF from an inherited frontier is progress, not a proof
+        // about the first 512 processes from an interrupted campaign.
+        assert!(candidates_at(&root, 600).unwrap().is_empty());
+        assert!(!sweep.wrap());
+        discovery.wrap();
+        assert_eq!(candidates_at(&root, discovery.after_pid).unwrap(), first);
+        assert!(sweep.wrap());
         discovery.active = Some(cursor());
         discovery.finish_process();
         assert_eq!(discovery.after_pid, 42);

@@ -208,6 +208,8 @@ def verify_foreground_evidence(path):
         or not 0 <= device["afterUsedKiB"] < device["beforeUsedKiB"]
         or device.get("restoredPriority") != 10
         or device.get("interruptedRestored") is not True
+        or device.get("brokerUnavailableRestored") is not True
+        or device.get("wrongActivePriorityDenied") is not True
     ):
         raise RuntimeError(
             "Native device-return evidence lacks progress or interrupted restoration"

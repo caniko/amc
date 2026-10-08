@@ -134,6 +134,7 @@ pub struct Device {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub used_bytes: u64,
+    pub priority: i32,
 }
 
 pub fn device(target: &RecoveryTarget) -> Result<Option<Device>> {
@@ -164,6 +165,7 @@ fn parse_device(text: &str, path: &Path) -> Result<Option<Device>> {
             path: path.to_owned(),
             size_bytes,
             used_bytes,
+            priority: fields[4].parse()?,
         }));
     }
     Ok(None)
@@ -188,8 +190,8 @@ pub fn helper(pid: i32, policy: &RecoveryPolicy) -> Result<Identity> {
         .trim()
         .parse()?;
     ensure!(
-        max > 0 && max <= policy.helper_bytes && swap == 0,
-        "unbounded recovery helper"
+        max > 0 && max == policy.helper_bytes && swap == 0,
+        "recovery helper must match its configured native memory ceiling and zero swap"
     );
     Ok(Identity {
         cgroup: cgroup.into(),
@@ -243,13 +245,22 @@ fn native_return_safe_at(root: &Path, ledger: &HostLedger, policy: &HostPolicy) 
 }
 
 fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]) -> Result<bool> {
+    let deadline = std::time::Instant::now() + crate::page_return::INVENTORY_TIMEOUT;
     let mut pending = vec![root.to_owned()];
     let mut seen = 0usize;
     while let Some(directory) = pending.pop() {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "device return inventory incomplete: time bound exceeded"
+        );
         seen += 1;
         ensure!(seen <= 8192, "swap feasibility scan exceeds bound");
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "device return inventory incomplete: time bound exceeded"
+            );
             if entry.file_type()?.is_dir() {
                 pending.push(entry.path());
             }
@@ -325,12 +336,45 @@ fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]
             return Ok(false);
         }
     }
+    ensure!(
+        std::time::Instant::now() < deadline,
+        "device return inventory incomplete: time bound exceeded"
+    );
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_observation_preserves_the_active_priority() {
+        let path = std::env::temp_dir().join(format!(
+            "amc-priority-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::write(&path, "").unwrap();
+        let header = "Filename Type Size Used Priority\n";
+        for priority in [-2, 7, 10] {
+            let observed = parse_device(
+                &format!("{header}{} file 64 32 {priority}\n", path.display()),
+                &path,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(observed.priority, priority);
+            assert_eq!(observed.size_bytes, 64 * 1024);
+            assert_eq!(observed.used_bytes, 32 * 1024);
+        }
+        assert!(
+            parse_device(
+                &format!("{header}{} file 64 32 unknown\n", path.display()),
+                &path
+            )
+            .is_err()
+        );
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn whole_device_return_backs_the_helper_even_outside_swapped_ancestors() {

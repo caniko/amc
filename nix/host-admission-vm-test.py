@@ -851,11 +851,46 @@ time.sleep(120)
 with test_section(
     "explicit whole-device recovery restores swap on success and interrupted cleanup"
 ):
+    machine.succeed("swapoff /dev/vdb; swapon --priority 10 /dev/vdb")
     device_policy = json.loads(machine.succeed("cat /etc/amc-test-host-policy.json"))
     device_policy["swap_recovery"]["targets"] = [
         {"name": "vm", "path": "/dev/vdb", "priority": 10}
     ]
     write_file("/tmp/page-device-policy.json", json.dumps(device_policy))
+    write_file(
+        "/tmp/page-restore-manifest.json",
+        json.dumps(device_policy["swap_recovery"]["targets"]),
+    )
+    for content in (
+        "[]",
+        "{}",
+        "x" * 65537,
+        json.dumps([{"name": "vm", "path": "relative", "priority": 10}]),
+        json.dumps(device_policy["swap_recovery"]["targets"] * 2),
+    ):
+        write_file("/tmp/page-invalid-manifest.json", content)
+        machine.fail(
+            "amc recover-swap --restore --restore-manifest /tmp/page-invalid-manifest.json"
+        )
+    machine.succeed(
+        "ln -s /tmp/page-restore-manifest.json /tmp/page-restore-link; mkfifo /tmp/page-restore-fifo"
+    )
+    for path in ("/tmp/page-restore-link", "/tmp/page-restore-fifo"):
+        code, output = machine.execute(
+            f"timeout 5 amc recover-swap --restore --restore-manifest {path}"
+        )
+        assert code == 1, (path, code, output)
+    machine.succeed("chmod 666 /tmp/page-restore-manifest.json")
+    machine.fail(
+        "amc recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
+    )
+    machine.succeed(
+        "chmod 644 /tmp/page-restore-manifest.json; chown 1000 /tmp/page-restore-manifest.json"
+    )
+    machine.fail(
+        "amc recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
+    )
+    machine.succeed("chown 0 /tmp/page-restore-manifest.json")
     machine.succeed(
         "systemd-run --unit=device-host -- amc admission host-serve --policy /tmp/page-device-policy.json "
         "--socket /run/amc-device/admission.sock --state /var/lib/amc-device"
@@ -916,12 +951,14 @@ time.sleep(120)
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 "
         "--property="
         + shlex.quote(
-            f"ExecStopPost={restore_executable} recover-swap --restore --socket /run/amc-device/admission.sock"
+            f"ExecStopPost={restore_executable} recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
         )
         + " -- python3 /tmp/device-return-interrupt.py"
     )
     machine.wait_until_succeeds("test -e /tmp/device-return-off")
     machine.fail("grep -q '^/dev/vdb' /proc/swaps")
+    machine.succeed("systemctl stop device-host")
+    machine.fail("test -S /run/amc-device/admission.sock")
     machine.succeed("systemctl stop page-return")
     machine.succeed(
         'test "$(systemctl show page-return --property=Result --value)" = success'
@@ -930,6 +967,11 @@ time.sleep(120)
         'test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10; touch /tmp/page-target-probe'
     )
     machine.wait_until_succeeds("test -e /tmp/page-target-intact")
+    machine.succeed(
+        "systemd-run --unit=device-host -- amc admission host-serve --policy /tmp/page-device-policy.json "
+        "--socket /run/amc-device/admission.sock --state /var/lib/amc-device"
+    )
+    machine.wait_until_succeeds("test -S /run/amc-device/admission.sock")
     machine.wait_until_succeeds(
         "amc admission host-status --socket /run/amc-device/admission.sock | python3 -c "
         + shlex.quote(
@@ -941,5 +983,16 @@ time.sleep(120)
         "afterUsedKiB": after_device,
         "restoredPriority": 10,
         "interruptedRestored": True,
+        "brokerUnavailableRestored": True,
     }
     machine.succeed("systemctl stop page-target device-host")
+    machine.succeed("swapoff /dev/vdb; swapon --priority 7 /dev/vdb")
+    machine.fail(
+        "amc recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
+    )
+    machine.succeed('test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 7')
+    machine.succeed(
+        "swapoff /dev/vdb; amc recover-swap --restore --restore-manifest /tmp/page-restore-manifest.json"
+    )
+    machine.succeed('test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10')
+    evidence["deviceReturn"]["wrongActivePriorityDenied"] = True

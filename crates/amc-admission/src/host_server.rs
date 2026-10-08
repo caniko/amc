@@ -135,12 +135,22 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response> {
         metadata.uid() == 0,
         "host admission socket must be root-owned"
     );
-    let mut stream = UnixStream::connect(socket)?;
+    let stream = UnixStream::connect(socket)?;
     ensure!(
         getsockopt(&stream, PeerCredentials)?.uid() == 0,
         "host admission peer must be root"
     );
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    exchange(stream, request)
+}
+
+fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
+    let timeout = match request {
+        Request::AcquirePageReturn { .. } | Request::AcquireRecovery { .. } => {
+            Duration::from_secs(30)
+        }
+        _ => Duration::from_secs(2),
+    };
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     write_frame(&mut stream, request)?;
     let response: Response = read_frame(&mut stream)?;
@@ -1201,6 +1211,38 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_inventory_reply_can_exceed_the_ordinary_two_second_deadline() {
+        let (client, mut broker) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let request: Request = read_frame(&mut broker).unwrap();
+            assert!(matches!(request, Request::AcquirePageReturn { .. }));
+            thread::sleep(Duration::from_millis(2100));
+            write_frame(
+                &mut broker,
+                &Response {
+                    version: 1,
+                    granted: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
+        let reply = exchange(
+            client,
+            &Request::AcquirePageReturn {
+                version: 1,
+                pid: 42,
+                start_ticks: 7,
+                address: 4096,
+                bytes: 4096,
+            },
+        )
+        .unwrap();
+        assert!(reply.granted);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn owned_pool_replay_preserves_its_parent_after_restart_and_parent_exit() {
