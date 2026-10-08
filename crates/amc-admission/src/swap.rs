@@ -155,7 +155,13 @@ fn parse_device(text: &str, path: &Path) -> Result<Option<Device>> {
     for line in text.lines().skip(1) {
         let fields: Vec<_> = line.split_whitespace().collect();
         ensure!(fields.len() == 5, "invalid native swap table");
-        if fs::canonicalize(fields[0])? != path {
+        let candidate = match fs::canonicalize(fields[0]) {
+            Ok(candidate) => candidate,
+            Err(error) if Path::new(fields[0]) == path => return Err(error.into()),
+            // An unrelated unlinked swap file is not evidence about this target.
+            Err(_) => continue,
+        };
+        if candidate != path {
             continue;
         }
         let size_bytes = fields[2]
@@ -355,6 +361,29 @@ fn native_return_safe_claims_at(root: &Path, claims: &[crate::host::Reservation]
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_unresolvable_swap_entry_does_not_hide_a_healthy_target() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-swap-lookup-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        fs::write(&target, "").unwrap();
+        let absent = root.join("unlinked");
+        let text = format!(
+            "Filename Type Size Used Priority\n{} file 64 32 1\n{} file 64 16 10\n",
+            absent.display(),
+            target.display()
+        );
+        let observed = parse_device(&text, &target).unwrap().unwrap();
+        assert_eq!(observed.used_bytes, 16 * 1024);
+        assert_eq!(observed.priority, 10);
+        // A matching but inaccessible target must still fail closed.
+        fs::remove_file(&target).unwrap();
+        assert!(parse_device(&text, &target).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_remote_readers_resident_cache_with_no_owned_slots_creates_no_return_demand() {

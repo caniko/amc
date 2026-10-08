@@ -230,55 +230,67 @@ fn scan_at(
             cursor.address = 0;
             return Ok(Scan::More);
         };
-        let readable = fields
+        let permissions = fields
             .next()
-            .is_some_and(|p| p.starts_with('r') && p.ends_with('p'));
+            .context("missing native mapping permissions")?;
+        // x86's fixed kernel vsyscall page is not a swappable user VMA and
+        // has no pagemap entry. Do not generalize this exception to user VMAs.
+        if cfg!(target_arch = "x86_64")
+            && first == 0xffffffffff600000
+            && last == 0xffffffffff601000
+            && permissions == "--xp"
+            && fields.nth(3) == Some("[vsyscall]")
+        {
+            cursor.maps_offset = maps.stream_position()?;
+            cursor.address = 0;
+            continue;
+        }
+        let readable = permissions.starts_with('r') && permissions.ends_with('p');
         let mut address =
             if cursor.maps_offset == offset && (first..=last).contains(&cursor.address) {
                 cursor.address
             } else {
                 first
             };
-        if readable {
-            while address < last {
-                if scanned == page_budget {
-                    cursor.maps_offset = offset;
-                    cursor.address = address;
-                    return Ok(Scan::More);
-                }
-                let count = ((last - address) / page)
-                    .min((entries.len() / 8) as u64)
-                    .min(page_budget - scanned) as usize;
-                ensure!(count > 0, "empty native mapping scan");
-                pagemap.read_exact_at(
-                    &mut entries[..count * 8],
-                    (address / page)
-                        .checked_mul(8)
-                        .context("pagemap overflow")?,
-                )?;
-                scanned += count as u64;
-                let swapped = |i: usize| {
-                    u64::from_ne_bytes(
-                        entries[i * 8..i * 8 + 8]
-                            .try_into()
-                            .expect("eight-byte pagemap entry"),
-                    ) & ((1u64 << 63) | (1u64 << 62))
-                        == 1u64 << 62
-                };
-                if let Some(first) = (0..count).find(|i| swapped(*i)) {
-                    let pages = (first..count)
-                        .take((bound / page) as usize)
-                        .take_while(|i| swapped(*i))
-                        .count();
-                    cursor.maps_offset = offset;
-                    cursor.address = address + first as u64 * page;
-                    return Ok(Scan::Range {
-                        address: cursor.address,
-                        bytes: pages as u64 * page,
-                    });
-                }
-                address += count as u64 * page;
+        while address < last {
+            if scanned == page_budget {
+                cursor.maps_offset = offset;
+                cursor.address = address;
+                return Ok(Scan::More);
             }
+            let count = ((last - address) / page)
+                .min((entries.len() / 8) as u64)
+                .min(page_budget - scanned) as usize;
+            ensure!(count > 0, "empty native mapping scan");
+            pagemap.read_exact_at(
+                &mut entries[..count * 8],
+                (address / page)
+                    .checked_mul(8)
+                    .context("pagemap overflow")?,
+            )?;
+            scanned += count as u64;
+            let swapped = |i: usize| {
+                u64::from_ne_bytes(
+                    entries[i * 8..i * 8 + 8]
+                        .try_into()
+                        .expect("eight-byte pagemap entry"),
+                ) & ((1u64 << 63) | (1u64 << 62))
+                    == 1u64 << 62
+            };
+            if let Some(first) = (0..count).find(|i| swapped(*i)) {
+                ensure!(readable, "swapped PTE in an unsupported native mapping");
+                let pages = (first..count)
+                    .take((bound / page) as usize)
+                    .take_while(|i| swapped(*i))
+                    .count();
+                cursor.maps_offset = offset;
+                cursor.address = address + first as u64 * page;
+                return Ok(Scan::Range {
+                    address: cursor.address,
+                    bytes: pages as u64 * page,
+                });
+            }
+            address += count as u64 * page;
         }
         cursor.maps_offset = maps.stream_position()?;
         cursor.address = 0;
@@ -304,6 +316,77 @@ mod tests {
             maps_offset: 0,
             address: 0,
         }
+    }
+    #[test]
+    fn swapped_pages_in_unreadable_or_shared_mappings_prevent_complete_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-skipped-vma-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let page = page_return::page_size().unwrap();
+        let pagemap = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.join("pagemap"))
+            .unwrap();
+        pagemap.set_len(3 * 8).unwrap();
+        for permission in ["---p", "rw-s", "r--s"] {
+            fs::write(
+                root.join("maps"),
+                format!("{page:x}-{:x} {permission} 0 00:00 0\n", 2 * page),
+            )
+            .unwrap();
+            pagemap.write_all_at(&0u64.to_ne_bytes(), 8).unwrap();
+            assert_eq!(
+                scan_at(
+                    &mut cursor(),
+                    File::open(root.join("maps")).unwrap(),
+                    &pagemap,
+                    page,
+                    8,
+                    8
+                )
+                .unwrap(),
+                Scan::Complete
+            );
+            pagemap
+                .write_all_at(&(1u64 << 62).to_ne_bytes(), 8)
+                .unwrap();
+            assert!(
+                scan_at(
+                    &mut cursor(),
+                    File::open(root.join("maps")).unwrap(),
+                    &pagemap,
+                    page,
+                    8,
+                    8
+                )
+                .is_err(),
+                "unfaultable swapped {permission} mapping appeared complete"
+            );
+        }
+        if cfg!(target_arch = "x86_64") {
+            fs::write(
+                root.join("maps"),
+                "ffffffffff600000-ffffffffff601000 --xp 0 00:00 0 [vsyscall]\n",
+            )
+            .unwrap();
+            assert_eq!(
+                scan_at(
+                    &mut cursor(),
+                    File::open(root.join("maps")).unwrap(),
+                    &pagemap,
+                    page,
+                    8,
+                    8
+                )
+                .unwrap(),
+                Scan::Complete
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn pid_reuse_exec_and_native_migration_reset_discovery_hints() {

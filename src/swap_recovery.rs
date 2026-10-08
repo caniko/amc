@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn default_recovery_cannot_succeed_without_selected_page_return_subtrees() {
         let policy: RecoveryPolicy = serde_json::from_value(serde_json::json!({
-            "cgroup":"/recovery", "helper_bytes":1048576, "minimum_bytes":1,
+            "cgroup":"/recovery.service", "helper_bytes":1048576, "minimum_bytes":1,
             "targets":[{"name":"device", "path":"/swap", "priority":10}],
             "page_cgroups":[], "batch_bytes":4096
         }))

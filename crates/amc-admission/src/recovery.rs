@@ -55,7 +55,16 @@ impl RecoveryPolicy {
     }
 
     fn validate_with_page_size(&self, page_size: u64) -> Result<()> {
-        crate::native::cgroup_directory(&self.cgroup)?;
+        canonical_cgroup(&self.cgroup)?;
+        ensure!(
+            std::path::Path::new(&self.cgroup)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name
+                    .strip_suffix(".service")
+                    .is_some_and(|stem| !stem.is_empty())),
+            "recovery requires a native service boundary"
+        );
         ensure!(
             (1..=1_073_741_824).contains(&self.helper_bytes)
                 && self.minimum_bytes > 0
@@ -68,7 +77,7 @@ impl RecoveryPolicy {
         );
         validate_targets(&self.targets)?;
         for (index, group) in self.page_cgroups.iter().enumerate() {
-            crate::native::cgroup_directory(group)?;
+            canonical_cgroup(group)?;
             ensure!(
                 self.page_cgroups
                     .iter()
@@ -80,6 +89,18 @@ impl RecoveryPolicy {
         }
         Ok(())
     }
+}
+
+fn canonical_cgroup(group: &str) -> Result<()> {
+    crate::native::cgroup_directory(group)?;
+    ensure!(
+        group
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "recovery requires canonical cgroup paths"
+    );
+    Ok(())
 }
 
 /// Shared by broker policy and the broker-independent restoration manifest.
@@ -295,9 +316,38 @@ impl HostLedger {
 mod tests {
     use super::*;
     #[test]
+    fn recovery_policy_rejects_noncanonical_paths_and_nonservice_helpers() {
+        let policy = RecoveryPolicy {
+            cgroup: "/system.slice/amc-recovery.service".into(),
+            helper_bytes: 1024 * 1024,
+            minimum_bytes: 1,
+            targets: vec![],
+            page_cgroups: vec!["/work/child".into()],
+            batch_bytes: 65536,
+        };
+        assert!(policy.validate().is_ok());
+        for group in ["/work/", "/work//child", "//work/child", "/work/./child"] {
+            let mut invalid = policy.clone();
+            invalid.page_cgroups = vec![group.into()];
+            assert!(invalid.validate().is_err(), "accepted selection {group}");
+        }
+        for group in [
+            "/system.slice/amc-recovery.service/",
+            "/system.slice//amc-recovery.service",
+            "/system.slice/amc-recovery.scope",
+            "/system.slice/amc-recovery.slice",
+            "/system.slice/recovery",
+            "/system.slice/.service",
+        ] {
+            let mut invalid = policy.clone();
+            invalid.cgroup = group.into();
+            assert!(invalid.validate().is_err(), "accepted helper {group}");
+        }
+    }
+    #[test]
     fn recovery_batches_must_cover_a_complete_native_page() {
         let mut policy = RecoveryPolicy {
-            cgroup: "/recovery".into(),
+            cgroup: "/recovery.service".into(),
             helper_bytes: 1024 * 1024,
             minimum_bytes: 1,
             targets: vec![],
