@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Allow four hours for hosted patched-kernel qualification after both native
+  kernel builds exhausted the previous two-hour deadline.
 - Require preparation slice hierarchies under their enrolled UID's user manager;
   reject host-root slices that the user-bus launch path cannot create.
 - Validate complete preparation slice hierarchies before admitting drain intents.

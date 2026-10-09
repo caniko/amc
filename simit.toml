@@ -14,7 +14,7 @@ nix_builds = [
 
 [ci.nix_build]
 only = true
-timeout_minutes = 120
+timeout_minutes = 240
 max_parallel = 2
 max_jobs = 1
 cores = 2
