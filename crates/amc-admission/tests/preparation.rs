@@ -20,7 +20,8 @@ fn policy() -> HostPolicy {
         "domains": [
             {"name":"work", "uid":1000, "cgroup":"/work.slice", "ceiling_bytes":50,
              "swap_bytes":10, "fair_share_bytes":50},
-            {"name":"game", "uid":1000, "cgroup":"/game.slice", "ceiling_bytes":40,
+            {"name":"game", "uid":1000,
+             "cgroup":"/user.slice/user-1000.slice/user@1000.service/game.slice", "ceiling_bytes":40,
              "swap_bytes":0, "fair_share_bytes":50},
             {"name":"builders", "uid":0, "cgroup":"/builders", "ceiling_bytes":50,
              "swap_bytes":10, "fair_share_bytes":50}
@@ -42,7 +43,13 @@ fn job(id: &str, domain: &str, uid: u32, bytes: u64) -> Reservation {
             pid: 42,
             start_ticks: 7,
             inode: 1,
-            cgroup: format!("/{domain}.slice/app-amc-job-{id}.service"),
+            cgroup: if domain == "game" {
+                format!(
+                    "/user.slice/user-{uid}.slice/user@{uid}.service/game.slice/app-amc-job-{id}.service"
+                )
+            } else {
+                format!("/{domain}.slice/app-amc-job-{id}.service")
+            },
         },
         memory_bytes: bytes,
         swap_bytes: 0,
@@ -514,8 +521,9 @@ fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
         domains: vec!["builders".into()],
         envelopes: Default::default(),
     });
-    p.domains[1].cgroup = "/shared/game.slice".into();
-    p.domains[2].cgroup = "/shared/builders.slice".into();
+    let shared = "/user.slice/user-1000.slice/user@1000.service/shared.slice";
+    p.domains[1].cgroup = format!("{shared}/shared-game.slice");
+    p.domains[2].cgroup = format!("{shared}/shared-builders.slice");
     let mut l = HostLedger::new("boot".into());
     l.swap_return_bytes = Some(0);
     let collision = "escrow-parent-builders";
@@ -523,7 +531,8 @@ fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
         .unwrap();
     advance(&mut l, &p, 250);
     let mut native = job(collision, "game", 1000, 40);
-    native.identity.cgroup = format!("/shared/game.slice/app-amc-prepared-{collision}.scope");
+    native.identity.cgroup =
+        format!("{shared}/shared-game.slice/app-amc-prepared-{collision}.scope");
     l.consume(collision, "key", 1000, native, 300).unwrap();
     l.request(job("parent", "work", 1000, 10), &p).unwrap();
     let waits = l.advance(
@@ -536,7 +545,9 @@ fn a_real_prepared_claim_with_a_lane_id_still_backs_the_shared_ancestor() {
                 50u64.saturating_sub(
                     claims
                         .iter()
-                        .filter(|r| r.granted && r.identity.cgroup.starts_with("/shared/"))
+                        .filter(|r| {
+                            r.granted && r.identity.cgroup.starts_with(&format!("{shared}/"))
+                        })
                         .map(|r| r.memory_bytes)
                         .sum::<u64>(),
                 )
@@ -875,7 +886,7 @@ fn a_ready_claim_is_native_backing_until_its_once_only_consume_transfer() {
     assert_eq!(claims.len(), 2);
     let ready = claims.iter().find(|r| r.id == "ready").unwrap();
     assert_eq!(ready.memory_bytes, 40);
-    assert_eq!(ready.identity.cgroup, "/game.slice");
+    assert_eq!(ready.identity.cgroup, p.domains[1].cgroup);
     let native = job("ready", "game", 1000, 40);
     let transferred = l.native_claims(&p, Some(&native)).unwrap();
     assert_eq!(transferred.len(), 1);

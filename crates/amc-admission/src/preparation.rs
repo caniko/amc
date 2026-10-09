@@ -67,8 +67,7 @@ fn launch_slice_hierarchy(group: &str, uid: u32) -> bool {
         hierarchy.push_str(&format!("/{}.slice", &name[..index]));
     }
     hierarchy.push_str(&format!("/{name}.slice"));
-    group == hierarchy
-        || group == format!("/user.slice/user-{uid}.slice/user@{uid}.service{hierarchy}")
+    group == format!("/user.slice/user-{uid}.slice/user@{uid}.service{hierarchy}")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

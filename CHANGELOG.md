@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Require preparation slice hierarchies under their enrolled UID's user manager;
+  reject host-root slices that the user-bus launch path cannot create.
 - Validate complete preparation slice hierarchies before admitting drain intents.
 - Revalidate pending helper runner placement/backing on poll, consume and broker
   reconciliation; changed helpers lose their pending barriers across restart.

@@ -83,6 +83,9 @@ fn preparation_profiles_require_the_slice_units_complete_hierarchy() {
     ]))
     .unwrap();
     for group in [
+        "/game.slice",
+        "/app.slice/app-game.slice",
+        "/app.slice/app-game.slice/app-game-child.slice",
         "/app.slice/game.slice",
         "/app-game.slice",
         "/app.slice/app-game.slice/app-other.slice",
@@ -96,11 +99,9 @@ fn preparation_profiles_require_the_slice_units_complete_hierarchy() {
         );
     }
     for group in [
-        "/game.slice",
-        "/app.slice/app-game.slice",
-        "/app.slice/app-game.slice/app-game-child.slice",
         "/user.slice/user-1000.slice/user@1000.service/game.slice",
         "/user.slice/user-1000.slice/user@1000.service/app.slice/app-game.slice",
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-game.slice/app-game-child.slice",
     ] {
         policy.domains[1].cgroup = group.into();
         policy.validate().unwrap();
@@ -118,11 +119,13 @@ fn preparation_profiles_require_an_executable_launch_slice_basename() {
     ]))
     .unwrap();
     for basename in ["a".repeat(80), "game".into()] {
-        policy.domains[1].cgroup = format!("/{basename}.slice");
+        policy.domains[1].cgroup =
+            format!("/user.slice/user-1000.slice/user@1000.service/{basename}.slice");
         policy.validate().unwrap();
     }
     for basename in ["a".repeat(81), "game\\x20name".into()] {
-        policy.domains[1].cgroup = format!("/{basename}.slice");
+        policy.domains[1].cgroup =
+            format!("/user.slice/user-1000.slice/user@1000.service/{basename}.slice");
         assert!(policy.validate().is_err(), "{basename}");
     }
 }
@@ -203,7 +206,8 @@ fn preparation_rejects_a_target_whose_completion_rights_it_cannot_mint() {
         "domains":[
             {"name":"work", "uid":1000, "cgroup":"/work.slice",
              "ceiling_bytes":50, "swap_bytes":0, "fair_share_bytes":50},
-            {"name":"game", "uid":1000, "cgroup":"/game.slice",
+            {"name":"game", "uid":1000,
+             "cgroup":"/user.slice/user-1000.slice/user@1000.service/game.slice",
              "ceiling_bytes":40, "swap_bytes":0, "fair_share_bytes":50,
              "continuation":{"parent_max_bytes":40, "memory_bytes":10,
                  "swap_bytes":0, "max_calls":8, "domains":["work"]}}

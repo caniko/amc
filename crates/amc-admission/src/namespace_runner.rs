@@ -330,7 +330,7 @@ mod tests {
         let mut policy: HostPolicy = serde_json::from_value(serde_json::json!({
             "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
             "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
-            "domains":[{"name":"game","uid":1000,"cgroup":"/game.slice","ceiling_bytes":100,"swap_bytes":0,"fair_share_bytes":100}],
+            "domains":[{"name":"game","uid":1000,"cgroup":"/user.slice/user-1000.slice/user@1000.service/game.slice","ceiling_bytes":100,"swap_bytes":0,"fair_share_bytes":100}],
             "preparations":[{"name":"game","domain":"game","memory_bytes":100,"swap_bytes":0,
                 "drain_domains":[],"wait_ms":10000,"ready_ms":15000}]
         })).unwrap();

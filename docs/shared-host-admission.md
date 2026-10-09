@@ -123,10 +123,11 @@ cooldown deferral. Passing Rust fixtures alone does not qualify native rollout.
 Optional `preparations` profiles specify a non-root slice domain, native
 memory/swap ceilings, `drain_domains`, a bounded `wait_ms` and a `ready_ms` of
 15–60 seconds, covering the bounded host-native registration and consume path.
-The configured path must match the slice unit's complete dash-derived hierarchy,
-optionally below that UID's user-manager root. For example, `app-game.slice`
-requires `app.slice/app-game.slice`; `app.slice/game.slice` cannot be launched
-by passing `game.slice` to systemd and is rejected before creating an intent.
+The configured path must match the slice unit's complete dash-derived hierarchy
+below that UID's user-manager root. For example, `app-game.slice` for UID 1000
+requires `/user.slice/user-1000.slice/user@1000.service/app.slice/app-game.slice`.
+Host-root slices and `app.slice/game.slice` cannot be produced by this user-bus
+launch path and are rejected before creating an intent.
 The flake and package export `admissionPreparationVersion = 2`.
 
 Waited `amc exec` and `amc admission exec` calls from a private PID or remapped

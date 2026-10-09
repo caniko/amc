@@ -1726,7 +1726,7 @@ mod tests {
             "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
             "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
             "namespace_runner_bytes":67108864,
-            "domains":[{"name":"game","uid":uid,"cgroup":"/game.slice","ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
+            "domains":[{"name":"game","uid":uid,"cgroup":format!("/user.slice/user-{uid}.slice/user@{uid}.service/game.slice"),"ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
             "preparations":[{"name":"game","domain":"game","memory_bytes":134217728,"swap_bytes":0,
                 "drain_domains":[],"wait_ms":3600000,"ready_ms":15000}]
         })).unwrap();
@@ -1795,7 +1795,7 @@ mod tests {
             "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
             "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
             "namespace_runner_bytes":67108864,
-            "domains":[{"name":"game","uid":1000,"cgroup":"/game.slice","ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
+            "domains":[{"name":"game","uid":1000,"cgroup":"/user.slice/user-1000.slice/user@1000.service/game.slice","ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
             "preparations":[{"name":"game","domain":"game","memory_bytes":134217728,"swap_bytes":0,
                 "drain_domains":[],"wait_ms":3600000,"ready_ms":15000}]
         })).unwrap();
