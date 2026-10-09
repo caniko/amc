@@ -289,7 +289,7 @@ pub fn serve_supervised(
     ledger.swap_return_bytes = None;
     crate::namespace_runner::discover(&mut ledger)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
-    ledger.reconcile_preparations(host_native::preparation_owner_alive);
+    reconcile_preparation_helpers(&mut ledger, &policy);
     let parent = socket
         .parent()
         .ok_or_else(|| anyhow::anyhow!("socket has no parent"))?;
@@ -342,7 +342,7 @@ pub fn serve_supervised(
                 }
             }
             reconcile_recovery(&mut ledger);
-            ledger.reconcile_preparations(host_native::preparation_owner_alive);
+            reconcile_preparation_helpers(&mut ledger, &policy);
             let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
             waiting = ledger.advance(
                 crate::clock::boot_ms()?,
@@ -1179,19 +1179,7 @@ fn handle_advance_request(
                 .find(|p| p.id == id && p.uid == uid && p.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown preparation capability"))?
                 .clone();
-            if matches!(
-                p.phase,
-                PreparationPhase::Draining | PreparationPhase::Ready
-            ) {
-                ensure!(
-                    p.owner
-                        .as_ref()
-                        .is_some_and(
-                            |owner| host_native::preparation_owner_alive(owner) == Some(true)
-                        ),
-                    "preparation helper is no longer running"
-                );
-            }
+            verify_preparation_helper(ledger, policy, &p)?;
             let (domain, identity, memory_bytes, swap_bytes) = if matches!(
                 p.phase,
                 PreparationPhase::Active | PreparationPhase::Reconciling
@@ -1652,6 +1640,53 @@ fn acquire_completion(
     )))
 }
 
+fn verify_preparation_helper(
+    ledger: &HostLedger,
+    policy: &HostPolicy,
+    preparation: &crate::preparation::Preparation,
+) -> Result<()> {
+    if matches!(
+        preparation.phase,
+        crate::preparation::PreparationPhase::Active
+            | crate::preparation::PreparationPhase::Reconciling
+    ) {
+        return Ok(());
+    }
+    let owner = preparation
+        .owner
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("preparation helper runner lifetime missing"))?;
+    ensure!(
+        host_native::preparation_owner_alive(owner) == Some(true)
+            && fs::metadata(format!("/proc/{}", owner.pid))?.uid() == preparation.uid,
+        "preparation helper runner lifetime or UID changed"
+    );
+    let claims = ledger
+        .native_claims(policy, None)
+        .ok_or_else(|| anyhow::anyhow!("preparation helper runner backing unavailable"))?;
+    crate::namespace_runner::verify(owner.pid, preparation.uid, policy, &claims)
+        .map_err(|error| error.context("preparation helper runner placement or limits changed"))?;
+    ensure!(
+        host_native::preparation_owner_alive(owner) == Some(true),
+        "preparation helper runner lifetime changed during verification"
+    );
+    Ok(())
+}
+
+fn reconcile_preparation_helpers(ledger: &mut HostLedger, policy: &HostPolicy) {
+    let invalid: std::collections::BTreeSet<_> = ledger
+        .preparations
+        .iter()
+        .filter(|preparation| verify_preparation_helper(ledger, policy, preparation).is_err())
+        .map(|preparation| preparation.id.clone())
+        .collect();
+    // Pending intents own no executing grant. Invalidate their barriers on
+    // missing or changed backing; consumed native claims reconcile separately.
+    ledger
+        .preparations
+        .retain(|preparation| !invalid.contains(&preparation.id));
+}
+
 fn preparation_reply(
     ledger: &HostLedger,
     policy: &HostPolicy,
@@ -1665,6 +1700,7 @@ fn preparation_reply(
         .iter()
         .find(|p| p.id == id && p.uid == uid && p.key == key)
         .ok_or_else(|| anyhow::anyhow!("unknown or expired preparation capability"))?;
+    verify_preparation_helper(ledger, policy, p)?;
     reply.granted = p.phase == crate::preparation::PreparationPhase::Ready;
     reply.waiting = p.waiting;
     reply.ticket = Some(p.id.clone());
@@ -1682,6 +1718,76 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_preparation_helper_outside_its_runner_cannot_poll_or_consume() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "namespace_runner_bytes":67108864,
+            "domains":[{"name":"game","uid":uid,"cgroup":"/game.slice","ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
+            "preparations":[{"name":"game","domain":"game","memory_bytes":134217728,"swap_bytes":0,
+                "drain_domains":[],"wait_ms":3600000,"ready_ms":15000}]
+        })).unwrap();
+        let pid = std::process::id() as i32;
+        let owner = crate::ledger::ClientIdentity {
+            pid,
+            start_ticks: host_native::process_start(pid).unwrap(),
+        };
+        assert_eq!(host_native::preparation_owner_alive(&owner), Some(true));
+        for phase in ["draining", "ready"] {
+            let mut ledger = HostLedger::new("boot".into());
+            ledger.preparations.push(
+                serde_json::from_value(serde_json::json!({
+                    "id":"intent", "key":"secret", "uid":uid, "owner":owner,
+                    "profile":"game", "domain":"game", "memory_bytes":134217728, "swap_bytes":0,
+                    "requested_ms":0, "expires_ms":3600000, "ready_ms":15000,
+                    "phase":phase, "drain":[], "waiting":null
+                }))
+                .unwrap(),
+            );
+            let mut restored: HostLedger =
+                serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+            let before = serde_json::to_vec(&restored).unwrap();
+            let evidence = crate::burst_manager::Snapshot::default();
+            for request in [
+                Request::Preparation {
+                    version: 1,
+                    id: "intent".into(),
+                    key: "secret".into(),
+                },
+                Request::Consume {
+                    version: 1,
+                    id: "intent".into(),
+                    key: "secret".into(),
+                    origin: None,
+                },
+            ] {
+                let result = handle_advance_request(
+                    request,
+                    pid,
+                    uid,
+                    &policy,
+                    &mut restored,
+                    (None, None, &evidence),
+                    &mut Response::default(),
+                );
+                assert!(
+                    result.is_err(),
+                    "a live helper outside its backed runner must not retain a {phase} claim"
+                );
+                assert!(format!("{:#}", result.unwrap_err()).contains("preparation helper runner"));
+                assert_eq!(serde_json::to_vec(&restored).unwrap(), before);
+            }
+            reconcile_preparation_helpers(&mut restored, &policy);
+            assert!(
+                !restored.preparation_barrier(),
+                "changed runner placement must release the pending barrier after restart"
+            );
+            assert!(restored.preparations.is_empty());
+        }
+    }
 
     #[test]
     fn preparation_request_outside_the_backed_runner_cannot_create_a_barrier() {

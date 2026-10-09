@@ -73,6 +73,41 @@ fn root_completion_envelopes_match_the_fixed_native_pool_request() {
 }
 
 #[test]
+fn preparation_profiles_require_the_slice_units_complete_hierarchy() {
+    let mut policy = host_policy();
+    policy.reserve_bytes = 67108864;
+    policy.namespace_runner_bytes = 67108864;
+    policy.preparations = serde_json::from_value(serde_json::json!([
+        {"name":"game", "domain":"game", "memory_bytes":40, "swap_bytes":0,
+         "drain_domains":["work"], "wait_ms":10000, "ready_ms":15000}
+    ]))
+    .unwrap();
+    for group in [
+        "/app.slice/game.slice",
+        "/app-game.slice",
+        "/app.slice/app-game.slice/app-other.slice",
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/game.slice",
+        "/user.slice/user-1001.slice/user@1001.service/game.slice",
+    ] {
+        policy.domains[1].cgroup = group.into();
+        assert!(
+            policy.validate().is_err(),
+            "accepted a launch slice with a different hierarchy: {group}"
+        );
+    }
+    for group in [
+        "/game.slice",
+        "/app.slice/app-game.slice",
+        "/app.slice/app-game.slice/app-game-child.slice",
+        "/user.slice/user-1000.slice/user@1000.service/game.slice",
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-game.slice",
+    ] {
+        policy.domains[1].cgroup = group.into();
+        policy.validate().unwrap();
+    }
+}
+
+#[test]
 fn preparation_profiles_require_an_executable_launch_slice_basename() {
     let mut policy = host_policy();
     policy.reserve_bytes = 67108864;
@@ -83,11 +118,11 @@ fn preparation_profiles_require_an_executable_launch_slice_basename() {
     ]))
     .unwrap();
     for basename in ["a".repeat(80), "game".into()] {
-        policy.domains[1].cgroup = format!("/parent/{basename}.slice");
+        policy.domains[1].cgroup = format!("/{basename}.slice");
         policy.validate().unwrap();
     }
     for basename in ["a".repeat(81), "game\\x20name".into()] {
-        policy.domains[1].cgroup = format!("/parent/{basename}.slice");
+        policy.domains[1].cgroup = format!("/{basename}.slice");
         assert!(policy.validate().is_err(), "{basename}");
     }
 }

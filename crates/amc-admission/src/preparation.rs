@@ -30,11 +30,7 @@ impl PreparationProfile {
                 && domain.uid != 0
                 && !domain.burst
                 && domain.continuation.is_none()
-                && std::path::Path::new(&domain.cgroup)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|slice| slice.strip_suffix(".slice"))
-                    .is_some_and(crate::ledger::valid_name)
+                && launch_slice_hierarchy(&domain.cgroup, domain.uid)
                 && self.memory_bytes > 0
                 && self.memory_bytes <= domain.ceiling_bytes
                 && self.swap_bytes <= domain.swap_bytes
@@ -51,6 +47,28 @@ impl PreparationProfile {
         );
         Ok(())
     }
+}
+
+fn launch_slice_hierarchy(group: &str, uid: u32) -> bool {
+    let Some(name) = std::path::Path::new(group)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|slice| slice.strip_suffix(".slice"))
+        .filter(|name| {
+            crate::ledger::valid_name(name) && name.split('-').all(|part| !part.is_empty())
+        })
+    else {
+        return false;
+    };
+    // systemd derives every ancestor from the dash-separated slice basename.
+    // The scope receives only this unit name, never an arbitrary cgroup path.
+    let mut hierarchy = String::new();
+    for (index, _) in name.match_indices('-') {
+        hierarchy.push_str(&format!("/{}.slice", &name[..index]));
+    }
+    hierarchy.push_str(&format!("/{name}.slice"));
+    group == hierarchy
+        || group == format!("/user.slice/user-{uid}.slice/user@{uid}.service{hierarchy}")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

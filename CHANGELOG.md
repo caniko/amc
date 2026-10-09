@@ -32,6 +32,9 @@
 
 ### Fixed
 
+- Validate complete preparation slice hierarchies before admitting drain intents.
+- Revalidate pending helper runner placement/backing on poll, consume and broker
+  reconciliation; changed helpers lose their pending barriers across restart.
 - Use the public memory-controller hierarchy API for kernel guards on Linux 6.18
   and 7.2, fixing the 6.18 compilation failure.
 - Authenticate each preparation request in its backed native helper boundary.
