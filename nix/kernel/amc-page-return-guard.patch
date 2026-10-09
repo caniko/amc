@@ -138,7 +138,7 @@
 +	if (task->mm != mm)
 +		goto out;
 +	memcg = mem_cgroup_from_task(task);
-+	if (!memcg || !cgroup_on_dfl(memcg->css.cgroup)) {
++	if (!memcg || !cgroup_subsys_on_dfl(memory_cgrp_subsys)) {
 +		ret = -EOPNOTSUPP;
 +		goto out;
 +	}

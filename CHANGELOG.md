@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Use the public memory-controller hierarchy API for kernel guards on Linux 6.18
+  and 7.2, fixing the 6.18 compilation failure.
 - Authenticate each preparation request in its backed native helper boundary.
 - Release retired root pools through persisted finite Worker ownership while
   retaining native descendants until positive cleanup.
