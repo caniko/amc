@@ -14,6 +14,8 @@ pub struct Policy {
     pub reserve_bytes: u64,
     pub queue_limit: usize,
     pub contracts: BTreeMap<String, Contract>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub burst_budget_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -24,6 +26,10 @@ pub struct Contract {
     pub memory_swap_max: u64,
     pub max_running: usize,
     pub pause_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub burst: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_max_sec: Option<u64>,
 }
 
 /// Shared headroom includes host and ancestors; sibling slices are separate.
@@ -62,10 +68,23 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl Policy {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.version == 1, "unsupported admission policy version");
         ensure!(self.budget_bytes > 0, "empty admission budget");
+        ensure!(
+            self.budget_bytes
+                .checked_add(self.burst_budget_bytes)
+                .is_some_and(|total| total <= i64::MAX as u64),
+            "admission burst budget overflow"
+        );
         ensure!(
             (1..=256).contains(&self.queue_limit),
             "queue_limit must be 1..=256"
@@ -74,12 +93,23 @@ impl Policy {
             !self.contracts.is_empty() && self.contracts.len() <= 32,
             "invalid contract count"
         );
+        let mut slice_classes = BTreeMap::new();
         for (name, contract) in &self.contracts {
             ensure!(valid_name(name), "invalid contract name");
             contract.validate()?;
             ensure!(
+                slice_classes
+                    .insert(&contract.slice, contract.burst)
+                    .is_none_or(|burst| burst == contract.burst),
+                "contracts sharing a native slice must use the same burst class"
+            );
+            ensure!(
                 contract.memory_max <= self.budget_bytes,
                 "contract cannot fit budget"
+            );
+            ensure!(
+                !contract.burst || contract.memory_max <= self.burst_budget_bytes,
+                "burst contract cannot fit burst allowance"
             );
         }
         Ok(())
@@ -109,6 +139,17 @@ impl Contract {
                 .as_ref()
                 .is_none_or(|p| p.as_os_str().len() <= 4096),
             "pause marker exceeds path bound"
+        );
+        ensure!(
+            self.runtime_max_sec
+                .is_none_or(|seconds| (1..=86400).contains(&seconds)),
+            "invalid native runtime deadline"
+        );
+        ensure!(
+            !self.burst
+                || (self.memory_swap_max == 0
+                    && self.runtime_max_sec.is_some_and(|seconds| seconds <= 30)),
+            "burst contract requires zero swap and a short native deadline"
         );
         Ok(())
     }
@@ -211,6 +252,17 @@ impl Ledger {
         policy: &Policy,
         deadline_ms: u64,
     ) -> Result<()> {
+        self.enqueue_sized(id, name, policy, deadline_ms, None)
+    }
+
+    pub fn enqueue_sized(
+        &mut self,
+        id: String,
+        name: &str,
+        policy: &Policy,
+        deadline_ms: u64,
+        memory_max: Option<u64>,
+    ) -> Result<()> {
         ensure!(
             self.entries.len() < policy.queue_limit,
             "admission queue is full"
@@ -219,11 +271,18 @@ impl Ledger {
             valid_name(&id) && self.get(&id).is_none(),
             "invalid or duplicate ticket"
         );
-        let contract = policy
+        let mut contract = policy
             .contracts
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown contract"))?
             .clone();
+        if let Some(bytes) = memory_max {
+            ensure!(
+                bytes > 0 && bytes <= contract.memory_max,
+                "requested memory exceeds contract"
+            );
+            contract.memory_max = bytes;
+        }
         self.entries.push(Entry {
             id,
             name: name.into(),
@@ -269,6 +328,16 @@ impl Ledger {
                 continue;
             }
             let committed = self.committed();
+            let burst_committed = self
+                .entries
+                .iter()
+                .filter(|e| e.phase != Phase::Queued && e.contract.burst)
+                .fold(0u64, |sum, e| sum.saturating_add(e.contract.memory_max));
+            let budget = policy.budget_bytes.saturating_add(if entry.contract.burst {
+                policy.burst_budget_bytes
+            } else {
+                0
+            });
             let prefix = format!("{}-", entry.contract.slice.trim_end_matches(".slice"));
             let slice_committed = self
                 .entries
@@ -289,7 +358,11 @@ impl Ledger {
                 Some(WaitReason::Fifo)
             } else if count >= entry.contract.max_running {
                 Some(WaitReason::Concurrency)
-            } else if entry.contract.memory_max > policy.budget_bytes.saturating_sub(committed) {
+            } else if entry.contract.memory_max > budget.saturating_sub(committed)
+                || (entry.contract.burst
+                    && entry.contract.memory_max
+                        > policy.burst_budget_bytes.saturating_sub(burst_committed))
+            {
                 Some(WaitReason::Budget)
             } else {
                 observed = headroom(&entry.contract);

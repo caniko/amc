@@ -2,10 +2,13 @@
   description = "Application Memory Contracts";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # Exact Canix Atlas kernel source; native CI uses its baseline CPU variant.
+  inputs.atlas-kernel.url = "github:xddxdd/nix-cachyos-kernel/b21e2ad2d1a0e031e6fe7f02a8bdaf010f922887";
 
   outputs = {
     self,
     nixpkgs,
+    atlas-kernel,
   }: let
     systems = [
       "aarch64-linux"
@@ -14,6 +17,8 @@
     forAllSystems = nixpkgs.lib.genAttrs systems;
     pkgsFor = system: import nixpkgs {inherit system;};
   in {
+    nixosModules.page-return-guard = import ./nix/page-return-guard-module.nix;
+
     packages = forAllSystems (system: {
       default = (pkgsFor system).callPackage ./nix/package.nix {};
     });
@@ -95,6 +100,14 @@
     nixosModules.default = import ./nix/module.nix;
     nixosModules.host-admission = import ./nix/host-admission-module.nix;
     lib.hostDomainPressureVersion = 1;
+    lib.admissionSizingVersion = 1;
+    lib.admissionBurstVersion = 1;
+    lib.admissionPreparationVersion = 2;
+    lib.admissionContinuationEnvelopesVersion = 1;
+    lib.admissionNamespaceRunnerVersion = 2;
+    lib.swapReturnReservationVersion = 2;
+    lib.swapRestorationManifestVersion = 1;
+    lib.pageReturnKernelGuardVersion = 1;
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;
@@ -104,26 +117,35 @@
     nixosTests = forAllSystems (
       system: let
         pkgs = pkgsFor system;
-      in {
-        supervision = import ./nix/supervision-vm-test.nix {
-          inherit pkgs;
-          package = self.packages.${system}.default;
-          module = self.nixosModules.supervision;
-        };
-        shared-admission = import ./nix/host-admission-vm-test.nix {
-          inherit pkgs;
-          package = self.packages.${system}.default;
-        };
-        admission = import ./nix/admission-vm-test.nix {
-          inherit pkgs;
-          amcPackage = self.packages.${system}.default;
-        };
-        generic = import ./nix/vm-test.nix {
-          inherit pkgs;
-          amcModule = self.nixosModules.default;
-          amcPackage = self.packages.${system}.default;
-        };
-      }
+      in
+        {
+          supervision = import ./nix/supervision-vm-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.default;
+            module = self.nixosModules.supervision;
+          };
+          shared-admission = import ./nix/host-admission-vm-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.default;
+          };
+          admission = import ./nix/admission-vm-test.nix {
+            inherit pkgs;
+            amcPackage = self.packages.${system}.default;
+          };
+          generic = import ./nix/vm-test.nix {
+            inherit pkgs;
+            amcModule = self.nixosModules.default;
+            amcPackage = self.packages.${system}.default;
+          };
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          shared-admission-atlas-kernel = import ./nix/host-admission-vm-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.default;
+            kernelPackages = atlas-kernel.legacyPackages.${system}.linuxPackages-cachyos-latest-lto;
+            name = "amc-shared-host-admission-atlas-kernel";
+          };
+        }
     );
   };
 }

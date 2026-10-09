@@ -4,8 +4,12 @@ use anyhow::{Context, Result, ensure};
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 pub fn process_start(pid: i32) -> Result<u64> {
+    process_start_at(Path::new("/proc"), pid)
+}
+
+fn process_start_at(proc: &Path, pid: i32) -> Result<u64> {
     ensure!(pid > 0, "invalid workload PID");
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = fs::read_to_string(proc.join(pid.to_string()).join("stat"))?;
     Ok(stat
         .rsplit_once(") ")
         .context("missing process identity")?
@@ -16,14 +20,182 @@ pub fn process_start(pid: i32) -> Result<u64> {
         .parse()?)
 }
 
+/// A host-native user helper can transfer its own preparation to a consenting
+/// peer. PID/start-time and the real host UID are rechecked by the root broker;
+/// a namespace-local PID or a different user's process has no authority here.
+pub fn prepared_origin(origin: &crate::ledger::ClientIdentity, uid: u32) -> Result<i32> {
+    ensure!(
+        fs::metadata(format!("/proc/{}", origin.pid))?.uid() == uid
+            && process_start(origin.pid)? == origin.start_ticks,
+        "prepared origin identity or UID changed"
+    );
+    Ok(origin.pid)
+}
+
 fn number(path: &Path, name: &str) -> Result<u64> {
     Ok(fs::read_to_string(path.join(name))?.trim().parse()?)
 }
 
 /// Only a helper already inside its native boundary may request capacity.
 pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Identity, u64, u64)> {
-    let start_ticks = process_start(pid)?;
-    let process = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    identify_entry(pid, uid, domains, false)
+}
+
+/// A lost acquisition reply must remain replayable after policy reload.
+pub fn identify_acquire(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    grants: &[crate::host::Reservation],
+) -> Result<(String, Identity, u64, u64)> {
+    identify_acquire_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        domains,
+        grants,
+    )
+}
+
+fn identify_acquire_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    grants: &[crate::host::Reservation],
+) -> Result<(String, Identity, u64, u64)> {
+    let start_ticks = process_start_at(proc, pid)?;
+    let placement = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
+    let cgroup = placement
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .context("peer has no cgroup v2 placement")?;
+    crate::native::cgroup_directory(cgroup)?;
+    let inode = fs::metadata(root.join(cgroup.trim_start_matches('/')))?.ino();
+    if let Some(grant) = grants.iter().find(|grant| {
+        grant.granted
+            && grant.identity.pid == pid
+            && grant.identity.uid == uid
+            && grant.identity.start_ticks == start_ticks
+            && grant.identity.cgroup == cgroup
+            && grant.identity.inode == inode
+    }) {
+        return identify_replay_at(proc, root, pid, uid, grant, false);
+    }
+    identify_entry_at(proc, root, pid, uid, domains, false)
+}
+
+/// Prepared scopes retain the submitting application's filesystem namespace.
+/// Only authenticated Consume, never ordinary Acquire, accepts this entry kind.
+pub fn identify_prepared(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+) -> Result<(String, Identity, u64, u64)> {
+    identify_entry(pid, uid, domains, true)
+}
+
+/// A committed Consume replay authenticates the original native grant rather
+/// than re-admitting its envelope against a possibly replaced host policy.
+pub fn identify_prepared_replay(
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+) -> Result<(String, Identity, u64, u64)> {
+    identify_prepared_replay_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        granted,
+    )
+}
+
+fn identify_prepared_replay_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+) -> Result<(String, Identity, u64, u64)> {
+    identify_replay_at(proc, root, pid, uid, granted, true)
+}
+
+fn identify_replay_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    granted: &crate::host::Reservation,
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
+    let identity = &granted.identity;
+    ensure!(
+        granted.granted
+            && pid == identity.pid
+            && uid == identity.uid
+            && process_start_at(proc, pid)? == identity.start_ticks,
+        "persisted grant peer changed"
+    );
+    let placement = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
+    ensure!(
+        placement.lines().find_map(|line| line.strip_prefix("0::"))
+            == Some(identity.cgroup.as_str())
+            && Path::new(&identity.cgroup)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| if prepared {
+                    name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
+                } else {
+                    name.starts_with("app-amc-job-") && name.ends_with(".service")
+                }),
+        "persisted grant placement changed"
+    );
+    crate::native::cgroup_directory(&identity.cgroup)?;
+    let directory = root.join(identity.cgroup.trim_start_matches('/'));
+    ensure!(
+        fs::metadata(&directory)?.ino() == identity.inode
+            && number(&directory, "memory.max")? == granted.memory_bytes
+            && number(&directory, "memory.swap.max")? == granted.swap_bytes
+            && process_start_at(proc, pid)? == identity.start_ticks,
+        "persisted grant enforcement changed"
+    );
+    Ok((
+        granted.domain.clone(),
+        identity.clone(),
+        granted.memory_bytes,
+        granted.swap_bytes,
+    ))
+}
+
+fn identify_entry(
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
+    identify_entry_at(
+        Path::new("/proc"),
+        Path::new("/sys/fs/cgroup"),
+        pid,
+        uid,
+        domains,
+        prepared,
+    )
+}
+
+fn identify_entry_at(
+    proc: &Path,
+    root: &Path,
+    pid: i32,
+    uid: u32,
+    domains: &[Domain],
+    prepared: bool,
+) -> Result<(String, Identity, u64, u64)> {
+    let start_ticks = process_start_at(proc, pid)?;
+    let process = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
     let cgroup = process
         .lines()
         .find_map(|l| l.strip_prefix("0::"))
@@ -43,10 +215,15 @@ pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Ident
         .and_then(|n| n.to_str())
         .context("invalid workload group")?;
     ensure!(
-        name.starts_with("app-amc-job-") && name.ends_with(".service"),
+        if prepared {
+            name.starts_with("app-amc-prepared-") && name.ends_with(".scope")
+        } else {
+            name.starts_with("app-amc-job-") && name.ends_with(".service")
+        },
         "host admission requires a native AMC entry helper"
     );
-    let directory = crate::native::cgroup_directory(cgroup)?;
+    crate::native::cgroup_directory(cgroup)?;
+    let directory = root.join(cgroup.trim_start_matches('/'));
     let memory = number(&directory, "memory.max")?;
     let swap = number(&directory, "memory.swap.max")?;
     ensure!(
@@ -54,7 +231,7 @@ pub fn identify(pid: i32, uid: u32, domains: &[Domain]) -> Result<(String, Ident
         "native ceiling exceeds enrolled host contract"
     );
     ensure!(
-        process_start(pid)? == start_ticks,
+        process_start_at(proc, pid)? == start_ticks,
         "peer process identity changed"
     );
     Ok((
@@ -102,7 +279,7 @@ pub fn empty_reservation(r: &crate::host::Reservation) -> Option<bool> {
         return Some(true);
     }
     if r.owners.is_empty() {
-        return None;
+        return r.owners_finished.then_some(true);
     }
     for owner in &r.owners {
         match fs::metadata(format!("/proc/{}", owner.pid)) {
@@ -120,6 +297,16 @@ pub fn empty_reservation(r: &crate::host::Reservation) -> Option<bool> {
 
 /// Any changed or unreadable granted boundary inhibits every new grant.
 pub fn enforcement(r: &crate::host::Reservation) -> Option<()> {
+    memory_enforcement(r)?;
+    if r.burst && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
+        return None;
+    }
+    Some(())
+}
+
+/// Broker-safe kernel observations. Manager properties are refreshed separately
+/// and asynchronously; this function never runs a subprocess.
+pub(crate) fn memory_enforcement(r: &crate::host::Reservation) -> Option<()> {
     let path = crate::native::cgroup_directory(&r.identity.cgroup).ok()?;
     if fs::metadata(&path).ok()?.ino() != r.identity.inode
         || number(&path, "memory.max").ok()? != r.memory_bytes
@@ -130,12 +317,141 @@ pub fn enforcement(r: &crate::host::Reservation) -> Option<()> {
     Some(())
 }
 
+/// Query the execution owner's actual manager, rather than trusting an estimate
+/// or the submitting helper's argv. The root broker can address each user bus.
+pub fn burst_runtime(identity: &Identity) -> Result<u64> {
+    let text = amc_runner::systemd::capture(std::process::Command::new("systemctl").args([
+        "--user", &format!("--machine={}@.host", identity.uid), "show", "--no-pager",
+        "--property=ControlGroup,MainPID,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal,Restart,KillMode,OOMPolicy",
+        "--", Path::new(&identity.cgroup).file_name().and_then(|s| s.to_str()).context("missing burst unit")?,
+    ]))?;
+    let runtime = verified_burst_runtime(&text, identity)?;
+    ensure!(
+        process_start(identity.pid)? == identity.start_ticks,
+        "burst process identity changed"
+    );
+    Ok(runtime)
+}
+
+fn verified_burst_runtime(text: &str, identity: &Identity) -> Result<u64> {
+    let fields: std::collections::BTreeMap<_, _> =
+        text.lines().filter_map(|l| l.split_once('=')).collect();
+    let get = |name| fields.get(name).copied().unwrap_or("");
+    ensure!(
+        get("ControlGroup") == identity.cgroup
+            && get("MainPID").parse::<i32>()? == identity.pid
+            && get("Restart") == "no"
+            && get("KillMode") == "control-group"
+            && get("OOMPolicy") == "kill"
+            && get("SendSIGKILL") == "yes"
+            && get("FinalKillSignal") == "9"
+            && crate::native::duration_us(get("RuntimeRandomizedExtraUSec")) == Some(0)
+            && crate::native::duration_us(get("TimeoutStopUSec"))
+                .is_some_and(|timeout| timeout > 0 && timeout <= 1_000_000),
+        "burst native identity or cleanup enforcement mismatch"
+    );
+    let micros = crate::native::duration_us(get("RuntimeMaxUSec"))
+        .context("missing finite native runtime")?;
+    ensure!(
+        micros > 0 && micros <= 30_000_000 && micros.is_multiple_of(1000),
+        "burst requires a finite short native deadline"
+    );
+    Ok(micros / 1000)
+}
+
 pub fn owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
     match fs::metadata(format!("/proc/{}", owner.pid)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
         Err(_) => None,
         Ok(_) => Some(process_start(owner.pid).ok()? == owner.start_ticks),
     }
+}
+
+pub(crate) fn preparation_owner_alive(owner: &crate::ledger::ClientIdentity) -> Option<bool> {
+    let stat = match fs::read_to_string(format!("/proc/{}/stat", owner.pid)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+        Ok(stat) => stat,
+    };
+    let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    let start: u64 = fields.get(19)?.parse().ok()?;
+    Some(start == owner.start_ticks && !matches!(*fields.first()?, "Z" | "X" | "x"))
+}
+
+fn recovery_unit(identity: &Identity) -> Result<String> {
+    let unit = Path::new(&identity.cgroup)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("missing recovery unit")?;
+    ensure!(
+        unit.ends_with(".service"),
+        "recovery requires a native service boundary"
+    );
+    amc_runner::systemd::capture(std::process::Command::new("systemctl").args([
+        "show",
+        "--property=ControlGroup,MainPID,Restart,KillMode,InvocationID",
+        "--",
+        unit,
+    ]))
+}
+
+fn verified_recovery_unit(text: &str, cgroup: &str) -> Result<(i32, String)> {
+    let fields: std::collections::BTreeMap<_, _> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let get = |key| fields.get(key).copied().unwrap_or("");
+    let invocation = get("InvocationID");
+    ensure!(
+        get("ControlGroup") == cgroup
+            && get("Restart") == "no"
+            && get("KillMode") == "control-group"
+            && invocation.len() == 32
+            && invocation.bytes().all(|b| b.is_ascii_hexdigit())
+            && invocation.bytes().any(|b| b != b'0'),
+        "recovery requires a non-restarting, invocation-bound control-group service"
+    );
+    let pid: i32 = get("MainPID").parse()?;
+    ensure!(pid > 0, "recovery service has no main process");
+    Ok((pid, invocation.into()))
+}
+
+pub fn recovery_invocation(identity: &Identity) -> Result<String> {
+    let (pid, invocation) = verified_recovery_unit(&recovery_unit(identity)?, &identity.cgroup)?;
+    ensure!(
+        pid == identity.pid && process_start(pid)? == identity.start_ticks,
+        "recovery peer is not the current native main process"
+    );
+    Ok(invocation)
+}
+
+/// A new systemd invocation of a KillMode=control-group service starts only
+/// after the previous invocation's processes have been stopped. Same-invocation
+/// descendants, legacy leases and unavailable observations remain charged.
+pub fn recovery_replaced(lease: &crate::recovery::RecoveryLease) -> Option<bool> {
+    let alive = owner_alive(&crate::ledger::ClientIdentity {
+        pid: lease.identity.pid,
+        start_ticks: lease.identity.start_ticks,
+    });
+    // Normal live-helper ticks need no manager subprocess. Unknown liveness
+    // and legacy leases also retain capacity without querying a replacement.
+    if alive != Some(false) || lease.invocation_id.is_none() {
+        return Some(false);
+    }
+    recovery_replaced_at(lease, &recovery_unit(&lease.identity).ok()?, alive)
+}
+
+fn recovery_replaced_at(
+    lease: &crate::recovery::RecoveryLease,
+    text: &str,
+    alive: Option<bool>,
+) -> Option<bool> {
+    let previous = lease.invocation_id.as_ref()?;
+    if alive != Some(false) {
+        return Some(false);
+    }
+    let (_, current) = verified_recovery_unit(text, &lease.identity.cgroup).ok()?;
+    Some(&current != previous)
 }
 
 pub fn identify_pool(
@@ -187,11 +503,16 @@ fn ancestor_headroom_at(
     let identity = &reservation.identity;
     crate::native::cgroup_directory(&identity.cgroup).ok()?;
     let directory = root.join(identity.cgroup.trim_start_matches('/'));
-    if fs::metadata(&directory).ok()?.ino() != identity.inode {
+    let envelope = identity.inode == 0 && identity.pid == 0;
+    if !envelope && fs::metadata(&directory).ok()?.ino() != identity.inode {
         return None;
     }
     let mut available = u64::MAX;
-    for ancestor in directory.ancestors().skip(1).take_while(|p| *p != root) {
+    for ancestor in directory
+        .ancestors()
+        .skip(usize::from(!envelope))
+        .take_while(|p| *p != root)
+    {
         let prefix = format!("/{}/", ancestor.strip_prefix(root).ok()?.display());
         let (memory_committed, swap_committed) = reservations
             .iter()
@@ -220,8 +541,29 @@ fn ancestor_headroom_at(
                 continue;
             }
             let max: u64 = max.trim().parse().ok()?;
+            // A synthetic lane spanning the entire enforced native pool also
+            // covers that pool's residual cache/kernel charges. Its ceiling is
+            // a total envelope, not additional allocation on top of those bytes.
+            // Partial lanes and sibling usage receive no such credit.
+            let ceiling = if swap {
+                reservation.swap_bytes
+            } else {
+                reservation.memory_bytes
+            };
+            let covered = if envelope
+                && fs::read_to_string(directory.join(max_file))
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    == Some(ceiling)
+            {
+                number(&directory, current_file).ok()?.min(ceiling)
+            } else {
+                0
+            };
             let remaining = max
-                .saturating_sub(number(ancestor, current_file).ok()?)
+                .saturating_sub(number(ancestor, current_file).ok()?.saturating_sub(covered))
                 .saturating_sub(committed);
             if swap {
                 if reservation.swap_bytes > remaining {
@@ -290,6 +632,320 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacement_recovery_invocation_cannot_hide_a_dead_helper_or_release_descendants() {
+        let lease: crate::recovery::RecoveryLease = serde_json::from_value(serde_json::json!({
+            "identity":{"cgroup":"/system.slice/return.service","inode":1,"uid":0,"pid":42,"start_ticks":7},
+            "invocation_id":"11111111111111111111111111111111",
+            "action":{"kind":"device","target":{"name":"swap","path":"/dev/swap","priority":10},"before_used_bytes":1},
+            "helper_bytes":10,"return_bytes":100
+        })).unwrap();
+        let same = "ControlGroup=/system.slice/return.service\nMainPID=43\nRestart=no\nKillMode=control-group\nInvocationID=11111111111111111111111111111111\n";
+        let replacement = same.replace(
+            "InvocationID=11111111111111111111111111111111",
+            "InvocationID=22222222222222222222222222222222",
+        );
+        assert_eq!(recovery_replaced_at(&lease, same, Some(false)), Some(false));
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            recovery_replaced_at(&lease, &replacement, None),
+            Some(false)
+        );
+        for invalid in [
+            replacement.replace("Restart=no", "Restart=always"),
+            replacement.replace("KillMode=control-group", "KillMode=process"),
+            replacement.replace("MainPID=43", "MainPID=0"),
+            replacement.replace("/system.slice/return.service", "/foreign.service"),
+        ] {
+            assert_eq!(recovery_replaced_at(&lease, &invalid, Some(false)), None);
+        }
+        let mut legacy = lease.clone();
+        legacy.invocation_id = None;
+        assert_eq!(
+            recovery_replaced_at(&legacy, &replacement, Some(false)),
+            None
+        );
+    }
+
+    #[test]
+    fn full_native_completion_envelope_covers_its_residual_charge_but_not_siblings() {
+        use crate::host::Reservation;
+        let root = std::env::temp_dir().join(format!(
+            "amc-envelope-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(root.join("parent/builders")).unwrap();
+        for (group, max, current) in [("parent", 100, 15), ("parent/builders", 96, 12)] {
+            for (file, value) in [
+                ("memory.max", max),
+                ("memory.current", current),
+                ("memory.swap.max", 0),
+                ("memory.swap.current", 0),
+            ] {
+                fs::write(root.join(group).join(file), value.to_string()).unwrap();
+            }
+        }
+        let lane: Reservation = serde_json::from_value(serde_json::json!({
+            "id":"escrow", "domain":"builders", "memory_bytes":96,"swap_bytes":0,
+            "requested_ms":0,"deadline_ms":10000,"granted":true,"owners":[],
+            "identity":{"cgroup":"/parent/builders","inode":0,"uid":0,"pid":0,"start_ticks":0}
+        }))
+        .unwrap();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[]), Some(96));
+        fs::write(root.join("parent/memory.current"), "17").unwrap();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[]), Some(95));
+        // A partial lane cannot cover unrelated usage of an entire native pool.
+        let mut partial = lane.clone();
+        partial.memory_bytes = 90;
+        assert_eq!(ancestor_headroom_at(&root, &partial, &[]), Some(83));
+        fs::write(root.join("parent/memory.current"), "15").unwrap();
+        let mut peer = lane.clone();
+        peer.id = "other-lane".into();
+        assert_eq!(ancestor_headroom_at(&root, &lane, &[peer]), Some(0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recycled_acquire_pid_can_enter_current_policy_or_replay_its_own_grant() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-recycled-acquire-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let old = "/work.slice/app-amc-job-old.service";
+        let new = "/work.slice/app-amc-job-new.service";
+        for group in [old, new] {
+            let directory = groups.join(group.trim_start_matches('/'));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("memory.max"), "40").unwrap();
+            fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        }
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (new) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{new}\n")).unwrap();
+        let old_grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"old", "domain":"work", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":old, "inode":fs::metadata(groups.join(old.trim_start_matches('/'))).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        })).unwrap();
+        let domains = [Domain {
+            name: "work".into(),
+            uid: 1000,
+            cgroup: "/work.slice".into(),
+            ceiling_bytes: 40,
+            swap_bytes: 10,
+            fair_share_bytes: 40,
+            io_pressure: crate::host::IoPressure::Enforce,
+            min_available_bytes: 0,
+            continuation: None,
+            burst: false,
+        }];
+        let expected = identify_entry_at(&proc, &groups, 42, 1000, &domains, false).unwrap();
+        assert_eq!(
+            identify_acquire_at(
+                &proc,
+                &groups,
+                42,
+                1000,
+                &domains,
+                std::slice::from_ref(&old_grant)
+            )
+            .unwrap(),
+            expected,
+            "a charged old cgroup must not deny a recycled PID its new acquisition"
+        );
+        let mut new_grant = old_grant.clone();
+        new_grant.id = "new".into();
+        new_grant.identity = expected.1.clone();
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &[], &[old_grant, new_grant]).unwrap(),
+            expected,
+            "a stale first candidate must not hide the exact persisted grant"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acquired_replay_survives_policy_removal_and_rejects_changed_native_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-acquired-replay-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let group = "/retired.slice/app-amc-job-original.service";
+        let directory = groups.join(group.trim_start_matches('/'));
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (job) S {}7\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(directory.join("memory.max"), "40").unwrap();
+        fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        let grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"original", "domain":"removed", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":group, "inode":fs::metadata(&directory).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        }))
+        .unwrap();
+        let grants = [grant.clone()];
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).unwrap(),
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        let reduced = [Domain {
+            name: grant.domain.clone(),
+            uid: 1000,
+            cgroup: "/retired.slice".into(),
+            ceiling_bytes: 39,
+            swap_bytes: 9,
+            fair_share_bytes: 39,
+            io_pressure: crate::host::IoPressure::Enforce,
+            min_available_bytes: 0,
+            continuation: None,
+            burst: false,
+        }];
+        assert!(identify_entry_at(&proc, &groups, 42, 1000, &reduced, false).is_err());
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &reduced, &grants).unwrap(),
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &reduced, &[]).is_err());
+        assert!(identify_acquire_at(&proc, &groups, 42, 1001, &[], &grants).is_err());
+        let mut pending = grant.clone();
+        pending.granted = false;
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &[pending]).is_err());
+        let mut replaced = grant.clone();
+        replaced.identity.inode += 1;
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &[replaced]).is_err());
+        for (name, changed, original) in
+            [("memory.max", "39", "40"), ("memory.swap.max", "9", "10")]
+        {
+            fs::write(directory.join(name), changed).unwrap();
+            assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
+            fs::write(directory.join(name), original).unwrap();
+        }
+        fs::write(proc.join("42/cgroup"), "0::/elsewhere.service\n").unwrap();
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (job) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        assert!(identify_acquire_at(&proc, &groups, 42, 1000, &[], &grants).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consumed_replay_uses_the_persisted_grant_and_rejects_changed_native_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-prepared-replay-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let group = "/retired.slice/app-amc-prepared-intent.scope";
+        let directory = groups.join(group.trim_start_matches('/'));
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (prepared) S {}7\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(directory.join("memory.max"), "40").unwrap();
+        fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        let grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"intent", "domain":"removed", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":group, "inode":fs::metadata(&directory).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        }))
+        .unwrap();
+        // The old policy-based lookup fails after the domain disappears.
+        assert!(identify_entry_at(&proc, &groups, 42, 1000, &[], true).is_err());
+        let replay = identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).unwrap();
+        assert_eq!(
+            replay,
+            (grant.domain.clone(), grant.identity.clone(), 40, 10)
+        );
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1001, &grant).is_err());
+        let mut pending = grant.clone();
+        pending.granted = false;
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &pending).is_err());
+        let mut replaced = grant.clone();
+        replaced.identity.inode += 1;
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &replaced).is_err());
+        for (name, changed, original) in
+            [("memory.max", "39", "40"), ("memory.swap.max", "9", "10")]
+        {
+            fs::write(directory.join(name), changed).unwrap();
+            assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+            fs::write(directory.join(name), original).unwrap();
+        }
+        fs::write(proc.join("42/cgroup"), "0::/elsewhere.scope\n").unwrap();
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+        fs::write(proc.join("42/cgroup"), format!("0::{group}\n")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (prepared) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        assert!(identify_prepared_replay_at(&proc, &groups, 42, 1000, &grant).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn burst_deadline_requires_native_identity_and_bounded_cleanup() {
+        let identity = Identity {
+            cgroup: "/burst/job.service".into(),
+            inode: 1,
+            uid: 1000,
+            pid: 42,
+            start_ticks: 1,
+        };
+        let valid = "ControlGroup=/burst/job.service\nMainPID=42\nRestart=no\nKillMode=control-group\nOOMPolicy=kill\nSendSIGKILL=yes\nFinalKillSignal=9\nRuntimeMaxUSec=5s\nRuntimeRandomizedExtraUSec=0\nTimeoutStopUSec=1s\n";
+        assert_eq!(verified_burst_runtime(valid, &identity).unwrap(), 5000);
+        for (before, after) in [
+            ("MainPID=42", "MainPID=43"),
+            ("Restart=no", "Restart=always"),
+            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=infinity"),
+            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=30s 1us"),
+            (
+                "RuntimeRandomizedExtraUSec=0",
+                "RuntimeRandomizedExtraUSec=1s",
+            ),
+            ("TimeoutStopUSec=1s", "TimeoutStopUSec=15s"),
+            ("TimeoutStopUSec=1s", "TimeoutStopUSec=0"),
+            ("SendSIGKILL=yes", "SendSIGKILL=no"),
+            ("FinalKillSignal=9", "FinalKillSignal=19"),
+        ] {
+            assert!(
+                verified_burst_runtime(&valid.replace(before, after), &identity).is_err(),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
     fn shared_ancestor_swap_cannot_be_spent_twice_with_ample_host_swap() {
         use crate::host::{HostLedger, HostPolicy, Reservation, WaitReason};
         let root = std::env::temp_dir().join(format!(
@@ -335,6 +991,10 @@ mod tests {
                         deadline_ms: 10_000,
                         granted: false,
                         owners: vec![],
+                        burst: false,
+                        runtime_max_ms: None,
+                        continuation: None,
+                        owners_finished: false,
                     },
                     &policy,
                 )
@@ -450,6 +1110,10 @@ mod tests {
                 pid,
                 start_ticks: ticks,
             }],
+            burst: false,
+            runtime_max_ms: None,
+            continuation: None,
+            owners_finished: false,
         };
         assert_eq!(empty_reservation(&r), Some(false));
         r.owners.insert(
@@ -464,5 +1128,7 @@ mod tests {
         assert_eq!(empty_reservation(&r), Some(true));
         r.owners.clear();
         assert_eq!(empty_reservation(&r), None);
+        r.owners_finished = true;
+        assert_eq!(empty_reservation(&r), Some(true));
     }
 }

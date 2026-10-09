@@ -27,10 +27,26 @@ pub struct Request {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
-    Enqueue { contract: String, wait_ms: u64 },
-    Poll { id: String },
-    Enter { id: String, key: String },
-    Cancel { id: String },
+    Enqueue {
+        contract: String,
+        wait_ms: u64,
+    },
+    /// Explicit bounded estimate. Older coordinators reject this operation.
+    EnqueueSized {
+        contract: String,
+        wait_ms: u64,
+        memory_max: u64,
+    },
+    Poll {
+        id: String,
+    },
+    Enter {
+        id: String,
+        key: String,
+    },
+    Cancel {
+        id: String,
+    },
     Status,
 }
 

@@ -4,6 +4,12 @@
 
 ### Added
 
+- Advance foreground preparation with durable drain barriers and once-only
+  transfer into native scopes that preserve the caller's filesystem namespace.
+- Finite, up-front-backed completion lanes and per-operation root worker
+  ownership so existing work can finish while newer calls wait.
+- Bounded incremental swap return with observed progress, explicit whole-device
+  recovery/restoration, and native interruption and safe-wait qualification.
 - Opt-in, bounded production observation for native services and scopes with
   aggregate host memory, swap, fault, and pressure context.
 - Offline capture validation and an optional transient observer runner that
@@ -26,6 +32,76 @@
 
 ### Fixed
 
+- Allow four hours for hosted patched-kernel qualification after both native
+  kernel builds exhausted the previous two-hour deadline.
+- Require preparation slice hierarchies under their enrolled UID's user manager;
+  reject host-root slices that the user-bus launch path cannot create.
+- Validate complete preparation slice hierarchies before admitting drain intents.
+- Revalidate pending helper runner placement/backing on poll, consume and broker
+  reconciliation; changed helpers lose their pending barriers across restart.
+- Use the public memory-controller hierarchy API for kernel guards on Linux 6.18
+  and 7.2, fixing the 6.18 compilation failure.
+- Authenticate each preparation request in its backed native helper boundary.
+- Release retired root pools through persisted finite Worker ownership while
+  retaining native descendants until positive cleanup.
+- Include mapping and PTE state when validating a completed recovery sweep.
+- Complete wide native replays outside the broker accept loop and refresh live
+  burst evidence concurrently within its existing one-second validity window.
+- Require a stable full selected-process sweep before page-return completion,
+  including PID lifetime, cgroup placement and exec layout after migrations.
+- Resume mapping streams above 64 MiB using bounded-memory fingerprints and
+  revalidate the complete VMA sequence around every pagemap scan window.
+- Match acquisition replays by the complete native lifetime and placement so
+  retained old grants cannot deny a recycled PID its new enrolled acquisition.
+- Protect Ready foreground transfers from new page/device recovery leases.
+- Reject existing recovery targets that are neither regular files nor block devices.
+- Replay ordinary persisted acquisitions after domain removal or ceiling reduction,
+  while freshly authenticating native identity and the original enforced envelope.
+- Reject aliases of the same native swap target before restoration, including
+  symlinks, hard links and duplicate block-device identities.
+- Revalidate the full page-return charge-owner frontier and native headroom before
+  granting a background recovery scan.
+- Bind mapping-scan resumes to the exact VMA sequence so mapping churn cannot
+  turn skipped swapped pages into successful recovery.
+- Reclaim abandoned preparation barriers after authenticated helper death,
+  including SIGKILL while the broker is offline, while retaining active claims.
+- Retain complete failed-builder logs in the Simit-generated hosted evidence.
+- Back all waited namespace runners with one finite, host-reserved aggregate
+  slice per user before shared payload admission.
+- Exclude proven resident swap-cache-only owners from additional return demand.
+- Bind recovery leases to native service invocations so replacements cannot
+  hide dead helpers, while surviving descendants retain backing.
+- Accept stable zero-owned-slot reader cache after offlined-owner recovery
+  without assigning that resident cache as another owner's entitlement.
+- Share the reserve-backed runner slice with concurrent preparation helpers;
+  expose this stronger contract as namespace-runner capability version 2.
+- Run recovery inventories outside the broker accept loop, rejecting stale,
+  disconnected or changed-owner results before fresh transactional admission.
+- Keep ungranted queue churn from invalidating recovery inventory backing.
+- Reject preparation policies without aggregate helper backing and pass
+  hyphen-leading profile names literally through native helper registration.
+- Require FD-owned kernel mm/memcg guards for page return, keeping target and
+  reader placement backed across grant/read races, owner loss and broker restart.
+- Bound guarded swap faults to order-0 pages without speculative readahead and
+  require native direct/cache-path charging and post-grant migration receipts.
+- Resume bounded discovery without treating an interrupted scan prefix as proof
+  of current residency; back original swap owners and the remote reader fallback.
+- Give complete charge-owner inventories a bounded maintenance RPC window and
+  refuse truncated inventories without faulting pages.
+- Require root completion lanes and recovery helpers to match their native limits.
+- Restore declared swap targets from a trusted local manifest when the broker is
+  unavailable, and reject active targets at the wrong priority.
+- Keep finite completion calls available after rejected enqueue attempts, bound
+  aggregate admission snapshots, and retain existing obligations on rejected growth.
+- Include parents that can launch future completion children in preparation drains
+  and require a ready window long enough for the native transfer.
+- Keep burst backfill available when draining cannot resolve an aged request's
+  swap-return, swap-headroom, completion-escrow, or native-ancestor wait.
+- Preserve prepared and completion native claims during whole-device recovery;
+  report empty page-return selection and unfinished multi-device return as incomplete.
+- Allow finite root services alongside operation-serial-owned root pools.
+- Preserve literal arguments, streams, exit status, and startup denial for waited
+  native/admitted launches from private PID and remapped user namespaces.
 - Preserve verified pre-change counter and pressure evidence across restarts
   without combining values from different workload lifetimes.
 - Mark final counters unavailable when sample persistence fails or the final

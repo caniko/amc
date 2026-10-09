@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -26,6 +26,7 @@ jobs:
           - ".#checks.x86_64-linux.test"
           - ".#checks.x86_64-linux.clippy"
           - ".#nixosTests.x86_64-linux.shared-admission"
+          - ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"
           - ".#nixosTests.x86_64-linux.supervision"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
@@ -57,10 +58,13 @@ jobs:
           sudo chmod a+rw /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
       - name: Project setup 1
-        run: python3 -B nix/test-hosted-ci.py
+        run: python3 -c 'from pathlib import Path; p = Path.home() / ".config/nix/nix.conf"; p.parent.mkdir(parents=True, exist_ok=True); p.open("a").write("\nlog-lines = 1000\n")'
 
       - name: Project setup 2
-        run: nix run github:caniko/simit/beea3e284a613d46468779bd998e51be2d63566c -- init ci --platform github --ci-provider actions --runtime nix --check --diff
+        run: python3 -B nix/test-hosted-ci.py
+
+      - name: Project setup 3
+        run: nix run github:caniko/simit/8008329afdadb9b2c6cd917cd4e1736243e5bc74 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
 
       - name: Build ${{ matrix.installable }}
         env:
@@ -77,6 +81,10 @@ jobs:
       - name: Retain Nix results 1
         run: |
           python3 nix/hosted-ci.py
+      - name: Retain Nix diagnostics 1
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B nix/retain-diagnostics.py
       - name: Upload Nix build evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

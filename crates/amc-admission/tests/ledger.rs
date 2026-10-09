@@ -7,6 +7,7 @@ fn policy() -> Policy {
         budget_bytes: 1000,
         reserve_bytes: 100,
         queue_limit: 16,
+        burst_budget_bytes: 0,
         contracts: BTreeMap::from([(
             "tool".into(),
             Contract {
@@ -15,6 +16,8 @@ fn policy() -> Policy {
                 memory_swap_max: 0,
                 max_running: 2,
                 pause_file: None,
+                burst: false,
+                runtime_max_sec: None,
             },
         )]),
     }
@@ -36,6 +39,60 @@ fn capacity(bytes: u64) -> Option<Headroom> {
         memory_swap_max: 0,
         paused: false,
     })
+}
+
+#[test]
+fn sized_calls_only_shrink_native_contracts_and_leave_legacy_wire_shape_intact() {
+    let p = policy();
+    let mut l = Ledger::new("boot".into());
+    assert!(
+        l.enqueue_sized("zero".into(), "tool", &p, 1000, Some(0))
+            .is_err()
+    );
+    assert!(
+        l.enqueue_sized("large".into(), "tool", &p, 1000, Some(601))
+            .is_err()
+    );
+    l.enqueue_sized("small".into(), "tool", &p, 1000, Some(100))
+        .unwrap();
+    l.advance(0, &p, |_| capacity(2000));
+    assert_eq!(l.committed(), 100);
+    assert_eq!(l.get("small").unwrap().contract.memory_max, 100);
+    let json = serde_json::to_value(&l.get("small").unwrap().contract).unwrap();
+    assert!(json.get("burst").is_none());
+    assert!(json.get("runtime_max_sec").is_none());
+}
+
+#[test]
+fn private_burst_allowance_never_becomes_normal_capacity() {
+    let mut p = policy();
+    p.burst_budget_bytes = 100;
+    p.contracts.insert(
+        "burst".into(),
+        Contract {
+            slice: "agent-burst.slice".into(),
+            memory_max: 100,
+            memory_swap_max: 0,
+            max_running: 1,
+            pause_file: None,
+            burst: true,
+            runtime_max_sec: Some(5),
+        },
+    );
+    p.validate().unwrap();
+    let mut l = Ledger::new("boot".into());
+    l.enqueue("first".into(), "tool", &p, 1000).unwrap();
+    l.enqueue_sized("second".into(), "tool", &p, 1000, Some(400))
+        .unwrap();
+    l.advance(0, &p, |_| capacity(2000));
+    assert_eq!(l.committed(), 1000);
+    l.enqueue("quick".into(), "burst", &p, 1000).unwrap();
+    l.advance(0, &p, |_| capacity(2000));
+    assert_eq!(l.committed(), 1100);
+    l.enqueue_sized("normal".into(), "tool", &p, 1000, Some(10))
+        .unwrap();
+    l.advance(0, &p, |_| capacity(2000));
+    assert_eq!(l.get("normal").unwrap().phase, Phase::Queued);
 }
 
 #[test]
@@ -122,6 +179,8 @@ fn long_lived_pool_does_not_block_disposable_pool() {
             memory_swap_max: 0,
             max_running: 1,
             pause_file: None,
+            burst: false,
+            runtime_max_sec: None,
         },
     );
     let mut ledger = Ledger::new("boot".into());

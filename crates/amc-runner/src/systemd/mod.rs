@@ -8,8 +8,11 @@
 
 mod control;
 mod managed;
+mod session_bus;
+mod startup;
 pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
+pub use startup::{StartupBarrier, wait_for_host_runner, wait_for_startup};
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -132,6 +135,7 @@ pub(crate) struct UnitState {
     started: bool,
     stopped: bool,
     control_group: Option<String>,
+    main_pid: Option<u32>,
     /// Workload exit status from `ExecMainCode`/`ExecMainStatus`, when the
     /// manager reports one. Distinct from the submission client's exit code.
     workload_code: Option<i32>,
@@ -142,11 +146,18 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
 }
 
 fn query_state(manager: &Path, unit: &str) -> Option<UnitState> {
+    routed_query_state(manager, unit, None)
+}
+
+fn routed_query_state(manager: &Path, unit: &str, session_uid: Option<u32>) -> Option<UnitState> {
+    if let Some(uid) = session_uid {
+        return session_bus::query(uid, unit);
+    }
     let text = capture(Command::new(manager).args([
         "--user",
         "show",
         "--no-pager",
-        "--property=LoadState,ActiveState,InvocationID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
+        "--property=LoadState,ActiveState,InvocationID,MainPID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
         "--",
         unit,
     ]))
@@ -197,6 +208,9 @@ fn query_state(manager: &Path, unit: &str) -> Option<UnitState> {
         started,
         stopped,
         control_group: field("ControlGroup").map(str::to_owned),
+        main_pid: field("MainPID")
+            .and_then(|pid| pid.parse().ok())
+            .filter(|pid| *pid > 0),
         workload_code,
     })
 }
@@ -355,12 +369,19 @@ pub fn unit_cgroup_dir(manager: &Path, unit: &str) -> Option<PathBuf> {
 
 /// Stop exactly the supplied AMC identity and confirm workload termination.
 pub fn cleanup(manager: &Path, unit: &str) -> Cleanup {
+    routed_cleanup(manager, unit, None)
+}
+
+fn routed_cleanup(manager: &Path, unit: &str, session_uid: Option<u32>) -> Cleanup {
+    if let Some(uid) = session_uid {
+        return session_bus::cleanup(uid, unit);
+    }
     if !valid_unit(unit)
         || capture(Command::new(manager).args(["--user", "stop", "--", unit])).is_err()
     {
         return Cleanup::Unknown;
     }
-    match state(manager, unit) {
+    match query_state(manager, unit).filter(|state| state.loaded) {
         Some(state)
             if state.stopped && terminated(state.control_group.as_deref()) == Some(true) =>
         {
@@ -391,9 +412,32 @@ fn reap_client(child: &mut Child) -> bool {
 pub struct ClientRecord {
     submitted: std::cell::Cell<bool>,
     settled: std::cell::Cell<bool>,
+    startup: Option<StartupBarrier>,
+    manager_session_uid: Option<u32>,
 }
 
 impl ClientRecord {
+    /// Require startup synchronization before a waited job can complete. This
+    /// does not grant admission or release capacity. Detached callers keep the
+    /// ordinary acknowledgment-only path and must not supply a barrier.
+    pub fn with_startup(startup: StartupBarrier) -> Self {
+        Self {
+            startup: Some(startup),
+            ..Self::default()
+        }
+    }
+
+    /// Use one explicit local host UID manager for an outer namespace runner.
+    /// Queries use the explicit host session bus; submission remains in
+    /// the caller's local user manager and cannot select a remote context.
+    pub fn with_host_startup(startup: StartupBarrier, uid: u32) -> Self {
+        Self {
+            startup: Some(startup),
+            manager_session_uid: Some(uid),
+            ..Self::default()
+        }
+    }
+
     /// Whether the client was spawned.
     pub fn submitted(&self) -> bool {
         self.submitted.get()
@@ -467,7 +511,7 @@ fn poll_cancelled(
         Ok(cancellation) => cancellation,
         Err(payload) => {
             record.mark_settled(reap_client(child));
-            let _ = cleanup(manager, unit);
+            let _ = routed_cleanup(manager, unit, record.manager_session_uid);
             std::panic::resume_unwind(payload);
         }
     }
@@ -508,24 +552,35 @@ pub fn execute(
     if !command_binding(command, unit, detached) {
         return Outcome::NotSubmitted(NotSubmitted::CommandMismatch);
     }
+    if detached && record.startup.is_some() {
+        return Outcome::NotSubmitted(NotSubmitted::CommandMismatch);
+    }
     if detached {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let mut child = match command.spawn() {
+    let spawned = {
+        #[cfg(test)]
+        let _guard = crate::test_support::executable_fixture_guard();
+        command.spawn()
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(_) => return Outcome::NotSubmitted(NotSubmitted::SpawnFailed),
     };
     record.mark_submitted();
+    let query = || routed_query_state(manager, unit, record.manager_session_uid);
+    let cleanup = || routed_cleanup(manager, unit, record.manager_session_uid);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut started = false;
     let mut observed: Option<(String, ObservedDomain)> = None;
+    let mut startup_released = record.startup.is_none();
     let mut next_query = Instant::now();
     loop {
         let cancellation = poll_cancelled(&mut child, manager, unit, &cancelled, record);
         let expired = Instant::now() >= deadline && startup_wait_required(detached, started);
         if cancellation.is_some() || expired {
             record.mark_settled(reap_client(&mut child));
-            let cleanup = cleanup(manager, unit);
+            let cleanup = cleanup();
             return match cancellation {
                 Some(signal) => Outcome::Cancelled {
                     signal,
@@ -551,10 +606,12 @@ pub fn execute(
                 // domain cannot be observed) is Unknown, not Completed.
                 // Workload status comes from the manager; the client code is
                 // only a fallback when the manager is silent.
-                match query_state(manager, unit) {
-                    Some(state) if confirmed_exit(&state, observed.as_ref()) => {
+                match query() {
+                    Some(state)
+                        if startup_released && confirmed_exit(&state, observed.as_ref()) =>
+                    {
                         if !retain {
-                            let _ = cleanup(manager, unit);
+                            let _ = cleanup();
                         }
                         return Outcome::Completed(state.workload_code.unwrap_or(client_code));
                     }
@@ -566,7 +623,7 @@ pub fn execute(
                             cleanup: if observed.is_some() {
                                 Cleanup::Unknown
                             } else {
-                                cleanup(manager, unit)
+                                cleanup()
                             },
                         };
                     }
@@ -577,25 +634,70 @@ pub fn execute(
                 record.mark_settled(reap_client(&mut child));
                 return Outcome::Unknown {
                     exit_code: 1,
-                    cleanup: cleanup(manager, unit),
+                    cleanup: cleanup(),
                 };
             }
         }
         if !started && Instant::now() >= next_query {
-            if let Some(state) = state(manager, unit) {
-                started = state.started;
-                if started {
-                    observed = state.invocation.zip(state.control_group).and_then(
-                        |(invocation, group)| {
+            if let Some(state) = query().filter(|state| state.loaded) {
+                if record.startup.is_none() {
+                    started = state.started;
+                }
+                if state.started && observed.is_none() {
+                    observed = state
+                        .invocation
+                        .as_ref()
+                        .zip(state.control_group.as_ref())
+                        .and_then(|(invocation, group)| {
                             if !group.ends_with(&format!("/{unit}")) {
                                 return None;
                             }
                             Some((
-                                invocation,
-                                ObservedDomain::capture(&safe_cgroup_path(&group)?)?,
+                                invocation.clone(),
+                                ObservedDomain::capture(&safe_cgroup_path(group)?)?,
                             ))
-                        },
-                    );
+                        });
+                }
+                if let (Some(barrier), Some((invocation, domain)), Some(main_pid), Some(group)) = (
+                    record.startup.as_ref(),
+                    observed.as_ref(),
+                    state.main_pid,
+                    state.control_group.as_deref(),
+                ) {
+                    // Pinning precedes release. Recheck cancellation after the
+                    // bounded manager query, so cancellation during that query
+                    // cannot authorize the payload.
+                    if let Some(signal) =
+                        poll_cancelled(&mut child, manager, unit, &cancelled, record)
+                    {
+                        record.mark_settled(reap_client(&mut child));
+                        return Outcome::Cancelled {
+                            signal,
+                            started,
+                            cleanup: cleanup(),
+                        };
+                    }
+                    if Instant::now() >= deadline {
+                        continue;
+                    }
+                    let identity_matches = !state.stopped
+                        && state.invocation.as_ref() == Some(invocation)
+                        && domain.matches(Some(group))
+                        && domain.empty() == Some(false);
+                    match identity_matches.then(|| barrier.release(main_pid, group)) {
+                        Some(Ok(true)) => {
+                            startup_released = true;
+                            started = true;
+                        }
+                        Some(Ok(false)) => {}
+                        _ => {
+                            record.mark_settled(reap_client(&mut child));
+                            return Outcome::Unknown {
+                                exit_code: 1,
+                                cleanup: Cleanup::Unknown,
+                            };
+                        }
+                    }
                 }
             }
             next_query = Instant::now() + Duration::from_millis(100);
@@ -826,6 +928,31 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
     }
 
     #[test]
+    fn startup_barrier_cannot_be_bypassed_by_a_successful_wait_client() {
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-startup-required");
+        let manager = show_manager(
+            &dir,
+            "printf 'LoadState=loaded\\nExecMainStartTimestampMonotonic=1\\nActiveState=inactive\\nExecMainCode=1\\nExecMainStatus=0\\nControlGroup=/amc-test-collected\\n'",
+        );
+        let record = ClientRecord::with_startup(
+            StartupBarrier::new(format!("amc-start-bypass-{}", std::process::id())).unwrap(),
+        );
+        let outcome = execute(
+            &mut bound_command("app-amc-startup@1.service", false),
+            &manager,
+            "app-amc-startup@1.service",
+            false,
+            false,
+            || None,
+            &record,
+        );
+        assert!(matches!(outcome, Outcome::Unknown { exit_code: 0, .. }));
+        assert!(record.submitted() && record.settled());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unsafe_cgroup_paths_are_unknown() {
         assert!(safe_cgroup_path("relative/path").is_none());
         assert!(safe_cgroup_path("/has/../traversal").is_none());
@@ -952,6 +1079,7 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
             started: false,
             stopped: true,
             control_group: Some(String::new()),
+            main_pid: None,
             workload_code: None,
         };
         assert!(!confirmed_exit(&state, None));

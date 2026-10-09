@@ -197,6 +197,8 @@ fn load(path: &Path) -> Result<Manifest> {
 
 fn contract(manifest: &Manifest, job: &Job) -> Contract {
     Contract {
+        burst: false,
+        runtime_max_sec: None,
         slice: manifest.slice.clone(),
         memory_max: job.memory_max,
         memory_swap_max: job.memory_swap_max,

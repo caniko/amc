@@ -7,6 +7,9 @@ fixture/compatibility launch tools for systemd memory policy. RFC 0.4 in
 sandbox or transparent replacement for normal launching. An optional
 [persistent per-user admission service](docs/persistent-admission.md) coordinates
 native managed jobs across independent processes with durable recovery.
+The [shared host broker](docs/shared-host-admission.md) additionally supports
+advance foreground preparation, finite completion rights for existing work,
+and bounded swap-return recovery before new memory growth.
 
 An optional [native memory supervisor](docs/supervision.md) adds per-invocation
 whole-window forecasting, admission inhibition and identity-bound recovery for
@@ -146,6 +149,17 @@ establish termination beneath the original visible parent. There is no retry,
 unrestricted fallback, or promise of cleanup after
 SIGKILL or manager unavailability. Inspect the recorded identity before any
 manual retry; work may already have happened.
+
+The waited `amc exec` and `amc admission exec` paths synchronize startup before
+executing the payload. An exec-only helper waits on a one-attempt Unix socket
+until the runner has pinned the native invocation and cgroup. Both peers verify
+PID/UID; the runner also checks the helper's MainPID and native placement. A
+failed exchange, disconnect, cancellation or 30-second startup timeout prevents
+payload execution. Exec preserves the PID, argv and streams, and admitted entry
+still performs all existing broker checks. The native runtime ceiling covers
+the helper as well as the payload. The acknowledgment is startup evidence;
+completion still requires the independent final manager query and empty pinned
+domain. Detached and library callers retain their existing acknowledgment rules.
 
 Helper self-checks observe settings at helper entry, before allocation. They
 do **not** prove arbitrary loader/constructor ordering or fail-closed launch
