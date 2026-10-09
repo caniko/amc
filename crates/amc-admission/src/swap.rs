@@ -371,6 +371,8 @@ pub(crate) struct NativeReturnInventory {
     pages: Option<(Identity, Identity, u64)>,
 }
 
+const REPLAY_TIMEOUT: Duration = crate::page_return::INVENTORY_TIMEOUT;
+
 impl NativeReturnInventory {
     fn scan(root: &Path, claims: &[crate::host::Reservation]) -> Result<Self> {
         Self::scan_with_limit(root, claims, 8192)
@@ -406,14 +408,22 @@ impl NativeReturnInventory {
         })
     }
 
-    /// Fast, complete replay of the actual inputs, never a bare cached boolean.
-    /// Changed or oversized observations reject instead of blocking ordinary RPCs
-    /// behind another 20-second inventory in the single accept loop.
+    /// Complete live replay of the actual inputs, never a bare cached boolean.
+    /// Runs in the inventory worker so wide hierarchies get the same bounded
+    /// time budget without blocking ordinary broker RPCs.
     pub(crate) fn current(&self) -> Result<bool> {
-        self.current_until(Instant::now() + Duration::from_millis(250))
+        self.current_until(Instant::now() + REPLAY_TIMEOUT)
     }
 
     fn current_until(&self, deadline: Instant) -> Result<bool> {
+        self.current_with(deadline, NativeDirectory::read)
+    }
+
+    fn current_with(
+        &self,
+        deadline: Instant,
+        mut observe: impl FnMut(&Path, &Path, Instant) -> Result<NativeDirectory>,
+    ) -> Result<bool> {
         let mut fresh = Self {
             root: self.root.clone(),
             directories: BTreeMap::new(),
@@ -425,7 +435,7 @@ impl NativeReturnInventory {
                 Instant::now() < deadline,
                 "device inventory replay exceeded time bound"
             );
-            let observed = NativeDirectory::read(directory, &self.root, deadline)?;
+            let observed = observe(directory, &self.root, deadline)?;
             if observed.inode != scanned.inode || observed.children != scanned.children {
                 return Ok(false);
             }
@@ -580,6 +590,46 @@ impl NativeReturnInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wide_replay_can_finish_when_native_observations_exceed_a_broker_tick() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-wide-replay-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let group = root.join("work");
+        fs::create_dir_all(&group).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "5"),
+            ("memory.swap.current", "0"),
+            ("memory.stat", "swapcached 0\n"),
+        ] {
+            fs::write(group.join(name), value).unwrap();
+        }
+        let proof = NativeReturnInventory::scan(&root, &[]).unwrap();
+        let mut delayed = false;
+        assert!(
+            proof
+                .current_with(
+                    Instant::now() + REPLAY_TIMEOUT,
+                    |directory, root, deadline| {
+                        if !delayed {
+                            delayed = true;
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                        NativeDirectory::read(directory, root, deadline)
+                    }
+                )
+                .unwrap(),
+            "wide supported inventories must not retry forever at the 250ms accept-loop boundary"
+        );
+        assert!(
+            proof.current_until(Instant::now()).is_err(),
+            "incomplete replay must still deny"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn page_inventory_replays_all_possible_owners_including_initially_empty_ones() {
         let root = std::env::temp_dir().join(format!(

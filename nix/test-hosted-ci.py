@@ -20,6 +20,9 @@ class NativeEvidenceTests(unittest.TestCase):
         receipt = {
             "kernel": "6.18.48",
             "pageReturnGuard": self.guard_evidence(),
+            "outsideRunnerPreparationDenied": True,
+            "poolRetirement": {"removedDomainReleased": True, "liveOwnerCleared": True,
+                "descendantRetainedBytes": 96 * 1048576, "finalBytes": 0},
             "abandonedPreparation": {
                 "sigkillWhileBrokerOffline": True,
                 "waitMilliseconds": 3600000,
@@ -141,6 +144,11 @@ class NativeEvidenceTests(unittest.TestCase):
             path.write_text(json.dumps(receipt))
             hosted.verify_foreground_evidence(path)
             hosted.verify_foreground_evidence(path, "6.18")
+            for value in [False, None]:
+                path.write_text(json.dumps({**receipt, "outsideRunnerPreparationDenied": value}))
+                with self.subTest(outsideRunnerPreparationDenied=value), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path)
+            path.write_text(json.dumps(receipt))
             with self.assertRaises(RuntimeError):
                 hosted.verify_foreground_evidence(path, "7.2")
             current = {**receipt, "kernel": "7.2.8-cachyos-lto"}
@@ -192,6 +200,10 @@ class NativeEvidenceTests(unittest.TestCase):
                 ):
                     hosted.verify_foreground_evidence(path)
             for section, key, value in [
+                ("poolRetirement", "removedDomainReleased", False),
+                ("poolRetirement", "liveOwnerCleared", False),
+                ("poolRetirement", "descendantRetainedBytes", 0),
+                ("poolRetirement", "finalBytes", 1),
                 ("abandonedPreparation", "sigkillWhileBrokerOffline", False),
                 ("abandonedPreparation", "waitMilliseconds", 60000),
                 ("abandonedPreparation", "restartClearedBarrier", False),

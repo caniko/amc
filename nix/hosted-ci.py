@@ -105,6 +105,14 @@ def verify_foreground_evidence(path, kernel_series=None):
     if not isinstance(kernel, str) or not kernel or (kernel_series is not None and not kernel.startswith(kernel_series + ".")):
         raise RuntimeError("Native page return evidence is for the wrong kernel series")
     verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
+    if receipt.get("outsideRunnerPreparationDenied") is not True:
+        raise RuntimeError("Native preparation accepted an unbacked runner peer")
+    pool = receipt.get("poolRetirement", {})
+    if (pool.get("removedDomainReleased") is not True
+        or pool.get("liveOwnerCleared") is not True
+        or pool.get("descendantRetainedBytes") != 96 * 1048576
+        or pool.get("finalBytes") != 0):
+        raise RuntimeError("Native root pool lacks persisted release after policy retirement")
     abandoned = receipt.get("abandonedPreparation", {})
     if (abandoned.get("sigkillWhileBrokerOffline") is not True
         or abandoned.get("waitMilliseconds") != 3600000

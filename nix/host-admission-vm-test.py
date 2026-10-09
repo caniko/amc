@@ -213,6 +213,17 @@ with test_section("namespace runners share a host-reserve-backed aggregate ceili
     wait_committed(0)
 
 with test_section("concurrent preparation helpers share the reserve-backed runner slice"):
+    write_file("/tmp/outside-runner-prepare.py", """import json, socket
+with socket.socket(socket.AF_UNIX) as s:
+    s.settimeout(2)
+    s.connect('/run/amc-host/admission.sock')
+    s.sendall(b'{"op":"prepare","version":1,"id":"outside-helper","key":"secret","profile":"game"}\\n')
+    reply = json.loads(s.makefile().readline())
+assert reply['error'] and not reply['granted'], reply
+""")
+    machine.succeed("runuser -u alice -- python3 /tmp/outside-runner-prepare.py")
+    assert not status()["preparation_barrier"] and not status()["preparations"]
+    evidence["outsideRunnerPreparationDenied"] = True
     launch("helper-drain", 1000, "small", "touch /tmp/helper-drain-entered; while ! test -e /tmp/helper-drain-finish; do sleep .1; done; touch /tmp/helper-drain-completed")
     wait_entered("helper-drain")
     drain_grant = next(r for r in status()["reservations"] if r["granted"] and r["identity"]["uid"] == 1000)
@@ -258,6 +269,7 @@ with test_section("durable root pool tracks every potential execution owner"):
     write_file(
         "/tmp/pool-owner.py",
         """import json, socket, sys, time
+from pathlib import Path
 while True:
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(2)
@@ -269,6 +281,15 @@ while True:
         open(sys.argv[1], "w").write(r["ticket"])
         break
     time.sleep(.25)
+while not Path(sys.argv[1] + '-release').exists():
+    time.sleep(.1)
+with socket.socket(socket.AF_UNIX) as s:
+    s.settimeout(2)
+    s.connect('/run/amc-host/admission.sock')
+    s.sendall(b'{"op":"release_pool","version":1,"domain":"builders","operation":1}\\n')
+    reply = json.loads(s.makefile().readline())
+assert not reply['error'] and reply['granted'], reply
+Path(sys.argv[1] + '-released').write_text(json.dumps(reply))
 time.sleep(120)
 """,
     )
@@ -290,11 +311,24 @@ time.sleep(120)
     machine.succeed("systemctl stop pool-first")
     machine.sleep(1)
     wait_committed(96 * 1048576)
-    machine.succeed("systemctl stop pool-second")
-    machine.sleep(1)
+    retired = json.loads(machine.succeed("cat /etc/amc-test-host-policy.json"))
+    retired["domains"] = [domain for domain in retired["domains"] if domain["name"] != "builders"]
+    retired["preparations"] = []
+    write_file("/tmp/retired-pool-policy.json", json.dumps(retired))
+    machine.succeed("systemctl stop amc-host-admission")
+    machine.succeed("systemd-run --unit=retired-pool-host -- amc admission host-serve --policy /tmp/retired-pool-policy.json --state /var/lib/amc-host")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
+    machine.succeed("touch /tmp/pool-second-release")
+    machine.wait_until_succeeds("test -s /tmp/pool-second-released")
     wait_committed(96 * 1048576)
+    assert status()["reservations"][0]["owners_finished"]
     machine.succeed("systemctl stop pool-child")
     wait_committed(0)
+    machine.succeed("systemctl is-active pool-second")
+    evidence["poolRetirement"] = {"removedDomainReleased": True, "liveOwnerCleared": True,
+        "descendantRetainedBytes": 96 * 1048576, "finalBytes": 0}
+    machine.succeed("systemctl stop pool-second retired-pool-host; systemctl start amc-host-admission")
+    machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
 
 with test_section("helper cannot omit host capacity before private entry"):
     write_file(

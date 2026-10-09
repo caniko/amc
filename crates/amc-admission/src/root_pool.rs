@@ -21,6 +21,28 @@ pub(crate) fn valid_operation_key(key: &str) -> bool {
 }
 
 impl HostLedger {
+    /// Release authority comes from the persisted finite Worker, even when its
+    /// domain or ceiling changed. Native cleanup still retains descendants.
+    pub(crate) fn pool_release_identity(
+        &self,
+        domain: &str,
+        pid: i32,
+        start_ticks: u64,
+        operation: u64,
+    ) -> Result<Identity> {
+        for reservation in self.reservations.iter().filter(|r| r.domain == domain) {
+            let identity = Identity {
+                pid,
+                start_ticks,
+                ..reservation.identity.clone()
+            };
+            if operation > 0 && self.owns_pool_operation(domain, &identity, Some(operation)) {
+                return Ok(identity);
+            }
+        }
+        anyhow::bail!("pool release does not match persisted Worker ownership")
+    }
+
     pub fn owns_pool_operation(
         &self,
         domain: &str,

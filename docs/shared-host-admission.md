@@ -27,6 +27,9 @@ charged until its descendants are empty and all potential execution owners have
 terminated or positively finished their finite operations. When preparations
 are configured, each root worker supplies a distinct nonzero `operation` serial.
 `release_pool` settles only that root peer's matching serial, not native capacity.
+The persisted PID/start, pool inode and operation authenticate release even after
+policy removes the domain or reduces its ceiling. Policy changes cannot trap a
+completed Worker behind a still-live daemon PID.
 Nested workers and other peers keep their ownership; a lost release retains
 backing, and a newer serial cannot retry with the old worker's admission rights.
 
@@ -95,6 +98,9 @@ user manager's `RuntimeMaxUSec`, zero randomized extension, `Restart=no`,
 control-group killing, `OOMPolicy=kill`, one-second stop timeout and final
 SIGKILL. The native timer includes the host-admission handshake. The requested
 runtime is a hard deadline, not a claim that the command will finish in time.
+Manager evidence refreshes outside the broker through at most eight concurrent
+queries, with live grants taking priority over waiting peers. Exact identity
+binding and the one-second validity window still apply.
 Host RAM/swap reserves, pressure recovery, all ancestor ceilings and full live
 commitments still apply. Daemon-owned work remains independently accounted.
 
@@ -143,6 +149,9 @@ Native projections back them in finite ancestors, including
 while runners wait, and the runner authenticates this allowance with the broker
 before submitting the inner shared job. They are static maintenance backing,
 so preparations do not wait for a runner that is itself waiting for admission.
+Every `Prepare` request independently checks this exact aggregate/leaf placement,
+native caps and ancestor backing before creating a barrier; a separate handshake
+does not give an arbitrary same-UID process preparation authority.
 Host status reports `namespace_runner_reserved_bytes`; consumers can require
 `lib.admissionNamespaceRunnerVersion = 2` for namespace runners and concurrent
 preparation helpers (version 1 covered only namespace runners). Without an allowance, shared
@@ -257,12 +266,14 @@ owner. Returned pages must fit the helper's remaining native resident allowance
 as well as its bounded working memory; successive batches wait when it is full.
 Charge-owner inventory is bounded to 65,536 groups, depth 256 and 20 seconds;
 an incomplete inventory rejects acquisition without faulting pages. Root recovery
-acquisition RPCs allow 30 seconds so a complete wide scan is not discarded at
-the ordinary two-second program-call deadline. Device inventory also has a
+acquisition RPCs allow 90 seconds for bounded scan, feasibility and full replay
+phases, so a complete wide scan is not discarded at the ordinary two-second
+program-call deadline. Device inventory also has a
 20-second deadline, within the same maintenance RPC budget.
 
-Both page and device inventories run in one bounded background task outside
-the broker accept loop. Ordinary status, preparation, and acquisition RPCs
+Both page and device inventories and their complete live replays run in one
+bounded background task outside the broker accept loop. Ordinary status,
+preparation, and acquisition RPCs
 remain responsive. No scan clone can write the ledger or grant a lease: the
 broker rejects stale backing, replaced helpers, disconnected peers and results
 older than one second, then repeats native identity, host capacity and local
@@ -274,9 +285,12 @@ Both page and whole-device replay verify the complete scanned cgroup frontier
 and recalculate headroom from live limits, resident bytes and uncovered swap
 demand, including groups with zero demand in the earlier scan. Page replay
 rechecks every possible original charge owner as well as target and reader
-fallback boundaries. This final replay has a
-250 ms bound and rejects incomplete or unsafe observations before durable grant.
-Burst manager evidence is refreshed in a separate single background task and
+fallback boundaries. This final replay has a 20-second deadline and completes
+before the worker timestamps its result. The main loop rechecks freshness after
+its final native target/helper and capacity validation before persisting the
+exact batch. A wide hierarchy cannot block the accept loop, and incomplete
+replay never falls back to scan-time native demand.
+Burst manager evidence is refreshed through at most eight background queries and
 expires after one second; missing evidence delays admission while kernel limits
 remain directly rechecked. Manager latency cannot hold ordinary broker RPCs.
 
@@ -358,16 +372,21 @@ including beyond 512 PIDs, 8,192 mappings and 8,388,608 pages. This avoids walki
 empty cgroup descendants. Identity, layout, placement, native backing and PTEs
 are rechecked; hints grant no authority. PID reuse, ordinary exec and migration
 reset the target hint. Mapping offsets additionally bind a SHA-256 digest of the
-complete maps stream, bounded to 64 MiB. Any changed VMA sequence resets the
-process frontier, even when exec/placement identity and the byte-offset boundary
-are unchanged. EOF requires a fresh matching maps snapshot; oversized or unstable
-snapshots remain incomplete. Full sweeps wrap to revisit churn and same-layout
-exec. Waits/interruption retain the first unread range. A scan-budget cutoff is
+complete maps stream, hashed through a fixed 64 KiB buffer with a 20-second
+deadline. Large streams remain resumable without a total-byte truncation. Any
+changed VMA sequence resets the process frontier, even when exec/placement
+identity and the byte-offset boundary
+are unchanged. Every bounded window requires a fresh matching maps fingerprint;
+unstable streams remain incomplete. Full sweeps wrap to revisit churn and
+same-layout exec. Waits/interruption retain the first unread range. A scan-budget cutoff is
 distinct from end-of-mm and cannot establish successful recovery, even with zero
 destination swap counters. Kernel counters must also show zero selected demand.
 On restart, completing an inherited suffix only advances discovery: success
 requires a complete new PID sweep within the current campaign. Old cursor hints
-cannot certify that an interrupted prefix remains resident.
+cannot certify that an interrupted prefix remains resident. Completion binds the
+whole selected frontier's mappings and present/swapped PTE state as well as its
+lifetimes and placements. A page newly swapped behind a completed PID invalidates
+the sweep even if its charge remains outside the destination subtree.
 
 ```sh
 amc recover-swap                 # bounded incremental return, devices stay on

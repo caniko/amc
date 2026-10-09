@@ -151,7 +151,7 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response> {
 fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
     let timeout = match request {
         Request::AcquirePageReturn { .. } | Request::AcquireRecovery { .. } => {
-            Duration::from_secs(30)
+            Duration::from_secs(90)
         }
         _ => Duration::from_secs(2),
     };
@@ -363,7 +363,7 @@ pub fn serve_supervised(
                 .worker
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("native inventory worker failed")))
-                .and_then(|(mut reply, native_demand, completed)| {
+                .and_then(|(mut reply, _native_demand, completed)| {
                     if reply.granted {
                         // Results authorize only one replay of the same authenticated
                         // request. Never replace the current ledger with a scan clone.
@@ -395,8 +395,10 @@ pub fn serve_supervised(
                                 )?;
                                 if fresh.granted {
                                     ensure!(
-                                        native_demand.as_ref().map_or(Ok(true), crate::swap::NativeReturnInventory::current)?,
-                                        "native recovery demand or frontier changed during inventory replay"
+                                        completed.elapsed() <= Duration::from_secs(1)
+                                            && host_native::owner_alive(&task.owner) == Some(true)
+                                            && inventory_peer_connected(&stream),
+                                        "native recovery replay expired before persistence"
                                     );
                                     ensure!(
                                         inventory_recovery_matches(
@@ -928,6 +930,14 @@ impl PendingInventory {
                     (health_file.as_deref(), inventory_proof, &burst_evidence),
                     &mut reply,
                 )?;
+                if reply.granted {
+                    ensure!(
+                        native_demand
+                            .as_ref()
+                            .map_or(Ok(true), crate::swap::NativeReturnInventory::current)?,
+                        "native recovery demand or frontier changed during inventory replay"
+                    );
+                }
                 Ok((reply, native_demand, Instant::now()))
             })?;
         Ok(Self {
@@ -1128,6 +1138,10 @@ fn handle_advance_request(
             profile,
         } => {
             ensure!(version == 1, "unsupported host protocol");
+            let claims = ledger
+                .native_claims(policy, None)
+                .ok_or_else(|| anyhow::anyhow!("preparation helper backing unavailable"))?;
+            crate::namespace_runner::verify(pid, uid, policy, &claims)?;
             let owner = crate::ledger::ClientIdentity {
                 pid,
                 start_ticks: host_native::process_start(pid)?,
@@ -1522,8 +1536,12 @@ fn handle_advance_request(
             operation,
         } => {
             ensure!(version == 1 && uid == 0, "pool release requires root");
-            let (_, identity, _, _) =
-                host_native::identify_pool(pid, uid, &domain, &policy.domains)?;
+            let identity = ledger.pool_release_identity(
+                &domain,
+                pid,
+                host_native::process_start(pid)?,
+                operation,
+            )?;
             ledger.release_pool_operation(&domain, &identity, operation);
             reply.granted = true;
         }
@@ -1664,6 +1682,126 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_request_outside_the_backed_runner_cannot_create_a_barrier() {
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "namespace_runner_bytes":67108864,
+            "domains":[{"name":"game","uid":1000,"cgroup":"/game.slice","ceiling_bytes":134217728,"swap_bytes":0,"fair_share_bytes":134217728}],
+            "preparations":[{"name":"game","domain":"game","memory_bytes":134217728,"swap_bytes":0,
+                "drain_domains":[],"wait_ms":3600000,"ready_ms":15000}]
+        })).unwrap();
+        policy.validate().unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        let before = serde_json::to_vec(&ledger).unwrap();
+        let result = handle_advance_request(
+            Request::Prepare {
+                version: 1,
+                id: "outside".into(),
+                key: "secret".into(),
+                profile: "game".into(),
+            },
+            std::process::id() as i32,
+            1000,
+            &policy,
+            &mut ledger,
+            (None, None, &crate::burst_manager::Snapshot::default()),
+            &mut Response::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an enrolled UID must not skip the runner boundary handshake"
+        );
+        assert!(!ledger.preparation_barrier());
+        assert_eq!(serde_json::to_vec(&ledger).unwrap(), before);
+    }
+
+    #[test]
+    fn root_pool_release_uses_persisted_worker_ownership_after_policy_removal() {
+        let mut policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":100,"reserve_bytes":10,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "domains":[{"name":"builders","uid":0,"cgroup":"/builders","ceiling_bytes":10,"swap_bytes":0,"fair_share_bytes":10}]
+        })).unwrap();
+        let pid = std::process::id() as i32;
+        let start = host_native::process_start(pid).unwrap();
+        let pool: Reservation = serde_json::from_value(serde_json::json!({
+            "id":"pool", "domain":"builders", "memory_bytes":20, "swap_bytes":0,
+            "requested_ms":0, "deadline_ms":10000, "granted":true,
+            "identity":{"cgroup":"/builders", "inode":1,"uid":0,"pid":pid,"start_ticks":start},
+            "owners":[{"pid":pid,"start_ticks":start}]
+        }))
+        .unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.reservations.push(pool.clone());
+        ledger
+            .bind_pool_operation("builders", &pool.identity, 1)
+            .unwrap();
+        ledger
+            .bind_pool_operation("builders", &pool.identity, 2)
+            .unwrap();
+        let mut ledger: HostLedger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        ledger.validate().unwrap();
+        let evidence = crate::burst_manager::Snapshot::default();
+        let release = |operation| Request::ReleasePool {
+            version: 1,
+            domain: "builders".into(),
+            operation,
+        };
+        // Reduced ceilings must not change an already-owned operation's release.
+        let mut reply = Response::default();
+        handle_advance_request(
+            release(1),
+            pid,
+            0,
+            &policy,
+            &mut ledger,
+            (None, None, &evidence),
+            &mut reply,
+        )
+        .unwrap();
+        assert!(reply.granted);
+        assert_eq!(ledger.committed(), 20);
+        assert!(
+            !ledger.reservations[0].owners_finished,
+            "the nested outer Worker still owns backing"
+        );
+        let before = serde_json::to_vec(&ledger).unwrap();
+        assert!(
+            handle_advance_request(
+                release(3),
+                pid,
+                0,
+                &policy,
+                &mut ledger,
+                (None, None, &evidence),
+                &mut Response::default()
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_vec(&ledger).unwrap(), before);
+        policy.domains.clear();
+        handle_advance_request(
+            release(2),
+            pid,
+            0,
+            &policy,
+            &mut ledger,
+            (None, None, &evidence),
+            &mut reply,
+        )
+        .unwrap();
+        assert!(ledger.reservations[0].owners_finished);
+        assert!(ledger.pool_operations.is_empty());
+        assert_eq!(
+            ledger.committed(),
+            20,
+            "native descendants remain charged until positive cleanup"
+        );
+    }
 
     #[test]
     fn inventory_poll_never_waits_and_stale_or_disconnected_results_cannot_grant() {

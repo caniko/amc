@@ -198,7 +198,8 @@ fn process_signature_at(proc: &Path, pid: i32) -> Result<(u64, String)> {
 }
 
 /// A bounded-memory, ordered digest of all selected native process lifetimes,
-/// placements and exec layouts. Destination swap counters omit migrated debt.
+/// placements, mappings and PTE return state. Destination counters omit migrated
+/// debt; PID identity alone cannot certify an address space already scanned.
 pub fn frontier(policy: &RecoveryPolicy) -> Result<[u8; 32]> {
     frontier_at(Path::new("/proc"), Path::new("/sys/fs/cgroup"), policy)
 }
@@ -230,19 +231,51 @@ fn frontier_at(proc: &Path, groups: &Path, policy: &RecoveryPolicy) -> Result<[u
                 let signature = process_signature_at(proc, pid)?;
                 let uid = fs::metadata(proc.join(pid.to_string()))?.uid();
                 let inode = fs::metadata(groups.join(group.trim_start_matches('/')))?.ino();
+                let mut maps = File::open(proc.join(pid.to_string()).join("maps"))?;
+                let mappings = mapping_fingerprint(&mut maps)?;
+                let mut source = maps.try_clone()?;
+                let pagemap = File::open(proc.join(pid.to_string()).join("pagemap"))?;
+                let mut state = Sha256::new();
+                state.update(mappings);
+                let mut cursor = ProcessCursor {
+                    target: Identity {
+                        pid,
+                        start_ticks: signature.0,
+                        uid,
+                        inode,
+                        cgroup: group.clone(),
+                    },
+                    layout: signature.1.clone(),
+                    maps_offset: 0,
+                    address: 0,
+                    maps_fingerprint: Some(mappings),
+                };
+                ensure!(
+                    scan_stream(
+                        &mut cursor,
+                        maps,
+                        &pagemap,
+                        page_return::page_size()?,
+                        (usize::MAX, u64::MAX),
+                        Some((&mut state, deadline))
+                    )? == Scan::Complete,
+                    "selected address-space frontier is incomplete"
+                );
                 ensure!(
                     placement_at(proc, pid)? == group
-                        && process_signature_at(proc, pid)? == signature,
+                        && process_signature_at(proc, pid)? == signature
+                        && mapping_fingerprint(&mut source)? == mappings,
                     "selected process changed during frontier observation"
                 );
-                Ok(Some((group, signature, uid, inode)))
+                Ok(Some((group, signature, uid, inode, state.finalize())))
             })();
             match entry {
-                Ok(Some((group, (start, layout), uid, inode))) => {
+                Ok(Some((group, (start, layout), uid, inode, state))) => {
                     hash.update(pid.to_le_bytes());
                     hash.update(start.to_le_bytes());
                     hash.update(uid.to_le_bytes());
                     hash.update(inode.to_le_bytes());
+                    hash.update(state);
                     for text in [group, layout] {
                         hash.update((text.len() as u64).to_le_bytes());
                         hash.update(text.as_bytes());
@@ -309,7 +342,14 @@ fn scan_at(
         cursor.maps_fingerprint = Some(fingerprint);
     }
     let mut source = maps.try_clone()?;
-    let result = scan_stream(cursor, maps, pagemap, bound, map_budget, page_budget)?;
+    let result = scan_stream(
+        cursor,
+        maps,
+        pagemap,
+        bound,
+        (map_budget, page_budget),
+        None,
+    )?;
     // The bounded window reads the live stream without retaining it in RAM.
     // No range, resume or EOF is trusted if mmap/munmap changed that stream.
     if mapping_fingerprint(&mut source)? != fingerprint {
@@ -326,15 +366,22 @@ fn scan_stream(
     maps: File,
     pagemap: &File,
     bound: u64,
-    map_budget: usize,
-    page_budget: u64,
+    budget: (usize, u64),
+    mut completion: Option<(&mut Sha256, std::time::Instant)>,
 ) -> Result<Scan> {
+    let (map_budget, page_budget) = budget;
     let page = page_return::page_size()?;
     let mut maps = BufReader::new(maps);
     maps.seek(SeekFrom::Start(cursor.maps_offset))?;
     let mut entries = [0u8; 4096];
     let mut scanned = 0;
     for _ in 0..map_budget {
+        ensure!(
+            completion
+                .as_ref()
+                .is_none_or(|(_, deadline)| std::time::Instant::now() < *deadline),
+            "selected address-space frontier exceeded time bound"
+        );
         let offset = maps.stream_position()?;
         let mut line = String::new();
         let count = (&mut maps).take(16385).read_line(&mut line)?;
@@ -382,6 +429,12 @@ fn scan_stream(
                 first
             };
         while address < last {
+            ensure!(
+                completion
+                    .as_ref()
+                    .is_none_or(|(_, deadline)| std::time::Instant::now() < *deadline),
+                "selected address-space frontier exceeded time bound"
+            );
             if scanned == page_budget {
                 cursor.maps_offset = offset;
                 cursor.address = address;
@@ -398,6 +451,17 @@ fn scan_stream(
                     .context("pagemap overflow")?,
             )?;
             scanned += count as u64;
+            if let Some((hash, _)) = completion.as_mut() {
+                // Ignore PFNs/soft-dirty churn. Only residency and swap state
+                // affect whether this address space still owes page return.
+                for entry in entries[..count * 8].chunks_exact(8) {
+                    hash.update([(u64::from_ne_bytes(
+                        entry.try_into().expect("eight-byte pagemap entry"),
+                    ) >> 62) as u8]);
+                }
+                address += count as u64 * page;
+                continue;
+            }
             let swapped = |i: usize| {
                 u64::from_ne_bytes(
                     entries[i * 8..i * 8 + 8]
@@ -479,6 +543,16 @@ mod tests {
                 format!("{pid} (target) {}\n", fields.join(" ")),
             )
             .unwrap();
+            fs::write(
+                proc.join(pid.to_string()).join("maps"),
+                "0-1000 rw-p 0 00:00 0\n",
+            )
+            .unwrap();
+            fs::write(
+                proc.join(pid.to_string()).join("pagemap"),
+                (1u64 << 63).to_ne_bytes(),
+            )
+            .unwrap();
         }
         let mut discovery = Discovery {
             boot_id: "boot".into(),
@@ -509,6 +583,20 @@ mod tests {
             [42, 600]
         );
         assert!(sweep.wrap(after, frontier_at(&proc, &groups, &policy).unwrap()));
+        let stable = frontier_at(&proc, &groups, &policy).unwrap();
+        // PID/layout/placement are unchanged when an earlier mapping becomes
+        // swapped with debt still charged outside the selected destination.
+        fs::write(proc.join("42/pagemap"), (1u64 << 62).to_ne_bytes()).unwrap();
+        assert!(
+            !sweep.wrap(stable, frontier_at(&proc, &groups, &policy).unwrap()),
+            "a newly swapped PTE behind the scan must prevent successful completion"
+        );
+        let swapped = frontier_at(&proc, &groups, &policy).unwrap();
+        fs::write(proc.join("42/maps"), "0-1000 rw-p 0 00:00 0 /new-mapping\n").unwrap();
+        assert!(
+            !sweep.wrap(swapped, frontier_at(&proc, &groups, &policy).unwrap()),
+            "VMA replacement behind the completed PID must also invalidate completion"
+        );
         let old = fs::read_to_string(proc.join("42/stat")).unwrap();
         fs::write(proc.join("42/stat"), old.replacen(" 7 ", " 8 ", 1)).unwrap();
         assert!(
