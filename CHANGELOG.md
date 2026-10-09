@@ -32,6 +32,10 @@
 
 ### Fixed
 
+- Match acquisition replays by the complete native lifetime and placement so
+  retained old grants cannot deny a recycled PID its new enrolled acquisition.
+- Protect Ready foreground transfers from new page/device recovery leases.
+- Reject existing recovery targets that are neither regular files nor block devices.
 - Replay ordinary persisted acquisitions after domain removal or ceiling reduction,
   while freshly authenticating native identity and the original enforced envelope.
 - Reject aliases of the same native swap target before restoration, including

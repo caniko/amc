@@ -66,10 +66,22 @@ fn identify_acquire_at(
     domains: &[Domain],
     grants: &[crate::host::Reservation],
 ) -> Result<(String, Identity, u64, u64)> {
-    if let Some(grant) = grants
-        .iter()
-        .find(|grant| grant.granted && grant.identity.pid == pid && grant.identity.uid == uid)
-    {
+    let start_ticks = process_start_at(proc, pid)?;
+    let placement = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
+    let cgroup = placement
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .context("peer has no cgroup v2 placement")?;
+    crate::native::cgroup_directory(cgroup)?;
+    let inode = fs::metadata(root.join(cgroup.trim_start_matches('/')))?.ino();
+    if let Some(grant) = grants.iter().find(|grant| {
+        grant.granted
+            && grant.identity.pid == pid
+            && grant.identity.uid == uid
+            && grant.identity.start_ticks == start_ticks
+            && grant.identity.cgroup == cgroup
+            && grant.identity.inode == inode
+    }) {
         return identify_replay_at(proc, root, pid, uid, grant, false);
     }
     identify_entry_at(proc, root, pid, uid, domains, false)
@@ -696,6 +708,72 @@ mod tests {
         let mut peer = lane.clone();
         peer.id = "other-lane".into();
         assert_eq!(ancestor_headroom_at(&root, &lane, &[peer]), Some(0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recycled_acquire_pid_can_enter_current_policy_or_replay_its_own_grant() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-recycled-acquire-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("cgroups");
+        let old = "/work.slice/app-amc-job-old.service";
+        let new = "/work.slice/app-amc-job-new.service";
+        for group in [old, new] {
+            let directory = groups.join(group.trim_start_matches('/'));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("memory.max"), "40").unwrap();
+            fs::write(directory.join("memory.swap.max"), "10").unwrap();
+        }
+        fs::create_dir_all(proc.join("42")).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (new) S {}8\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), format!("0::{new}\n")).unwrap();
+        let old_grant: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"old", "domain":"work", "memory_bytes":40, "swap_bytes":10,
+            "requested_ms":0, "deadline_ms":10000, "granted":true, "owners":[],
+            "identity":{"cgroup":old, "inode":fs::metadata(groups.join(old.trim_start_matches('/'))).unwrap().ino(),
+                "uid":1000, "pid":42, "start_ticks":7}
+        })).unwrap();
+        let domains = [Domain {
+            name: "work".into(),
+            uid: 1000,
+            cgroup: "/work.slice".into(),
+            ceiling_bytes: 40,
+            swap_bytes: 10,
+            fair_share_bytes: 40,
+            io_pressure: crate::host::IoPressure::Enforce,
+            min_available_bytes: 0,
+            continuation: None,
+            burst: false,
+        }];
+        let expected = identify_entry_at(&proc, &groups, 42, 1000, &domains, false).unwrap();
+        assert_eq!(
+            identify_acquire_at(
+                &proc,
+                &groups,
+                42,
+                1000,
+                &domains,
+                std::slice::from_ref(&old_grant)
+            )
+            .unwrap(),
+            expected,
+            "a charged old cgroup must not deny a recycled PID its new acquisition"
+        );
+        let mut new_grant = old_grant.clone();
+        new_grant.id = "new".into();
+        new_grant.identity = expected.1.clone();
+        assert_eq!(
+            identify_acquire_at(&proc, &groups, 42, 1000, &[], &[old_grant, new_grant]).unwrap(),
+            expected,
+            "a stale first candidate must not hide the exact persisted grant"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

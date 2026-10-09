@@ -151,6 +151,10 @@ fn target_identity(path: &str) -> Result<Option<TargetIdentity>> {
     Ok(Some(if metadata.file_type().is_block_device() {
         TargetIdentity::BlockDevice(metadata.rdev())
     } else {
+        ensure!(
+            metadata.is_file(),
+            "recovery target must be a regular file or block device"
+        );
         TargetIdentity::File(metadata.dev(), metadata.ino())
     }))
 }
@@ -284,6 +288,13 @@ impl HostLedger {
         if self.recovery.is_some() {
             return Some(WaitReason::Recovery);
         }
+        if self
+            .preparations
+            .iter()
+            .any(|p| p.phase == crate::preparation::PreparationPhase::Ready)
+        {
+            return Some(WaitReason::Preparation);
+        }
         if !(0.0..policy.max_memory_full_psi).contains(&c.memory_full_psi) {
             return Some(WaitReason::Pressure);
         }
@@ -322,6 +333,13 @@ impl HostLedger {
         if self.recovery.is_some() {
             return Some(WaitReason::Recovery);
         }
+        if self
+            .preparations
+            .iter()
+            .any(|p| p.phase == crate::preparation::PreparationPhase::Ready)
+        {
+            return Some(WaitReason::Preparation);
+        }
         if !(0.0..policy.max_memory_full_psi).contains(&c.memory_full_psi) {
             return Some(WaitReason::Pressure);
         }
@@ -347,6 +365,45 @@ impl HostLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_targets_reject_existing_nonfile_boundaries() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-invalid-target-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let fifo = root.join("fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let socket = root.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let alias = root.join("directory-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for path in [
+            &root,
+            &fifo,
+            &socket,
+            &alias,
+            std::path::Path::new("/dev/null"),
+        ] {
+            let target = RecoveryTarget {
+                name: "invalid".into(),
+                path: path.to_str().unwrap().into(),
+                priority: 10,
+            };
+            assert!(
+                validate_targets(&[target]).is_err(),
+                "accepted nonswap target {}",
+                path.display()
+            );
+        }
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn recovery_targets_reject_existing_symlink_and_hardlink_aliases() {
         let root = std::env::temp_dir().join(format!(

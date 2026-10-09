@@ -76,6 +76,37 @@ fn advance(l: &mut HostLedger, p: &HostPolicy, now: u64) -> BTreeMap<String, Wai
 }
 
 #[test]
+fn ready_preparation_blocks_new_recovery_until_native_transfer() {
+    let p = policy();
+    let mut ledger = HostLedger::new("boot".into());
+    ledger.swap_return_bytes = Some(0);
+    ledger
+        .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+        .unwrap();
+    assert_eq!(ledger.preparations[0].phase, PreparationPhase::Draining);
+    assert_eq!(ledger.page_return_wait(&p, capacity(), 20, 1, true), None);
+    assert_eq!(ledger.recovery_wait(&p, capacity(), 20, 1, true), None);
+    advance(&mut ledger, &p, 250);
+    assert_eq!(ledger.preparations[0].phase, PreparationPhase::Ready);
+    let before = serde_json::to_value(&ledger).unwrap();
+    assert_eq!(
+        [
+            ledger.page_return_wait(&p, capacity(), 20, 1, true),
+            ledger.recovery_wait(&p, capacity(), 20, 1, true)
+        ],
+        [Some(WaitReason::Preparation); 2],
+        "recovery must not interrupt an already-backed foreground transfer"
+    );
+    assert_eq!(serde_json::to_value(&ledger).unwrap(), before);
+    ledger
+        .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 500)
+        .unwrap();
+    assert_eq!(ledger.preparations[0].phase, PreparationPhase::Active);
+    assert_eq!(ledger.page_return_wait(&p, capacity(), 20, 1, true), None);
+    assert_eq!(ledger.recovery_wait(&p, capacity(), 20, 1, true), None);
+}
+
+#[test]
 fn abandoned_helper_releases_only_pending_barriers_across_restart() {
     let mut p = policy();
     p.preparations[0].wait_ms = 3_600_000;
