@@ -32,6 +32,12 @@
 
 ### Fixed
 
+- Authenticate each preparation request in its backed native helper boundary.
+- Release retired root pools through persisted finite Worker ownership while
+  retaining native descendants until positive cleanup.
+- Include mapping and PTE state when validating a completed recovery sweep.
+- Complete wide native replays outside the broker accept loop and refresh live
+  burst evidence concurrently within its existing one-second validity window.
 - Require a stable full selected-process sweep before page-return completion,
   including PID lifetime, cgroup placement and exec layout after migrations.
 - Resume mapping streams above 64 MiB using bounded-memory fingerprints and
