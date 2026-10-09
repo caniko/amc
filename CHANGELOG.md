@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Resume mapping streams above 64 MiB using bounded-memory fingerprints and
+  revalidate the complete VMA sequence around every pagemap scan window.
 - Match acquisition replays by the complete native lifetime and placement so
   retained old grants cannot deny a recycled PID its new enrolled acquisition.
 - Protect Ready foreground transfers from new page/device recovery leases.

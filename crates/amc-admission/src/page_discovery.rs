@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::FileExt,
     path::Path,
 };
@@ -185,7 +185,7 @@ pub enum Scan {
     Complete,
 }
 
-/// Byte offsets apply only to the exact mapping snapshot that produced them.
+/// Byte offsets apply only to the exact mapping stream that produced them.
 /// mmap/munmap changes reset the entire process frontier before any resume.
 /// A found range stays at its first page until the caller proves settlement.
 pub fn scan(cursor: &mut ProcessCursor, pagemap: &File, bound: u64) -> Result<Scan> {
@@ -193,21 +193,27 @@ pub fn scan(cursor: &mut ProcessCursor, pagemap: &File, bound: u64) -> Result<Sc
     scan_at(cursor, maps, pagemap, bound, 8192, 8_388_608)
 }
 
-fn mapping_snapshot(mut maps: File) -> Result<Vec<u8>> {
-    const LIMIT: u64 = 64 * 1024 * 1024;
+fn mapping_fingerprint(maps: &mut File) -> Result<[u8; 32]> {
+    let deadline = std::time::Instant::now() + page_return::INVENTORY_TIMEOUT;
     maps.seek(SeekFrom::Start(0))?;
-    let mut snapshot = Vec::new();
-    maps.take(LIMIT + 1).read_to_end(&mut snapshot)?;
-    ensure!(
-        snapshot.len() as u64 <= LIMIT,
-        "native mapping snapshot exceeds bound"
-    );
-    Ok(snapshot)
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "native mapping fingerprint exceeded time bound"
+        );
+        let count = maps.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(hash.finalize().into());
+        }
+        hash.update(&buffer[..count]);
+    }
 }
 
 fn scan_at(
     cursor: &mut ProcessCursor,
-    maps: File,
+    mut maps: File,
     pagemap: &File,
     bound: u64,
     map_budget: usize,
@@ -218,15 +224,35 @@ fn scan_at(
         bound >= page && bound <= 16 * 1024 * 1024,
         "invalid discovery batch"
     );
-    let source = maps.try_clone()?;
-    let snapshot = mapping_snapshot(maps)?;
-    let fingerprint: [u8; 32] = Sha256::digest(&snapshot).into();
+    let fingerprint = mapping_fingerprint(&mut maps)?;
     if cursor.maps_fingerprint != Some(fingerprint) {
         cursor.maps_offset = 0;
         cursor.address = 0;
         cursor.maps_fingerprint = Some(fingerprint);
     }
-    let mut maps = BufReader::new(Cursor::new(snapshot));
+    let mut source = maps.try_clone()?;
+    let result = scan_stream(cursor, maps, pagemap, bound, map_budget, page_budget)?;
+    // The bounded window reads the live stream without retaining it in RAM.
+    // No range, resume or EOF is trusted if mmap/munmap changed that stream.
+    if mapping_fingerprint(&mut source)? != fingerprint {
+        cursor.maps_offset = 0;
+        cursor.address = 0;
+        cursor.maps_fingerprint = None;
+        return Ok(Scan::More);
+    }
+    Ok(result)
+}
+
+fn scan_stream(
+    cursor: &mut ProcessCursor,
+    maps: File,
+    pagemap: &File,
+    bound: u64,
+    map_budget: usize,
+    page_budget: u64,
+) -> Result<Scan> {
+    let page = page_return::page_size()?;
+    let mut maps = BufReader::new(maps);
     maps.seek(SeekFrom::Start(cursor.maps_offset))?;
     let mut entries = [0u8; 4096];
     let mut scanned = 0;
@@ -236,15 +262,6 @@ fn scan_at(
         let count = (&mut maps).take(16385).read_line(&mut line)?;
         ensure!(count <= 16384, "native mapping exceeds line bound");
         if count == 0 {
-            // A stream read does not freeze mmap/munmap. An EOF from the
-            // snapshot is complete only while the current VMA sequence matches.
-            let current: [u8; 32] = Sha256::digest(mapping_snapshot(source)?).into();
-            if current != fingerprint {
-                cursor.maps_offset = 0;
-                cursor.address = 0;
-                cursor.maps_fingerprint = None;
-                return Ok(Scan::More);
-            }
             return Ok(Scan::Complete);
         }
         let mut fields = line.split_whitespace();
@@ -352,6 +369,67 @@ mod tests {
             maps_fingerprint: None,
         }
     }
+    #[test]
+    fn mapping_stream_above_snapshot_cap_resumes_to_swapped_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-large-maps-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let page = page_return::page_size().unwrap();
+        let padding = "p".repeat(8192);
+        let mut maps = std::io::BufWriter::new(File::create(root.join("maps")).unwrap());
+        for i in 0..8193 {
+            writeln!(
+                maps,
+                "{:x}-{:x} rw-p 0 00:00 0 /{padding}",
+                i * page,
+                (i + 1) * page
+            )
+            .unwrap();
+        }
+        maps.flush().unwrap();
+        drop(maps);
+        assert!(fs::metadata(root.join("maps")).unwrap().len() > 64 * 1024 * 1024);
+        let pagemap = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.join("pagemap"))
+            .unwrap();
+        pagemap.set_len(8193 * 8).unwrap();
+        pagemap
+            .write_all_at(&(1u64 << 62).to_ne_bytes(), 8192 * 8)
+            .unwrap();
+        let window = |cursor: &mut ProcessCursor| {
+            scan_at(
+                cursor,
+                File::open(root.join("maps")).unwrap(),
+                &pagemap,
+                page,
+                8192,
+                8192,
+            )
+        };
+        let mut cursor = cursor();
+        assert_eq!(window(&mut cursor).unwrap(), Scan::More);
+        let mut cursor: ProcessCursor =
+            serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
+        assert_eq!(
+            window(&mut cursor).unwrap(),
+            Scan::Range {
+                address: 8192 * page,
+                bytes: page
+            }
+        );
+        pagemap
+            .write_all_at(&(1u64 << 63).to_ne_bytes(), 8192 * 8)
+            .unwrap();
+        cursor.address += page;
+        assert_eq!(window(&mut cursor).unwrap(), Scan::Complete);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn changed_vma_prefix_cannot_skip_a_swapped_mapping_at_a_valid_byte_offset() {
         let root = std::env::temp_dir().join(format!(
