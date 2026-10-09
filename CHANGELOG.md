@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Require a stable full selected-process sweep before page-return completion,
+  including PID lifetime, cgroup placement and exec layout after migrations.
 - Resume mapping streams above 64 MiB using bounded-memory fingerprints and
   revalidate the complete VMA sequence around every pagemap scan window.
 - Match acquisition replays by the complete native lifetime and placement so

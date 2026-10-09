@@ -10,7 +10,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, MetadataExt},
     path::Path,
 };
 
@@ -62,8 +62,8 @@ impl Sweep {
             began_at_start: discovery.after_pid == 0 && discovery.active.is_none(),
         }
     }
-    pub fn wrap(&mut self) -> bool {
-        std::mem::replace(&mut self.began_at_start, true)
+    pub fn wrap(&mut self, before: [u8; 32], after: [u8; 32]) -> bool {
+        std::mem::replace(&mut self.began_at_start, true) && before == after
     }
 }
 
@@ -150,23 +150,42 @@ fn candidates_at(root: &Path, after: i32) -> Result<Vec<i32>> {
 }
 
 pub fn selected(pid: i32, policy: &RecoveryPolicy) -> Result<bool> {
-    let group = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    let group = placement_at(Path::new("/proc"), pid)?;
+    Ok(selected_group(&group, policy))
+}
+
+fn placement_at(proc: &Path, pid: i32) -> Result<String> {
+    let group = fs::read_to_string(proc.join(pid.to_string()).join("cgroup"))?;
     let group = group
         .lines()
         .find_map(|s| s.strip_prefix("0::"))
         .context("missing native placement")?;
-    Ok(policy
+    crate::native::cgroup_directory(group)?;
+    Ok(group.into())
+}
+
+fn selected_group(group: &str, policy: &RecoveryPolicy) -> bool {
+    policy
         .page_cgroups
         .iter()
-        .any(|prefix| group == prefix || group.starts_with(&format!("{prefix}/"))))
+        .any(|prefix| group == prefix || group.starts_with(&format!("{prefix}/")))
 }
 
 pub fn layout(pid: i32) -> Result<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    Ok(process_signature_at(Path::new("/proc"), pid)?.1)
+}
+
+fn process_signature_at(proc: &Path, pid: i32) -> Result<(u64, String)> {
+    let stat = fs::read_to_string(proc.join(pid.to_string()).join("stat"))?;
     let (_, fields) = stat
         .rsplit_once(") ")
         .context("invalid native process stat")?;
     let fields: Vec<_> = fields.split_whitespace().collect();
+    let start = fields
+        .get(19)
+        .context("missing process lifetime")?
+        .parse::<u64>()?;
+    ensure!(start > 0, "invalid process lifetime");
     // startcode/endcode/startstack and data/argument/environment bounds change
     // on ordinary exec. Even same-layout exec cannot turn a hint into authority:
     // the complete sweep wraps and native descriptors/settlement are rechecked.
@@ -175,7 +194,66 @@ pub fn layout(pid: i32) -> Result<String> {
         .into_iter()
         .map(|i| fields.get(i).copied().context("short native process stat"))
         .collect::<Result<Vec<_>>>()
-        .map(|v| v.join(" "))
+        .map(|v| (start, v.join(" ")))
+}
+
+/// A bounded-memory, ordered digest of all selected native process lifetimes,
+/// placements and exec layouts. Destination swap counters omit migrated debt.
+pub fn frontier(policy: &RecoveryPolicy) -> Result<[u8; 32]> {
+    frontier_at(Path::new("/proc"), Path::new("/sys/fs/cgroup"), policy)
+}
+
+fn frontier_at(proc: &Path, groups: &Path, policy: &RecoveryPolicy) -> Result<[u8; 32]> {
+    let deadline = std::time::Instant::now() + page_return::INVENTORY_TIMEOUT;
+    let mut hash = Sha256::new();
+    let mut after = 0;
+    loop {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "selected PID frontier exceeded time bound"
+        );
+        let pids = candidates_at(proc, after)?;
+        if pids.is_empty() {
+            return Ok(hash.finalize().into());
+        }
+        for pid in pids {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "selected PID frontier exceeded time bound"
+            );
+            after = pid;
+            let entry = (|| -> Result<_> {
+                let group = placement_at(proc, pid)?;
+                if !selected_group(&group, policy) {
+                    return Ok(None);
+                }
+                let signature = process_signature_at(proc, pid)?;
+                let uid = fs::metadata(proc.join(pid.to_string()))?.uid();
+                let inode = fs::metadata(groups.join(group.trim_start_matches('/')))?.ino();
+                ensure!(
+                    placement_at(proc, pid)? == group
+                        && process_signature_at(proc, pid)? == signature,
+                    "selected process changed during frontier observation"
+                );
+                Ok(Some((group, signature, uid, inode)))
+            })();
+            match entry {
+                Ok(Some((group, (start, layout), uid, inode))) => {
+                    hash.update(pid.to_le_bytes());
+                    hash.update(start.to_le_bytes());
+                    hash.update(uid.to_le_bytes());
+                    hash.update(inode.to_le_bytes());
+                    for text in [group, layout] {
+                        hash.update((text.len() as u64).to_le_bytes());
+                        hash.update(text.as_bytes());
+                    }
+                }
+                Ok(None) => (),
+                Err(_) if !proc.join(pid.to_string()).exists() => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -369,6 +447,77 @@ mod tests {
             maps_fingerprint: None,
         }
     }
+    #[test]
+    fn selected_process_entering_behind_pid_frontier_prevents_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-pid-migration-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("groups");
+        fs::create_dir_all(groups.join("selected")).unwrap();
+        let policy = RecoveryPolicy {
+            cgroup: "/helper.service".into(),
+            helper_bytes: 1048576,
+            minimum_bytes: 1,
+            targets: vec![],
+            page_cgroups: vec!["/selected".into()],
+            batch_bytes: 4096,
+        };
+        for (pid, group) in [(42, "/outside"), (600, "/selected")] {
+            fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            fs::write(
+                proc.join(pid.to_string()).join("cgroup"),
+                format!("0::{group}\n"),
+            )
+            .unwrap();
+            let mut fields = vec!["0"; 49];
+            fields[0] = "S";
+            fields[19] = "7";
+            fs::write(
+                proc.join(pid.to_string()).join("stat"),
+                format!("{pid} (target) {}\n", fields.join(" ")),
+            )
+            .unwrap();
+        }
+        let mut discovery = Discovery {
+            boot_id: "boot".into(),
+            groups: policy.page_cgroups.clone(),
+            after_pid: 0,
+            active: None,
+        };
+        let mut sweep = Sweep::new(&discovery);
+        let before = frontier_at(&proc, &groups, &policy).unwrap();
+        // PID 42 was outside the selection when its position was passed. Its
+        // original memcg can retain all swap charges after this migration.
+        discovery.after_pid = 600;
+        assert!(
+            candidates_at(&proc, discovery.after_pid)
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(proc.join("42/cgroup"), "0::/selected\n").unwrap();
+        let after = frontier_at(&proc, &groups, &policy).unwrap();
+        assert_ne!(before, after);
+        assert!(
+            !sweep.wrap(before, after),
+            "zero destination counters must not accept a process missed behind the PID sweep"
+        );
+        discovery.wrap();
+        assert_eq!(
+            candidates_at(&proc, discovery.after_pid).unwrap(),
+            [42, 600]
+        );
+        assert!(sweep.wrap(after, frontier_at(&proc, &groups, &policy).unwrap()));
+        let old = fs::read_to_string(proc.join("42/stat")).unwrap();
+        fs::write(proc.join("42/stat"), old.replacen(" 7 ", " 8 ", 1)).unwrap();
+        assert!(
+            !sweep.wrap(after, frontier_at(&proc, &groups, &policy).unwrap()),
+            "PID reuse must also restart the full sweep"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn mapping_stream_above_snapshot_cap_resumes_to_swapped_tail() {
         let root = std::env::temp_dir().join(format!(
@@ -622,10 +771,10 @@ mod tests {
         // Reaching EOF from an inherited frontier is progress, not a proof
         // about the first 512 processes from an interrupted campaign.
         assert!(candidates_at(&root, 600).unwrap().is_empty());
-        assert!(!sweep.wrap());
+        assert!(!sweep.wrap([0; 32], [0; 32]));
         discovery.wrap();
         assert_eq!(candidates_at(&root, discovery.after_pid).unwrap(), first);
-        assert!(sweep.wrap());
+        assert!(sweep.wrap([0; 32], [0; 32]));
         discovery.active = Some(cursor());
         discovery.finish_process();
         assert_eq!(discovery.after_pid, 42);

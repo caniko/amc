@@ -187,6 +187,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     // Durable cursors are progress hints, not a residency proof for the prefix
     // that a previous (possibly interrupted or failed) campaign visited.
     let mut sweep = page_discovery::Sweep::new(&discovery);
+    let mut frontier = page_discovery::frontier(&policy)?;
     for _ in 0..1024 {
         if Instant::now() >= deadline {
             break;
@@ -194,7 +195,9 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         if discovery.active.is_none() {
             let candidates = page_discovery::candidates(discovery.after_pid)?;
             if candidates.is_empty() {
-                let complete = sweep.wrap();
+                let current = page_discovery::frontier(&policy)?;
+                let complete = sweep.wrap(frontier, current);
+                frontier = current;
                 discovery.wrap();
                 store.save_discovery(&discovery)?;
                 if complete && amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
@@ -337,6 +340,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         store.save_discovery(&discovery)?;
     }
     let remaining = amc_admission::page_return::selected_return_bytes(&policy)?;
+    sweep_complete &= page_discovery::frontier(&policy)? == frontier;
     eprintln!(
         "page return: proved {returned} bytes resident, {remaining} nonresident return bytes remain in selected subtrees"
     );
