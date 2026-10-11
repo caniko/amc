@@ -281,6 +281,22 @@ impl ObservedDomain {
             group.is_empty() || safe_cgroup_path(group).as_ref() == Some(&self.path)
         })
     }
+
+    fn release_startup(
+        &self,
+        barrier: &StartupBarrier,
+        main_pid: u32,
+        group: &str,
+    ) -> anyhow::Result<bool> {
+        match self.empty() {
+            Some(false) => barrier.release(main_pid, group),
+            // Manager startup properties can precede visible native attachment.
+            // Leave the connection queued until population is positively known;
+            // execute's startup deadline and cancellation still bound this wait.
+            Some(true) => Ok(false),
+            None => anyhow::bail!("startup domain identity or population is unknown"),
+        }
+    }
 }
 
 fn confirmed_exit(state: &UnitState, observed: Option<&(String, ObservedDomain)>) -> bool {
@@ -682,9 +698,9 @@ pub fn execute(
                     }
                     let identity_matches = !state.stopped
                         && state.invocation.as_ref() == Some(invocation)
-                        && domain.matches(Some(group))
-                        && domain.empty() == Some(false);
-                    match identity_matches.then(|| barrier.release(main_pid, group)) {
+                        && domain.matches(Some(group));
+                    match identity_matches.then(|| domain.release_startup(barrier, main_pid, group))
+                    {
                         Some(Ok(true)) => {
                             startup_released = true;
                             started = true;
@@ -1060,6 +1076,102 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         fs::create_dir(&group).unwrap();
         fs::write(group.join("cgroup.events"), "populated 0\n").unwrap();
         assert_eq!(observed.empty(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initially_empty_startup_keeps_the_helper_pending_until_population() {
+        use std::os::{
+            linux::net::SocketAddrExt,
+            unix::net::{SocketAddr, UnixStream},
+        };
+
+        let root = crate::test_support::scratch_dir("amc-pending-startup-domain");
+        let group = root.join("job.service");
+        fs::create_dir(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 0\n").unwrap();
+        let domain = ObservedDomain::capture(&group).unwrap();
+        let barrier =
+            StartupBarrier::new(format!("amc-start-pending-{}", std::process::id())).unwrap();
+        let mut helper =
+            UnixStream::connect_addr(&SocketAddr::from_abstract_name(barrier.name()).unwrap())
+                .unwrap();
+        helper
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let placement = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let native_group = placement
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+
+        assert!(
+            !domain
+                .release_startup(&barrier, std::process::id(), native_group)
+                .unwrap()
+        );
+        let error = std::io::Read::read_exact(&mut helper, &mut [0]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(
+            domain
+                .release_startup(&barrier, std::process::id(), native_group)
+                .unwrap()
+        );
+        let mut ack = [0];
+        std::io::Read::read_exact(&mut helper, &mut ack).unwrap();
+        assert_eq!(ack, [1]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unobservable_or_replaced_startup_domain_cannot_authorize_helper() {
+        use std::os::{
+            linux::net::SocketAddrExt,
+            unix::net::{SocketAddr, UnixStream},
+        };
+
+        let root = crate::test_support::scratch_dir("amc-unknown-startup-domain");
+        let group = root.join("job.service");
+        fs::create_dir(&group).unwrap();
+        let domain = ObservedDomain::capture(&group).unwrap();
+        let barrier =
+            StartupBarrier::new(format!("amc-start-unknown-{}", std::process::id())).unwrap();
+        let mut helper =
+            UnixStream::connect_addr(&SocketAddr::from_abstract_name(barrier.name()).unwrap())
+                .unwrap();
+        helper
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        assert!(
+            domain
+                .release_startup(&barrier, std::process::id(), "/unrelated")
+                .is_err()
+        );
+        fs::write(group.join("cgroup.events"), "populated invalid\n").unwrap();
+        assert!(
+            domain
+                .release_startup(&barrier, std::process::id(), "/unrelated")
+                .is_err()
+        );
+
+        fs::rename(&group, root.join("original.service")).unwrap();
+        fs::create_dir(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(
+            domain
+                .release_startup(&barrier, std::process::id(), "/unrelated")
+                .is_err()
+        );
+        let error = std::io::Read::read_exact(&mut helper, &mut [0]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Keep native startup pending while its pinned cgroup is initially empty;
+  release the helper only after population is observed within the startup deadline.
 - Allow four hours for hosted patched-kernel qualification after both native
   kernel builds exhausted the previous two-hour deadline.
 - Require preparation slice hierarchies under their enrolled UID's user manager;
