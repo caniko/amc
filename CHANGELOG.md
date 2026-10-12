@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Retain host admission and preparation client/helper journals when concurrent
+  helper qualification times out, preserving the original phase assertions.
 - Bind whole-device swap recovery to one broker-approved native object and retain
   its descriptor through deactivation and restoration, including failure recovery.
 - Keep native startup pending while its pinned cgroup is initially empty;

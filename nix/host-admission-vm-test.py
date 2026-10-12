@@ -245,11 +245,25 @@ assert reply['error'] and not reply['granted'], reply
             "amc prepare --profile game -- /bin/sh -c "
             + shlex.quote(f"touch /tmp/helper-prepared-{number}-entered; sleep 120")
         )
-    machine.wait_until_succeeds(
-        "amc admission host-status | python3 -c " + shlex.quote(
-            'import sys,json; s=json.load(sys.stdin); assert len(s["preparations"]) == 2 and all(p["phase"] == "draining" for p in s["preparations"])'
+    try:
+        machine.wait_until_succeeds(
+            "amc admission host-status | python3 -c " + shlex.quote(
+                'import sys,json; s=json.load(sys.stdin); assert len(s["preparations"]) == 2 and all(p["phase"] == "draining" for p in s["preparations"])'
+            )
         )
-    )
+    except Exception as error:
+        queries = {
+            "host": "amc admission host-status",
+            "clients": "journalctl -b --no-pager -o cat -u helper-prepared-1 -u helper-prepared-2 -n 30",
+            "helpers": "journalctl -b --no-pager -o cat _UID=1000 -n 30",
+            "broker": "journalctl -b --no-pager -o cat -u amc-host-admission -n 12",
+        }
+        observations = {
+            key: machine.execute(command) for key, command in queries.items()
+        }
+        raise AssertionError(
+            json.dumps({"preparationHelpers": observations})
+        ) from error
     runner_group = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-amchostrunner.slice"
     machine.succeed(
         f'test "$(cat {runner_group}/memory.max)" = 67108864; '
