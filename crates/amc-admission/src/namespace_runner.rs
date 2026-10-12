@@ -123,36 +123,20 @@ pub(crate) fn discover(ledger: &mut HostLedger, policy: &HostPolicy) -> Result<(
 }
 
 fn discover_at(ledger: &mut HostLedger, root: &Path) -> Result<()> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+    ensure!(
+        ledger.namespace_runners.len() <= 256,
+        "runner discovery exceeds bound"
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    for (index, entry) in entries.enumerate() {
+    // Only durable/current authenticated keys can own an allowance. Looking
+    // them up directly keeps unrelated user directories out of the work bound.
+    for (&uid, allowance) in &mut ledger.namespace_runners {
         ensure!(
-            index < 256 && std::time::Instant::now() < deadline,
+            std::time::Instant::now() < deadline,
             "runner discovery exceeds bound"
         );
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(uid) = name
-            .to_str()
-            .and_then(|s| {
-                s.strip_prefix("user-")?
-                    .strip_suffix(".slice")?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .filter(|uid| *uid != 0)
-        else {
-            continue;
-        };
-        if !ledger.namespace_runners.contains_key(&uid) {
-            continue;
-        }
-        let directory = entry.path().join(format!(
-            "user@{uid}.service/app.slice/app-amchostrunner.slice"
+        let directory = root.join(format!(
+            "user-{uid}.slice/user@{uid}.service/app.slice/app-amchostrunner.slice"
         ));
         let events = match fs::read_to_string(directory.join("cgroup.events")) {
             Ok(events) => events,
@@ -171,7 +155,10 @@ fn discover_at(ledger: &mut HostLedger, root: &Path) -> Result<()> {
             (SERVICE_BYTES..=1024 * 1024 * 1024).contains(&bytes),
             "unbounded surviving runner aggregate"
         );
-        let allowance = ledger.namespace_runners.entry(uid).or_default();
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "runner discovery exceeds bound"
+        );
         *allowance = (*allowance).max(bytes);
     }
     Ok(())
@@ -271,6 +258,35 @@ pub fn verify(pid: i32, uid: u32, policy: &HostPolicy, claims: &[Reservation]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_user_directories_cannot_exhaust_authenticated_runner_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-runner-many-users-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for uid in 2000..2300 {
+            fs::create_dir_all(root.join(format!("user-{uid}.slice"))).unwrap();
+        }
+        let directory =
+            root.join("user-1000.slice/user@1000.service/app.slice/app-amchostrunner.slice");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("cgroup.events"), "populated 1\n").unwrap();
+        fs::write(
+            directory.join("memory.max"),
+            (2 * SERVICE_BYTES).to_string(),
+        )
+        .unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.namespace_runners.insert(1000, SERVICE_BYTES);
+        let result = discover_at(&mut ledger, &root);
+        fs::remove_dir_all(root).unwrap();
+        result.expect("unrelated directories must not prevent startup");
+        assert_eq!(
+            ledger.namespace_runners,
+            BTreeMap::from([(1000, 2 * SERVICE_BYTES)])
+        );
+    }
+
     #[test]
     fn startup_discovery_ignores_unenrolled_user_created_runner_slices() {
         let root = std::env::temp_dir().join(format!(
