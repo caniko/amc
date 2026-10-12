@@ -121,21 +121,25 @@ pub struct Preparation {
 
 impl Preparation {
     pub(crate) fn policy_matches(&self, policy: &HostPolicy) -> bool {
-        policy.preparations.iter().any(|spec| {
-            spec.name == self.profile
-                && spec.domain == self.domain
-                && spec.memory_bytes == self.memory_bytes
-                && spec.swap_bytes == self.swap_bytes
-                && self.wait_ms == Some(spec.wait_ms)
-                && spec.ready_ms == self.ready_ms
-                && self.drain_domains.as_ref().is_some_and(|domains| {
-                    domains.iter().collect::<std::collections::BTreeSet<_>>()
-                        == spec
-                            .drain_domains
-                            .iter()
-                            .collect::<std::collections::BTreeSet<_>>()
-                })
-        })
+        policy
+            .domains
+            .iter()
+            .any(|domain| domain.name == self.domain && domain.uid == self.uid)
+            && policy.preparations.iter().any(|spec| {
+                spec.name == self.profile
+                    && spec.domain == self.domain
+                    && spec.memory_bytes == self.memory_bytes
+                    && spec.swap_bytes == self.swap_bytes
+                    && self.wait_ms == Some(spec.wait_ms)
+                    && spec.ready_ms == self.ready_ms
+                    && self.drain_domains.as_ref().is_some_and(|domains| {
+                        domains.iter().collect::<std::collections::BTreeSet<_>>()
+                            == spec
+                                .drain_domains
+                                .iter()
+                                .collect::<std::collections::BTreeSet<_>>()
+                    })
+            })
     }
 }
 

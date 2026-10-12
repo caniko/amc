@@ -169,6 +169,92 @@ fn restart_rejects_changed_wait_policy_for_draining_and_ready_but_retains_consum
 }
 
 #[test]
+fn restart_rejects_reassigned_preparation_uids_but_retains_consumed_native_claims() {
+    let tick = |ledger: &mut HostLedger, policy: &HostPolicy, now| {
+        let mut healthy = BTreeMap::from([
+            ("work".into(), 0),
+            ("game".into(), 0),
+            ("builders".into(), 0),
+        ]);
+        ledger.advance(
+            now,
+            policy,
+            Some(Capacity {
+                available_bytes: policy.reserve_bytes + 180,
+                ..capacity().unwrap()
+            }),
+            &mut healthy,
+            |_, _| Some(200),
+        )
+    };
+    for phase in [
+        PreparationPhase::Draining,
+        PreparationPhase::Ready,
+        PreparationPhase::Active,
+    ] {
+        let mut p = policy();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.swap_return_bytes = Some(0);
+        ledger
+            .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+            .unwrap();
+        if phase != PreparationPhase::Draining {
+            advance(&mut ledger, &p, 250);
+        }
+        if phase == PreparationPhase::Active {
+            ledger
+                .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 500)
+                .unwrap();
+        }
+        let saved = serde_json::to_vec(&ledger).unwrap();
+        let mut unchanged: HostLedger = serde_json::from_slice(&saved).unwrap();
+        advance(&mut unchanged, &p, 750);
+        assert_eq!(unchanged.preparations.len(), 1);
+
+        let domain = p.domains.iter_mut().find(|d| d.name == "game").unwrap();
+        domain.uid = 1001;
+        domain.cgroup = "/user.slice/user-1001.slice/user@1001.service/game.slice".into();
+        p.reserve_bytes += p.namespace_runner_bytes;
+        p.validate().unwrap();
+        assert!(p.domains.iter().any(|d| d.uid == 1000));
+        let mut restored: HostLedger = serde_json::from_slice(&saved).unwrap();
+        tick(&mut restored, &p, 750);
+        let consumed = phase == PreparationPhase::Active;
+        assert_eq!(
+            restored.preparations.len(),
+            usize::from(consumed),
+            "reassigning the domain UID must revoke pending and Ready barriers"
+        );
+        assert!(!restored.preparation_barrier());
+        assert_eq!(restored.reservations.len(), usize::from(consumed));
+        if consumed {
+            assert!(restored.reservations[0].granted);
+            assert_eq!(restored.reservations[0].identity.uid, 1000);
+            assert_eq!(restored.committed(), 40);
+        } else {
+            assert!(
+                restored
+                    .prepare("old-user".into(), "key".into(), peer(), "game", 751, &p)
+                    .is_err()
+            );
+            restored
+                .prepare(
+                    "new-user".into(),
+                    "key".into(),
+                    (1001, peer().1),
+                    "game",
+                    751,
+                    &p,
+                )
+                .unwrap();
+            tick(&mut restored, &p, 1000);
+            assert_eq!(restored.preparations[0].phase, PreparationPhase::Ready);
+            assert_eq!(restored.preparations[0].uid, 1001);
+        }
+    }
+}
+
+#[test]
 fn legacy_pending_intents_without_wait_binding_cannot_reacquire_authority() {
     let p = policy();
     let mut ledger = HostLedger::new("boot".into());
