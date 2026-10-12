@@ -166,6 +166,41 @@ pidfd identity rejection, admission inhibition, recovery deadlines/budgets and
 replay segmentation. `nixosTests.x86_64-linux.supervision` defines closed-loop
 backend/descendant cleanup, once-only restart, in-flight supervisor restart,
 shadow authority and trace/replay cases. Hosted CI must retain its named JUnit
-cases and trace/recovery receipts. Defined tests are not passing VM evidence;
+cases and trace/recovery receipts. The VM stops the trace writer before replay
+and export; `replay-input.json` binds the complete trace's SHA-256 and byte count
+to the replay summary's SHA-256. Hosted verification rejects missing or stale
+bindings. Defined tests are not passing VM evidence;
 application thresholds still need chronological replay, shadow observation and
 controlled consumer qualification before enabling forecast recovery.
+
+### Native failure injections
+
+The supervision VM additionally defines these production-path probes:
+
+- Missing, malformed, oversized, writable, foreign-owned and symlinked heartbeat
+  files; expired/future timestamps; changed boot, inhibition and degraded state.
+  Each variant denies a new pool across multiple broker ticks while preserving a
+  live root owner's exact grant, identity and full-ceiling commitment.
+- Missing/malformed `MemAvailable` and full memory PSI. Corrupted proc files are
+  mounted only in the broker's private namespace. Broker restarts preserve two
+  live grants; restoring required observations permits the queued third pool.
+- A replacement invocation during native failed-backend cooldown. The old
+  recovery trips, retains its attempt and never signals or restarts the active
+  replacement or its descendant.
+- Two completed recoveries followed by independent domain-budget and host-budget
+  exhaustion. Both trips survive supervisor restart with unchanged accounting
+  and no third recovery. The host case uses two different domains, each below
+  its individual limit, to distinguish the host constraint.
+
+An unenrolled backend and its descendant remain live with the same invocation
+through replacement and budget trials. Injected failures stay inside the VM;
+they do not change the build host's telemetry or service policy.
+
+`nix/hosted-ci.py` requires all named execution cases and verifies the exported
+`admission-failures.json`, `admission-observations.json`,
+`replacement-status.json`, `domain-budget-status.json`,
+`host-budget-status.json` and `foreign-status.json`. Validator regressions reject
+missing denial variants, early-only observations, lost commitments, missing
+restored progress, changed identities, forgiven attempts and foreign disruption.
+Qualification still requires the production, workspace-test, strict-Clippy,
+shared-admission and supervision outputs at the same immutable source.

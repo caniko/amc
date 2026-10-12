@@ -1,0 +1,328 @@
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -76,6 +76,7 @@
+ #include <linux/printk.h>
+ #include <linux/cache.h>
+ #include <linux/cgroup.h>
++#include <linux/memcontrol.h>
+ #include <linux/cpuset.h>
+ #include <linux/audit.h>
+ #include <linux/poll.h>
+@@ -978,6 +979,69 @@
+ 	.fop_flags	= FOP_UNSIGNED_OFFSET,
+ };
+ 
++#ifdef CONFIG_MEMCG
++/* Root-only, read-only proc-mem descriptor with an FD-owned memcg guard. */
++static int amc_mem_open(struct inode *inode, struct file *file)
++{
++	struct task_struct *task;
++	struct mm_struct *mm;
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = mem_open(inode, file);
++	if (ret)
++		return ret;
++	mm = file->private_data;
++	ret = -ESRCH;
++	if (!mm)
++		return ret;
++	if (!mmget_not_zero(mm))
++		goto out_drop;
++	task = get_proc_task(inode);
++	if (task) {
++		ret = mem_cgroup_amc_pin(mm, task);
++		put_task_struct(task);
++	}
++	mmput(mm);
++	if (!ret)
++		return 0;
++out_drop:
++	mmdrop(mm);
++	file->private_data = NULL;
++	return ret;
++}
++
++static int amc_mem_release(struct inode *inode, struct file *file)
++{
++	mem_cgroup_amc_unpin(file->private_data);
++	return mem_release(inode, file);
++}
++
++static void amc_mem_fdinfo(struct seq_file *seq, struct file *file)
++{
++	struct mm_struct *mm = file->private_data;
++	struct mem_cgroup *memcg;
++
++	cgroup_lock();
++	memcg = rcu_dereference_protected(mm->amc_recovery_memcg,
++					lockdep_is_held(&cgroup_mutex));
++	seq_printf(seq, "amc_guard_version:\t1\namc_guard_cookie:\t%llu\n"
++		   "amc_guard_memcg_ino:\t%lu\n", mm->amc_recovery_cookie,
++		   (unsigned long)cgroup_ino(memcg->css.cgroup));
++	cgroup_unlock();
++}
++
++static const struct file_operations proc_amc_mem_operations = {
++	.llseek		= mem_lseek,
++	.read		= mem_read,
++	.open		= amc_mem_open,
++	.release	= amc_mem_release,
++	.show_fdinfo	= amc_mem_fdinfo,
++	.fop_flags	= FOP_UNSIGNED_OFFSET,
++};
++#endif
++
+ static int environ_open(struct inode *inode, struct file *file)
+ {
+ 	return __mem_open(inode, file, PTRACE_MODE_READ);
+@@ -3327,6 +3391,9 @@
+ 	REG("numa_maps",  S_IRUGO, proc_pid_numa_maps_operations),
+ #endif
+ 	REG("mem",        S_IRUSR|S_IWUSR, proc_mem_operations),
++#ifdef CONFIG_MEMCG
++	REG("amc_mem", S_IRUSR, proc_amc_mem_operations),
++#endif
+ 	LNK("cwd",        proc_cwd_link),
+ 	LNK("root",       proc_root_link),
+ 	LNK("exe",        proc_exe_link),
+@@ -3674,6 +3741,9 @@
+ 	REG("numa_maps", S_IRUGO, proc_pid_numa_maps_operations),
+ #endif
+ 	REG("mem",       S_IRUSR|S_IWUSR, proc_mem_operations),
++#ifdef CONFIG_MEMCG
++	REG("amc_mem", S_IRUSR, proc_amc_mem_operations),
++#endif
+ 	LNK("cwd",       proc_cwd_link),
+ 	LNK("root",      proc_root_link),
+ 	LNK("exe",       proc_exe_link),
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -933,6 +933,12 @@
+ 	}
+ 
+ 	rcu_read_lock();
++	memcg = rcu_dereference(mm->amc_recovery_memcg);
++	if (memcg) {
++		css_get(&memcg->css);
++		rcu_read_unlock();
++		return memcg;
++	}
+ 	do {
+ 		memcg = mem_cgroup_from_task(rcu_dereference(mm->owner));
+ 		if (unlikely(!memcg))
+@@ -942,6 +948,98 @@
+ 	return memcg;
+ }
+ EXPORT_SYMBOL(get_mem_cgroup_from_mm);
++
++/*
++ * Guard the exact mm served by /proc/PID/amc_mem, before admission. Pin its
++ * target memcg and ancestry against removal/controller reconfiguration, and
++ * serialize acquisition with cgroup migration. The fallback cannot follow a
++ * dying mm owner to an already-existing CLONE_VM peer in another memcg.
++ */
++int mem_cgroup_amc_pin(struct mm_struct *mm, struct task_struct *task)
++{
++	static atomic64_t next_cookie = ATOMIC64_INIT(0);
++	struct mem_cgroup *memcg, *pinned;
++	struct cgroup *cgrp;
++	int ret = -ESRCH;
++
++	if (mem_cgroup_disabled())
++		return -EOPNOTSUPP;
++	cgroup_lock();
++	task_lock(task);
++	if (task->mm != mm)
++		goto out;
++	memcg = mem_cgroup_from_task(task);
++	if (!memcg || !cgroup_subsys_on_dfl(memory_cgrp_subsys)) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	pinned = rcu_dereference_protected(mm->amc_recovery_memcg,
++					   lockdep_is_held(&cgroup_mutex));
++	if (pinned && pinned != memcg) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (mm->amc_recovery_refs == UINT_MAX) {
++		ret = -EOVERFLOW;
++		goto out;
++	}
++	if (!pinned) {
++		for (cgrp = memcg->css.cgroup; cgrp; cgrp = cgroup_parent(cgrp)) {
++			if (cgrp->amc_recovery_pins == UINT_MAX) {
++				ret = -EOVERFLOW;
++				goto out;
++			}
++		}
++		if (!css_tryget_online(&memcg->css))
++			goto out;
++		for (cgrp = memcg->css.cgroup; cgrp; cgrp = cgroup_parent(cgrp))
++			cgrp->amc_recovery_pins++;
++		mm->amc_recovery_cookie = atomic64_inc_return(&next_cookie);
++		rcu_assign_pointer(mm->amc_recovery_memcg, memcg);
++	}
++	mm->amc_recovery_refs++;
++	ret = 0;
++out:
++	task_unlock(task);
++	cgroup_unlock();
++	return ret;
++}
++
++void mem_cgroup_amc_unpin(struct mm_struct *mm)
++{
++	struct mem_cgroup *memcg = NULL;
++	struct cgroup *cgrp;
++
++	cgroup_lock();
++	if (!--mm->amc_recovery_refs) {
++		memcg = rcu_dereference_protected(mm->amc_recovery_memcg,
++						lockdep_is_held(&cgroup_mutex));
++		rcu_assign_pointer(mm->amc_recovery_memcg, NULL);
++		for (cgrp = memcg->css.cgroup; cgrp; cgrp = cgroup_parent(cgrp))
++			cgrp->amc_recovery_pins--;
++	}
++	cgroup_unlock();
++	if (memcg) {
++		synchronize_rcu();
++		css_put(&memcg->css);
++	}
++}
++
++static int mem_cgroup_amc_can_attach(struct cgroup_taskset *tset)
++{
++	struct task_struct *task;
++	struct cgroup_subsys_state *css;
++	bool guarded;
++
++	cgroup_taskset_for_each(task, css, tset) {
++		task_lock(task);
++		guarded = task->mm && task->mm->amc_recovery_refs;
++		task_unlock(task);
++		if (guarded)
++			return -EBUSY;
++	}
++	return 0;
++}
+ 
+ /**
+  * get_mem_cgroup_from_current - Obtain a reference on current task's memcg.
+@@ -4669,6 +4767,7 @@
+ 	.css_free = mem_cgroup_css_free,
+ 	.css_reset = mem_cgroup_css_reset,
+ 	.css_rstat_flush = mem_cgroup_css_rstat_flush,
++	.can_attach = mem_cgroup_amc_can_attach,
+ 	.attach = mem_cgroup_attach,
+ 	.fork = mem_cgroup_fork,
+ 	.exit = mem_cgroup_exit,
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1053,6 +1053,11 @@
+ 	mm_init_cpumask(mm);
+ 	mm_init_aio(mm);
+ 	mm_init_owner(mm, p);
++#ifdef CONFIG_MEMCG
++	RCU_INIT_POINTER(mm->amc_recovery_memcg, NULL);
++	mm->amc_recovery_refs = 0;
++	mm->amc_recovery_cookie = 0;
++#endif
+ 	mm_pasid_init(mm);
+ 	RCU_INIT_POINTER(mm->exe_file, NULL);
+ 	mmu_notifier_subscriptions_init(mm);
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -1146 +1146,5 @@
+-		struct task_struct __rcu *owner;
++		struct task_struct __rcu *owner;
++		/* FD-owned AMC recovery guard; writers hold cgroup_mutex. */
++		struct mem_cgroup __rcu *amc_recovery_memcg;
++		unsigned int amc_recovery_refs;
++		u64 amc_recovery_cookie;
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -746,6 +746,8 @@
+ struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);
+ 
+ struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
++int mem_cgroup_amc_pin(struct mm_struct *mm, struct task_struct *task);
++void mem_cgroup_amc_unpin(struct mm_struct *mm);
+ 
+ struct mem_cgroup *get_mem_cgroup_from_current(void);
+ 
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -518,6 +518,9 @@
+ 
+ 	int nr_threaded_children;	/* # of live threaded child cgroups */
+ 
++	/* Recovery guards in this subtree, protected by cgroup_mutex. */
++	unsigned int amc_recovery_pins;
++
+ 	/* sequence number for cgroup.kill, serialized by css_set_lock. */
+ 	unsigned int kill_seq;
+ 
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -1861,6 +1861,9 @@
+ 	lockdep_assert_held(&cgroup_mutex);
+ 
+ 	do_each_subsys_mask(ss, ssid, ss_mask) {
++		if (ss->root->cgrp.amc_recovery_pins)
++			return -EBUSY;
++
+ 		/*
+ 		 * If @ss has non-root csses attached to it, can't move.
+ 		 * If @ss is an implicit controller, it is exempt from this
+@@ -3616,6 +3619,11 @@
+ 	}
+ 
++	if (cgrp->amc_recovery_pins) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++
+ 	ret = cgroup_vet_subtree_control_enable(cgrp, enable);
+ 	if (ret)
+ 		goto out_unlock;
+ 
+@@ -3724,7 +3729,7 @@
+ 		return -ENOENT;
+ 
+ 	/* threaded can only be enabled */
+-	ret = cgroup_enable_threaded(cgrp);
++	ret = cgrp->amc_recovery_pins ? -EBUSY : cgroup_enable_threaded(cgrp);
+ 
+ 	cgroup_kn_unlock(of->kn);
+ 	return ret ?: nbytes;
+@@ -6200,6 +6205,9 @@
+ 	 * ->self.children as dead children linger on it while being
+ 	 * drained; otherwise, "rmdir parent/child parent" may fail.
+ 	 */
++	if (cgrp->amc_recovery_pins)
++		return -EBUSY;
++
+ 	if (css_has_online_children(&cgrp->self))
+ 		return -EBUSY;
+ 
+@@ -6863,6 +6871,16 @@
+ 	if (ret)
+ 		return ret;
+ 
++#ifdef CONFIG_MEMCG
++	/* CLONE_VM must not bypass the migration barrier via clone3(). */
++	if ((kargs->flags & (CLONE_INTO_CGROUP | CLONE_VM)) ==
++	    (CLONE_INTO_CGROUP | CLONE_VM) && child->mm &&
++	    child->mm->amc_recovery_refs) {
++		cgroup_css_set_put_fork(kargs);
++		return -EBUSY;
++	}
++#endif
++
+ 	do_each_subsys_mask(ss, i, have_canfork_callback) {
+ 		ret = ss->can_fork(child, kargs->cset);
+ 		if (ret)

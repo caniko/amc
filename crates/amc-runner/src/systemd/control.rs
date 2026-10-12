@@ -43,12 +43,16 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
         }
         let (reader, writer) = UnixStream::pair()?;
         reader.set_nonblocking(true)?;
-        match command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(writer)))
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        let spawned = {
+            #[cfg(test)]
+            let _guard = crate::test_support::executable_fixture_guard();
+            command.spawn()
+        };
+        match spawned {
             Ok(child) => break (reader, child),
             Err(_) if attempts < 20 => {
                 attempts += 1;

@@ -207,7 +207,15 @@ fn handle(
         ..Response::default()
     };
     match request.message {
-        Message::Enqueue { contract, wait_ms } => {
+        Message::Enqueue {
+            ref contract,
+            wait_ms,
+        }
+        | Message::EnqueueSized {
+            ref contract,
+            wait_ms,
+            ..
+        } => {
             ensure!(
                 (1..=3_600_000).contains(&wait_ms),
                 "admission wait must be 1ms..1h"
@@ -215,11 +223,20 @@ fn handle(
             let id = fresh_id()?;
             let client = client_identity(pid)?;
             let key = fresh_id()?;
-            ledger.enqueue(
+            ensure!(
+                host_socket.is_some() || !policy.contracts.get(contract).is_some_and(|c| c.burst),
+                "burst execution requires the shared host broker"
+            );
+            let memory_max = match request.message {
+                Message::EnqueueSized { memory_max, .. } => Some(memory_max),
+                _ => None,
+            };
+            ledger.enqueue_sized(
                 id.clone(),
-                &contract,
+                contract,
                 policy,
                 now_ms()?.saturating_add(wait_ms).saturating_add(30_000),
+                memory_max,
             )?;
             ledger.set_client(&id, client)?;
             observations.entry_keys.insert(id.clone(), key.clone());

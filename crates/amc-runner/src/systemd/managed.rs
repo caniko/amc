@@ -406,6 +406,7 @@ mod tests {
     }
 
     fn script(path: &std::path::Path, text: &str) {
+        let _guard = crate::test_support::executable_fixture_guard();
         fs::write(path, format!("#!{}\n{text}\n", shell().display())).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }

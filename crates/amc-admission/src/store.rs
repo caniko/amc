@@ -87,6 +87,15 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn open_discovery(
+        directory: &Path,
+        boot_id: &str,
+    ) -> Result<(Self, crate::page_discovery::Discovery)> {
+        Self::open_snapshot(directory, boot_id)
+    }
+    pub fn save_discovery(&self, discovery: &crate::page_discovery::Discovery) -> Result<()> {
+        self.save_snapshot(discovery)
+    }
     pub fn open(directory: &Path, boot_id: &str) -> Result<(Self, Ledger)> {
         Self::open_snapshot(directory, boot_id)
     }
@@ -218,6 +227,10 @@ mod host_tests {
                 pid: 123,
                 start_ticks: 5,
             }],
+            burst: false,
+            runtime_max_ms: None,
+            continuation: None,
+            owners_finished: false,
         });
         store.save_snapshot(&ledger).unwrap();
         assert!(Store::open_snapshot::<HostLedger>(&path, boot).is_err());

@@ -17,6 +17,8 @@ fn running_ledger() -> Ledger {
             memory_swap_max: 0,
             max_running: 1,
             pause_file: None,
+            burst: false,
+            runtime_max_sec: None,
         },
         phase: Phase::Running,
         deadline_ms: 0,

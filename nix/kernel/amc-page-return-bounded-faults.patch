@@ -1,0 +1,103 @@
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -1149,6 +1149,8 @@
+ 		struct mem_cgroup __rcu *amc_recovery_memcg;
+ 		unsigned int amc_recovery_refs;
+ 		u64 amc_recovery_cookie;
++		atomic64_t amc_swapin_direct_pages;
++		atomic64_t amc_swapin_cache_pages;
+ #endif
+ 		struct user_namespace *user_ns;
+ 
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1058,6 +1058,8 @@
+ 	RCU_INIT_POINTER(mm->amc_recovery_memcg, NULL);
+ 	mm->amc_recovery_refs = 0;
+ 	mm->amc_recovery_cookie = 0;
++	atomic64_set(&mm->amc_swapin_direct_pages, 0);
++	atomic64_set(&mm->amc_swapin_cache_pages, 0);
+ #endif
+ 	mm_pasid_init(mm);
+ 	RCU_INIT_POINTER(mm->exe_file, NULL);
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -748,6 +748,11 @@
+ struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
+ int mem_cgroup_amc_pin(struct mm_struct *mm, struct task_struct *task);
+ void mem_cgroup_amc_unpin(struct mm_struct *mm);
++static inline bool mem_cgroup_amc_guarded(struct mm_struct *mm)
++{
++	return mm && rcu_access_pointer(mm->amc_recovery_memcg);
++}
++
+ 
+ struct mem_cgroup *get_mem_cgroup_from_current(void);
+ 
+@@ -1235,6 +1240,11 @@
+ 	return NULL;
+ }
+ 
++static inline bool mem_cgroup_amc_guarded(struct mm_struct *mm)
++{
++	return false;
++}
++
+ static inline struct mem_cgroup *get_mem_cgroup_from_current(void)
+ {
+ 	return NULL;
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4898,6 +4898,13 @@
+ 
+ 	ret = charge_memcg(folio, memcg, gfp);
+ 
++	if (!ret && mem_cgroup_amc_guarded(mm ?: current->mm)) {
++		struct mm_struct *guard_mm = mm ?: current->mm;
++
++		atomic64_add(folio_nr_pages(folio), mm ?
++			&guard_mm->amc_swapin_direct_pages :
++			&guard_mm->amc_swapin_cache_pages);
++	}
+ 	css_put(&memcg->css);
+ 	return ret;
+ }
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -1028,5 +1028,9 @@
+ 		   "amc_guard_memcg_ino:\t%lu\n", mm->amc_recovery_cookie,
+ 		   (unsigned long)cgroup_ino(memcg->css.cgroup));
++	seq_printf(seq, "amc_swapin_direct_pages:\t%lld\n"
++		   "amc_swapin_cache_pages:\t%lld\n",
++		   atomic64_read(&mm->amc_swapin_direct_pages),
++		   atomic64_read(&mm->amc_swapin_cache_pages));
+ 	cgroup_unlock();
+ }
+ 
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4510,6 +4510,10 @@
+ 	gfp_t gfp;
+ 	int order;
+ 
++	/* Admission backs exact pages, never a larger speculative folio. */
++	if (mem_cgroup_amc_guarded(vma->vm_mm))
++		goto fallback;
++
+ 	/*
+ 	 * If uffd is active for the vma we need per-page fault fidelity to
+ 	 * maintain the uffd semantics.
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -819,6 +819,11 @@
+ 	pgoff_t ilx;
+ 	struct folio *folio;
+ 
++	/* The guarded recovery batch has no escrow for read-ahead pages. */
++	if (mem_cgroup_amc_guarded(vmf->vma->vm_mm))
++		return read_swap_cache_async(entry, gfp_mask, vmf->vma,
++					     vmf->address, NULL);
++
+ 	mpol = get_vma_policy(vmf->vma, vmf->address, 0, &ilx);
+ 	folio = swap_use_vma_readahead() ?
+ 		swap_vma_readahead(entry, gfp_mask, mpol, ilx, vmf) :

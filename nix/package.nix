@@ -4,6 +4,7 @@
   python3,
   rustPlatform,
   systemd,
+  util-linux,
 }:
 rustPlatform.buildRustPackage {
   pname = "amc";
@@ -35,6 +36,14 @@ rustPlatform.buildRustPackage {
   cargoTestFlags = ["-p" "amc"];
 
   strictDeps = true;
+  passthru.nativeExecVersion = 1;
+  passthru.admissionSizingVersion = 1;
+  passthru.admissionPreparationVersion = 2;
+  passthru.admissionContinuationEnvelopesVersion = 1;
+  passthru.admissionNamespaceRunnerVersion = 2;
+  passthru.swapReturnReservationVersion = 2;
+  passthru.swapRestorationManifestVersion = 1;
+  passthru.pageReturnKernelGuardVersion = 1;
   nativeBuildInputs = [makeWrapper python3];
   postInstall = ''
     mkdir -p $out/share/amc/examples
@@ -42,7 +51,7 @@ rustPlatform.buildRustPackage {
     cp examples/admission.json $out/share/amc/examples/
   '';
   postFixup = ''
-    wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3 systemd]}
+    wrapProgram "$out/bin/amc" --prefix PATH : ${lib.makeBinPath [python3 systemd util-linux]}
   '';
 
   meta = {
