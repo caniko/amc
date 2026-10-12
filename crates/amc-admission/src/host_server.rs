@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod transport;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -326,6 +328,7 @@ pub fn serve_supervised(
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
     let mut burst_manager = crate::burst_manager::Cache::default();
+    let mut connections = transport::Connections::default();
     while !stopping() {
         burst_manager.refresh(&ledger)?;
         let burst_evidence = burst_manager.snapshot();
@@ -358,61 +361,34 @@ pub fn serve_supervised(
         }
         if let Some(task) = take_finished_inventory(&mut inventory) {
             let before = serde_json::to_vec(&ledger)?;
-            let mut stream = task.stream;
+            let stream = task.stream;
             let result = task
                 .worker
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("native inventory worker failed")))
-                .and_then(|(mut reply, _native_demand, completed)| {
-                    if reply.granted {
-                        // Results authorize only one replay of the same authenticated
-                        // request. Never replace the current ledger with a scan clone.
-                        if !inventory_current(
-                            &task.owner,
-                            &task.backing,
-                            completed,
-                            &stream,
-                            &ledger,
-                            &policy,
-                        )? {
-                            reply.granted = false;
-                            reply.recovery = None;
-                            reply.waiting = Some(WaitReason::Unknown);
-                        } else {
-                            reply = ledger.transaction(|ledger| {
-                                let mut fresh = Response {
-                                    version: 1,
-                                    ..Default::default()
-                                };
-                                handle_advance_request(
-                                    task.request,
-                                    task.owner.pid,
-                                    0,
-                                    &policy,
-                                    ledger,
-                                    (health_file, Some(true), &burst_evidence),
-                                    &mut fresh,
-                                )?;
-                                if fresh.granted {
-                                    ensure!(
-                                        completed.elapsed() <= Duration::from_secs(1)
-                                            && host_native::owner_alive(&task.owner) == Some(true)
-                                            && inventory_peer_connected(&stream),
-                                        "native recovery replay expired before persistence"
-                                    );
-                                    ensure!(
-                                        inventory_recovery_matches(
-                                            &fresh.recovery,
-                                            &reply.recovery
-                                        )?,
-                                        "recovery identity or demand changed during inventory"
-                                    );
-                                }
-                                Ok(fresh)
-                            })?;
-                        }
+                .and_then(|(reply, _native_demand, completed)| {
+                    InventoryReplay {
+                        owner: &task.owner,
+                        backing: &task.backing,
+                        completed,
+                        stream: &stream,
                     }
-                    Ok(reply)
+                    .apply(&mut ledger, &policy, reply, |ledger| {
+                        let mut fresh = Response {
+                            version: 1,
+                            ..Default::default()
+                        };
+                        handle_advance_request(
+                            task.request,
+                            task.owner.pid,
+                            0,
+                            &policy,
+                            ledger,
+                            (health_file, Some(true), &burst_evidence),
+                            &mut fresh,
+                        )?;
+                        Ok(fresh)
+                    })
                 });
             if before != serde_json::to_vec(&ledger)? {
                 store.save_snapshot(&ledger)?;
@@ -422,16 +398,14 @@ pub fn serve_supervised(
                 error: Some(e.to_string()),
                 ..Default::default()
             });
-            let _ = write_frame(&mut stream, &reply);
+            let _ = connections.respond(stream, 0, &reply);
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_millis(250)))?;
-                stream.set_write_timeout(Some(Duration::from_millis(250)))?;
-                let credentials = getsockopt(&stream, PeerCredentials)?;
-                let Ok(request) = read_frame::<Request>(&mut stream) else {
-                    continue;
-                };
+        match connections.next(&listener)? {
+            Some(transport::Incoming {
+                stream,
+                credentials,
+                request,
+            }) => {
                 if credentials.uid() == 0
                     && matches!(
                         &request,
@@ -439,8 +413,9 @@ pub fn serve_supervised(
                     )
                 {
                     if inventory.is_some() {
-                        let _ = write_frame(
-                            &mut stream,
+                        let _ = connections.respond(
+                            stream,
+                            credentials.uid(),
                             &Response {
                                 version: 1,
                                 waiting: Some(WaitReason::Recovery),
@@ -459,8 +434,9 @@ pub fn serve_supervised(
                         ) {
                             Ok(task) => inventory = Some(task),
                             Err(e) => {
-                                let _ = write_frame(
-                                    &mut stream,
+                                let _ = connections.respond(
+                                    stream,
+                                    credentials.uid(),
                                     &Response {
                                         version: 1,
                                         error: Some(e.to_string()),
@@ -732,12 +708,13 @@ pub fn serve_supervised(
                     error: Some(e.to_string()),
                     ..Default::default()
                 });
-                let _ = write_frame(&mut stream, &reply);
+                let _ = connections.respond(stream, credentials.uid(), &reply);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20))
+            None => {
+                if !connections.progress() {
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
-            Err(e) => return Err(e.into()),
         }
     }
     fs::remove_file(socket)?;
@@ -784,6 +761,64 @@ fn inventory_current(
         && host_native::owner_alive(owner) == Some(true)
         && inventory_peer_connected(stream)
         && inventory_backing(ledger, policy)? == backing)
+}
+
+struct InventoryReplay<'a> {
+    owner: &'a crate::ledger::ClientIdentity,
+    backing: &'a [u8],
+    completed: Instant,
+    stream: &'a UnixStream,
+}
+
+// A result must reach the loop within one second. Its authenticated replay may
+// additionally spend the shared, bounded query budget validating the recovery
+// unit with systemd. Identity, demand and peer checks still apply at commit.
+const INVENTORY_REPLAY_MAX_AGE: Duration =
+    Duration::from_secs(1).saturating_add(amc_runner::systemd::QUERY_TIMEOUT);
+
+impl InventoryReplay<'_> {
+    fn apply(
+        self,
+        ledger: &mut HostLedger,
+        policy: &HostPolicy,
+        mut scanned: Response,
+        replay: impl FnOnce(&mut HostLedger) -> Result<Response>,
+    ) -> Result<Response> {
+        if !scanned.granted {
+            return Ok(scanned);
+        }
+        // Results authorize one replay of the same authenticated request, never
+        // replacement of the current ledger with the worker's scan clone.
+        if !inventory_current(
+            self.owner,
+            self.backing,
+            self.completed,
+            self.stream,
+            ledger,
+            policy,
+        )? {
+            scanned.granted = false;
+            scanned.recovery = None;
+            scanned.waiting = Some(WaitReason::Unknown);
+            return Ok(scanned);
+        }
+        ledger.transaction(|ledger| {
+            let fresh = replay(ledger)?;
+            if fresh.granted {
+                ensure!(
+                    self.completed.elapsed() <= INVENTORY_REPLAY_MAX_AGE
+                        && host_native::owner_alive(self.owner) == Some(true)
+                        && inventory_peer_connected(self.stream),
+                    "native recovery replay expired before persistence"
+                );
+                ensure!(
+                    inventory_recovery_matches(&fresh.recovery, &scanned.recovery)?,
+                    "recovery identity or demand changed during inventory"
+                );
+            }
+            Ok(fresh)
+        })
+    }
 }
 
 fn inventory_recovery_matches(
@@ -2028,6 +2063,61 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn inventory_replay_allows_a_successful_bounded_manager_validation() {
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":1073741824,"reserve_bytes":10,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "domains":[{"name":"builders","uid":0,"cgroup":"/builders","ceiling_bytes":20,"swap_bytes":0,"fair_share_bytes":20}]
+        })).unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        let backing = inventory_backing(&ledger, &policy).unwrap();
+        let (_client, stream) = UnixStream::pair().unwrap();
+        let pid = std::process::id() as i32;
+        let owner = crate::ledger::ClientIdentity {
+            pid,
+            start_ticks: host_native::process_start(pid).unwrap(),
+        };
+        let lease: crate::recovery::RecoveryLease = serde_json::from_value(serde_json::json!({
+            "identity":{"cgroup":"/system.slice/amc-recovery.service","inode":1,"uid":0,"pid":pid,"start_ticks":owner.start_ticks},
+            "invocation_id":"11111111111111111111111111111111",
+            "action":{"kind":"pages","target":{"cgroup":"/target","inode":2,"uid":0,"pid":43,"start_ticks":8},
+                "address":4096,"bytes":4096,"before_swap_bytes":8192,"before_return_bytes":8192,"settled":false,
+                "guards":{"target":{"cookie":10,"inode":2},"helper":{"cookie":11,"inode":1}}},
+            "return_bytes":4096,"helper_bytes":1024
+        })).unwrap();
+        let scanned = Response {
+            version: 1,
+            granted: true,
+            recovery: Some(lease.clone()),
+            ..Default::default()
+        };
+        let result = InventoryReplay {
+            owner: &owner,
+            backing: &backing,
+            completed: Instant::now(),
+            stream: &stream,
+        }
+        .apply(&mut ledger, &policy, scanned, |candidate| {
+            // Successful systemd queries are allowed two seconds. Keep the
+            // exact batch/identity and emulate a healthy 1.1-second query.
+            thread::sleep(Duration::from_millis(1100));
+            candidate.recovery = Some(lease.clone());
+            Ok(Response {
+                version: 1,
+                granted: true,
+                recovery: Some(lease.clone()),
+                ..Default::default()
+            })
+        });
+        assert!(
+            result.is_ok(),
+            "a healthy bounded manager query expired the fresh replay: {result:?}"
+        );
+        assert!(result.unwrap().granted);
+        assert!(inventory_recovery_matches(&ledger.recovery, &Some(lease)).unwrap());
     }
 
     #[test]
