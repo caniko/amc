@@ -1,4 +1,4 @@
-//! Bounded reads through an mm-bound /proc/<pid>/amc_mem descriptor fault actual
+//! Bounded reads through an mm-bound `/proc/<pid>/amc_mem` descriptor fault actual
 //! pages in. No advice-success assumption, process writes, signals, or payload
 //! contents in diagnostics. Native PTEs prove each batch's residency; swap cache
 //! and occupied slots remain separate from outstanding RAM-return demand.

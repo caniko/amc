@@ -87,6 +87,22 @@ pub enum Outcome {
     },
 }
 
+/// Diagnostic reason for a refused startup release. This does not establish
+/// workload termination or authorize replay or release of a reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupFailure {
+    /// The manager's invocation or enrolled cgroup no longer matches the pin.
+    ManagerIdentityChanged,
+    /// The pinned native domain's identity or population could not be observed.
+    NativeDomainUnobservable,
+    /// The authenticated startup socket release failed; detail is bounded.
+    Handshake {
+        /// At most 1024 characters from the underlying error chain.
+        detail: String,
+    },
+}
+
 impl Outcome {
     /// Whether releasing a workload reservation is justified by this outcome.
     pub fn releases_reservation(self) -> bool {
@@ -287,14 +303,20 @@ impl ObservedDomain {
         barrier: &StartupBarrier,
         main_pid: u32,
         group: &str,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, StartupFailure> {
         match self.empty() {
-            Some(false) => barrier.release(main_pid, group),
+            Some(false) => {
+                barrier
+                    .release(main_pid, group)
+                    .map_err(|error| StartupFailure::Handshake {
+                        detail: format!("{error:#}").chars().take(1024).collect(),
+                    })
+            }
             // Manager startup properties can precede visible native attachment.
             // Leave the connection queued until population is positively known;
             // execute's startup deadline and cancellation still bound this wait.
             Some(true) => Ok(false),
-            None => anyhow::bail!("startup domain identity or population is unknown"),
+            None => Err(StartupFailure::NativeDomainUnobservable),
         }
     }
 }
@@ -430,6 +452,7 @@ pub struct ClientRecord {
     settled: std::cell::Cell<bool>,
     startup: Option<StartupBarrier>,
     manager_session_uid: Option<u32>,
+    startup_failure: std::cell::RefCell<Option<StartupFailure>>,
 }
 
 impl ClientRecord {
@@ -462,6 +485,31 @@ impl ClientRecord {
     /// Whether the client is confirmed reaped or exited.
     pub fn settled(&self) -> bool {
         self.settled.get()
+    }
+
+    /// Retained startup refusal for caller-owned diagnostics. This is not
+    /// cleanup evidence and does not change the execution outcome or authority.
+    pub fn startup_failure(&self) -> Option<StartupFailure> {
+        self.startup_failure.borrow().clone()
+    }
+
+    fn release_startup(
+        &self,
+        barrier: &StartupBarrier,
+        domain: &ObservedDomain,
+        main_pid: u32,
+        group: &str,
+        identity_matches: bool,
+    ) -> Result<bool, StartupFailure> {
+        let release = if identity_matches {
+            domain.release_startup(barrier, main_pid, group)
+        } else {
+            Err(StartupFailure::ManagerIdentityChanged)
+        };
+        if let Err(failure) = &release {
+            self.startup_failure.replace(Some(failure.clone()));
+        }
+        release
     }
 
     pub(crate) fn mark_submitted(&self) {
@@ -699,14 +747,14 @@ pub fn execute(
                     let identity_matches = !state.stopped
                         && state.invocation.as_ref() == Some(invocation)
                         && domain.matches(Some(group));
-                    match identity_matches.then(|| domain.release_startup(barrier, main_pid, group))
+                    match record.release_startup(barrier, domain, main_pid, group, identity_matches)
                     {
-                        Some(Ok(true)) => {
+                        Ok(true) => {
                             startup_released = true;
                             started = true;
                         }
-                        Some(Ok(false)) => {}
-                        _ => {
+                        Ok(false) => {}
+                        Err(_) => {
                             record.mark_settled(reap_client(&mut child));
                             return Outcome::Unknown {
                                 exit_code: 1,
@@ -1172,6 +1220,71 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
             error.kind(),
             ErrorKind::WouldBlock | ErrorKind::TimedOut
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_refusal_retains_native_reason_without_settlement_authority() {
+        use std::os::{
+            linux::net::SocketAddrExt,
+            unix::net::{SocketAddr, UnixStream},
+        };
+
+        let root = crate::test_support::scratch_dir("amc-startup-refusal");
+        let group = root.join("job.service");
+        fs::create_dir(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 0\n").unwrap();
+        let domain = ObservedDomain::capture(&group).unwrap();
+        let barrier =
+            StartupBarrier::new(format!("amc-start-refusal-{}", std::process::id())).unwrap();
+        let record = ClientRecord::default();
+        let pid = std::process::id();
+        let placement = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let native_group = placement
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        assert!(
+            !record
+                .release_startup(&barrier, &domain, pid, native_group, true)
+                .unwrap()
+        );
+        assert_eq!(record.startup_failure(), None);
+
+        assert_eq!(
+            record.release_startup(&barrier, &domain, pid, native_group, false),
+            Err(StartupFailure::ManagerIdentityChanged)
+        );
+        assert_eq!(
+            record.startup_failure(),
+            Some(StartupFailure::ManagerIdentityChanged)
+        );
+
+        fs::remove_file(group.join("cgroup.events")).unwrap();
+        assert_eq!(
+            record.release_startup(&barrier, &domain, pid, native_group, true),
+            Err(StartupFailure::NativeDomainUnobservable)
+        );
+        assert_eq!(
+            record.startup_failure(),
+            Some(StartupFailure::NativeDomainUnobservable)
+        );
+
+        fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        let helper =
+            UnixStream::connect_addr(&SocketAddr::from_abstract_name(barrier.name()).unwrap())
+                .unwrap();
+        drop(helper);
+        assert!(matches!(
+            record.release_startup(&barrier, &domain, pid, native_group, true),
+            Err(StartupFailure::Handshake { .. })
+        ));
+        let Some(StartupFailure::Handshake { detail }) = record.startup_failure() else {
+            panic!("disconnected native helper must retain its socket error");
+        };
+        assert!(!detail.is_empty() && detail.chars().count() <= 1024);
+        assert!(detail.contains("Broken pipe"), "{detail}");
+        assert!(!record.submitted() && !record.settled());
         fs::remove_dir_all(root).unwrap();
     }
 

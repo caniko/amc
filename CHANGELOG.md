@@ -32,6 +32,10 @@
 
 ### Fixed
 
+- Preserve bounded native startup refusal reasons in host-runner errors,
+  distinguishing manager/cgroup identity loss from a socket-handshake failure.
+  The retained diagnostic does not change unknown cleanup or admission authority.
+
 - Retain host admission and preparation client/helper journals when concurrent
   helper qualification times out, preserving the original phase assertions.
 - Bind whole-device swap recovery to one broker-approved native object and retain
