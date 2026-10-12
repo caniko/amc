@@ -87,11 +87,7 @@ fn prepare_ready(
         || signals.cancelled().is_some(),
     )?;
     if let Some(p) = &reply.preparation {
-        deadline = Instant::now()
-            + Duration::from_millis(
-                p.expires_ms
-                    .saturating_sub(amc_admission::clock::boot_ms()?),
-            );
+        deadline = polling_deadline(p, amc_admission::clock::boot_ms()?, Instant::now())?;
     }
     let mut previous = None;
     while !reply.granted {
@@ -115,6 +111,27 @@ fn prepare_ready(
     }
     ensure!(signals.cancelled().is_none(), "preparation cancelled");
     Ok(reply)
+}
+
+fn polling_deadline(
+    preparation: &amc_admission::preparation::Preparation,
+    boot_ms: u64,
+    now: Instant,
+) -> Result<Instant> {
+    // Draining can become Ready between polls and replace its original expiry.
+    // Keep that last transition observable; every poll still asks the broker to
+    // validate the persisted phase, policy and expiry before granting authority.
+    let expires_ms = if preparation.phase == amc_admission::preparation::PreparationPhase::Draining
+    {
+        preparation
+            .expires_ms
+            .checked_add(preparation.ready_ms)
+            .context("preparation polling expiry overflow")?
+    } else {
+        preparation.expires_ms
+    };
+    now.checked_add(Duration::from_millis(expires_ms.saturating_sub(boot_ms)))
+        .context("preparation polling deadline overflow")
 }
 
 pub fn enter(args: EnterArgs) -> Result<i32> {
@@ -192,6 +209,30 @@ fn payload_environment(value: &str) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn polling_deadline_includes_the_broker_ready_extension() {
+        let mut preparation: amc_admission::preparation::Preparation = serde_json::from_value(serde_json::json!({
+            "id":"intent","key":"key","uid":1000,"profile":"game","domain":"game",
+            "memory_bytes":64,"swap_bytes":0,"requested_ms":0,"expires_ms":10000,
+            "wait_ms":10000,"ready_ms":15000,"phase":"draining","drain_domains":[],"drain":[],"waiting":"draining"
+        })).unwrap();
+        let now = Instant::now();
+        let deadline = polling_deadline(&preparation, 9990, now).unwrap();
+        assert!(
+            deadline > now + Duration::from_millis(250),
+            "a Ready transition in the final polling interval must remain observable"
+        );
+        assert_eq!(deadline, now + Duration::from_millis(15010));
+        preparation.phase = amc_admission::preparation::PreparationPhase::Ready;
+        assert_eq!(
+            polling_deadline(&preparation, 9990, now).unwrap(),
+            now + Duration::from_millis(10)
+        );
+        preparation.phase = amc_admission::preparation::PreparationPhase::Draining;
+        preparation.expires_ms = u64::MAX;
+        assert!(polling_deadline(&preparation, 9990, now).is_err());
+    }
+
     #[test]
     fn helper_registration_uses_the_host_runtime_bus_without_forwarding_payload() {
         let args = PrepareArgs {
