@@ -148,6 +148,22 @@ pub struct Device {
     pub priority: i32,
 }
 
+/// Pin a swap file or block alias without opening device I/O. Callers retain
+/// this descriptor across admission and all deactivation/restoration syscalls.
+pub fn open_target(target: &RecoveryTarget) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    ensure!(
+        (0..=32767).contains(&target.priority),
+        "invalid swap priority"
+    );
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .open(&target.path)?;
+    crate::recovery::TargetIdentity::from_file(&file)?;
+    Ok(file)
+}
+
 pub fn device(target: &RecoveryTarget) -> Result<Option<Device>> {
     let path = fs::canonicalize(&target.path)?;
     parse_device(&fs::read_to_string("/proc/swaps")?, &path)

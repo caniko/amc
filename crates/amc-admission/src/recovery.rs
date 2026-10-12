@@ -134,10 +134,30 @@ pub fn validate_targets(targets: &[RecoveryTarget]) -> Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum TargetIdentity {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetIdentity {
     BlockDevice(u64),
     File(u64, u64),
+}
+
+impl TargetIdentity {
+    /// Native identity of a retained object, independent of mutable path aliases.
+    pub fn from_file(file: &fs::File) -> Result<Self> {
+        Self::from_metadata(&file.metadata()?)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
+        Ok(if metadata.file_type().is_block_device() {
+            Self::BlockDevice(metadata.rdev())
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "recovery target must be a regular file or block device"
+            );
+            Self::File(metadata.dev(), metadata.ino())
+        })
+    }
 }
 
 fn target_identity(path: &str) -> Result<Option<TargetIdentity>> {
@@ -148,15 +168,7 @@ fn target_identity(path: &str) -> Result<Option<TargetIdentity>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("observe recovery target {path}")),
     };
-    Ok(Some(if metadata.file_type().is_block_device() {
-        TargetIdentity::BlockDevice(metadata.rdev())
-    } else {
-        ensure!(
-            metadata.is_file(),
-            "recovery target must be a regular file or block device"
-        );
-        TargetIdentity::File(metadata.dev(), metadata.ino())
-    }))
+    Ok(Some(TargetIdentity::from_metadata(&metadata)?))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,6 +190,10 @@ pub enum RecoveryAction {
     Device {
         target: RecoveryTarget,
         before_used_bytes: u64,
+        /// Legacy leases remain readable for cleanup but cannot authorize a new
+        /// whole-device handoff without a pinned native object binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_target: Option<TargetIdentity>,
     },
     Pages {
         target: Identity,
@@ -217,6 +233,7 @@ impl RecoveryLease {
             RecoveryAction::Device {
                 target,
                 before_used_bytes,
+                ..
             } => {
                 ensure!(
                     *before_used_bytes <= self.return_bytes,

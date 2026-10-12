@@ -2,12 +2,11 @@
 use amc_admission::{
     host_server::{Request, call},
     page_discovery::{self, ProcessCursor, Scan},
-    recovery::{RecoveryAction, RecoveryPolicy, RecoveryTarget},
+    recovery::{RecoveryAction, RecoveryLease, RecoveryPolicy, RecoveryTarget, TargetIdentity},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -31,57 +30,54 @@ pub struct RecoveryArgs {
 }
 
 fn restore(target: &RecoveryTarget) -> Result<()> {
+    restore_with(target, amc_admission::swap::device_from_file, activate_swap)
+}
+
+fn activate_swap(path: &Path, priority: i32) -> Result<()> {
     // Linux include/linux/swap.h: explicit priority occupies the low 15 bits.
     const SWAP_FLAG_PREFER: i32 = 0x8000;
-    restore_with(
-        target,
-        amc_admission::swap::device_from_file,
-        |path, priority| {
-            use std::os::unix::ffi::OsStrExt;
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-            // SAFETY: the CString is NUL terminated and remains alive through the
-            // syscall. The descriptor path resolves to the still-open pinned object.
-            let result = unsafe { nix::libc::swapon(path.as_ptr(), SWAP_FLAG_PREFER | priority) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
-        },
-    )
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: the CString is NUL terminated and remains alive through the
+    // syscall. The descriptor path resolves to the still-open pinned object.
+    let result = unsafe { nix::libc::swapon(path.as_ptr(), SWAP_FLAG_PREFER | priority) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 fn restore_with(
     target: &RecoveryTarget,
+    observe: impl FnMut(&std::fs::File) -> Result<Option<amc_admission::swap::Device>>,
+    activate: impl FnOnce(&Path, i32) -> Result<()>,
+) -> Result<()> {
+    let file = amc_admission::swap::open_target(target)?;
+    restore_pinned_with(target, &file, observe, activate)
+}
+
+fn restore_pinned_with(
+    target: &RecoveryTarget,
+    file: &std::fs::File,
     mut observe: impl FnMut(&std::fs::File) -> Result<Option<amc_admission::swap::Device>>,
     activate: impl FnOnce(&Path, i32) -> Result<()>,
 ) -> Result<()> {
-    use std::os::unix::{
-        fs::{FileTypeExt, OpenOptionsExt},
-        io::AsRawFd,
-    };
+    use std::os::unix::io::AsRawFd;
     ensure!(
         (0..=32767).contains(&target.priority),
         "invalid swap priority"
     );
-    // O_PATH pins regular files and block aliases without opening device I/O.
+    // The same descriptor pins both deactivation and restoration.
     // Do not use the swapon frontend: its canonicalization can turn this fd path
     // back into the mutable original pathname before the kernel sees it.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
-        .open(&target.path)?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file() || metadata.file_type().is_block_device(),
-        "invalid swap target"
-    );
-    if observe(&file)?.is_none() {
+    TargetIdentity::from_file(file)?;
+    if observe(file)?.is_none() {
         let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
         activate(&path, target.priority)
             .with_context(|| format!("failed to restore swap {}", target.name))?;
     }
     ensure!(
-        observe(&file)?.is_some_and(|device| device.priority == target.priority),
+        observe(file)?.is_some_and(|device| device.priority == target.priority),
         "swap {} is inactive or differs from declared priority {}",
         target.name,
         target.priority
@@ -123,7 +119,10 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
         };
     }
     for target in &targets {
-        if amc_admission::swap::device(target)?.is_some_and(|device| device.used_bytes == 0) {
+        let file = amc_admission::swap::open_target(target)?;
+        if amc_admission::swap::device_from_file(&file)?
+            .is_some_and(|device| device.used_bytes == 0)
+        {
             continue;
         }
         let reply = call(
@@ -138,26 +137,30 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
             continue;
         }
         let lease = reply.recovery.context("missing native recovery lease")?;
-        let RecoveryAction::Device {
-            target,
-            before_used_bytes,
-        } = lease.action
-        else {
-            anyhow::bail!("unexpected page return lease");
-        };
+        let (target, before_used_bytes) = validated_device_grant(target, &file, &lease)?;
+        ensure!(
+            amc_admission::swap::device_from_file(&file)?
+                .is_some_and(|device| device.size_bytes == lease.return_bytes),
+            "approved swap object size or activity changed"
+        );
         // One device per unit lifetime: retain backing through ExecStopPost.
-        let result = Command::new("swapoff").arg(&target.path).status();
-        restore(&target)?;
-        ensure!(
-            result?.success(),
-            "swapoff {} failed; declared swap restored",
-            target.name
-        );
-        let after = amc_admission::swap::device(&target)?.context("restored swap disappeared")?;
-        ensure!(
-            after.used_bytes < before_used_bytes,
-            "swap recovery made no observed occupancy progress"
-        );
+        let after = recover_device_with(
+            &target,
+            &file,
+            before_used_bytes,
+            amc_admission::swap::device_from_file,
+            |path| {
+                use std::os::unix::ffi::OsStrExt;
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+                // SAFETY: the NUL-terminated path and pinned descriptor remain
+                // alive throughout the syscall; no frontend re-resolves aliases.
+                if unsafe { nix::libc::swapoff(path.as_ptr()) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                Ok(())
+            },
+            activate_swap,
+        )?;
         eprintln!(
             "swap recovery {}: used {} -> {} bytes",
             target.name, before_used_bytes, after.used_bytes
@@ -167,6 +170,51 @@ pub fn execute(args: RecoveryArgs) -> Result<i32> {
     whole_device_status(&targets, |target| {
         Ok(amc_admission::swap::device(target)?.map(|device| device.used_bytes))
     })
+}
+
+fn validated_device_grant(
+    target: &RecoveryTarget,
+    file: &std::fs::File,
+    lease: &RecoveryLease,
+) -> Result<(RecoveryTarget, u64)> {
+    lease.validate()?;
+    let RecoveryAction::Device {
+        target: approved,
+        before_used_bytes,
+        native_target,
+    } = &lease.action
+    else {
+        anyhow::bail!("unexpected page return lease");
+    };
+    ensure!(
+        native_target.as_ref() == Some(&TargetIdentity::from_file(file)?)
+            && approved.name == target.name
+            && approved.priority == target.priority,
+        "recovery grant does not bind the pinned swap object"
+    );
+    Ok((approved.clone(), *before_used_bytes))
+}
+
+fn recover_device_with(
+    target: &RecoveryTarget,
+    file: &std::fs::File,
+    before_used_bytes: u64,
+    mut observe: impl FnMut(&std::fs::File) -> Result<Option<amc_admission::swap::Device>>,
+    deactivate: impl FnOnce(&Path) -> Result<()>,
+    activate: impl FnOnce(&Path, i32) -> Result<()>,
+) -> Result<amc_admission::swap::Device> {
+    use std::os::unix::io::AsRawFd;
+    TargetIdentity::from_file(file)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let result = deactivate(&path);
+    restore_pinned_with(target, file, &mut observe, activate)?;
+    result.with_context(|| format!("swapoff {} failed; declared swap restored", target.name))?;
+    let after = observe(file)?.context("restored swap disappeared")?;
+    ensure!(
+        after.used_bytes < before_used_bytes,
+        "swap recovery made no observed occupancy progress"
+    );
+    Ok(after)
 }
 
 fn restoration_manifest(path: &Path) -> Result<Vec<RecoveryTarget>> {
@@ -398,6 +446,150 @@ fn page_status(remaining: u64, unproven: bool, sweep_complete: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whole_device_grants_require_the_native_identity_of_the_retained_object() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = std::env::temp_dir().join(format!(
+            "amc-swap-grant-{}",
+            amc_admission::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original");
+        let replacement = root.join("replacement");
+        let alias = root.join("alias");
+        fs::write(&original, b"approved").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        symlink(&original, &alias).unwrap();
+        let target = RecoveryTarget {
+            name: "swap".into(),
+            path: alias.to_str().unwrap().into(),
+            priority: 17,
+        };
+        let file = amc_admission::swap::open_target(&target).unwrap();
+        let native = TargetIdentity::from_file(&file).unwrap();
+        let mut lease = RecoveryLease {
+            identity: amc_admission::host::Identity {
+                cgroup: "/recovery.service".into(),
+                inode: 1,
+                uid: 0,
+                pid: 1,
+                start_ticks: 1,
+            },
+            invocation_id: Some("1".repeat(32)),
+            action: RecoveryAction::Device {
+                target: target.clone(),
+                before_used_bytes: 1024,
+                native_target: Some(native),
+            },
+            return_bytes: 4096,
+            helper_bytes: 1024,
+        };
+        fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        let encoded = serde_json::to_vec(&lease).unwrap();
+        let decoded: RecoveryLease = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            validated_device_grant(&target, &file, &decoded).unwrap().1,
+            1024
+        );
+        let replacement = amc_admission::swap::open_target(&target).unwrap();
+        assert!(validated_device_grant(&target, &replacement, &decoded).is_err());
+        if let RecoveryAction::Device { native_target, .. } = &mut lease.action {
+            *native_target = None;
+        }
+        // Historical records remain readable, but grant no mutable-path authority.
+        lease.validate().unwrap();
+        assert!(
+            !serde_json::to_string(&lease)
+                .unwrap()
+                .contains("native_target")
+        );
+        assert!(validated_device_grant(&target, &file, &lease).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn whole_device_failure_restores_only_the_pinned_object_across_path_replacement() {
+        use std::{cell::RefCell, fs, os::unix::fs::symlink};
+        for replacement_before_deactivate in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "amc-pinned-handoff-{}",
+                amc_admission::store::fresh_id().unwrap()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let original = root.join("original");
+            let replacement = root.join("replacement");
+            let alias = root.join("alias");
+            fs::write(&original, b"approved swap object").unwrap();
+            fs::write(&replacement, b"unapproved replacement").unwrap();
+            symlink(&original, &alias).unwrap();
+            let file = fs::File::open(&alias).unwrap();
+            let target = RecoveryTarget {
+                name: "swap".into(),
+                path: alias.to_str().unwrap().into(),
+                priority: 17,
+            };
+            let replace = || {
+                fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            };
+            if replacement_before_deactivate {
+                replace();
+            }
+            let deactivated = RefCell::new(Vec::new());
+            let activated = RefCell::new(Vec::new());
+            let mut active = false;
+            let result = recover_device_with(
+                &target,
+                &file,
+                4096,
+                |_| {
+                    if active {
+                        Ok(Some(amc_admission::swap::Device {
+                            path: original.clone(),
+                            size_bytes: 4096,
+                            used_bytes: 0,
+                            priority: 17,
+                        }))
+                    } else {
+                        active = true;
+                        Ok(None)
+                    }
+                },
+                |path| {
+                    *deactivated.borrow_mut() = fs::read(path)?;
+                    if !replacement_before_deactivate {
+                        replace();
+                    }
+                    anyhow::bail!("injected deactivation failure")
+                },
+                |path, priority| {
+                    assert_eq!(priority, 17);
+                    *activated.borrow_mut() = fs::read(path)?;
+                    Ok(())
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("declared swap restored")
+            );
+            assert_eq!(
+                *deactivated.borrow(),
+                b"approved swap object",
+                "deactivation followed a replacement pathname"
+            );
+            assert_eq!(
+                *activated.borrow(),
+                b"approved swap object",
+                "failure restoration activated the unapproved replacement"
+            );
+            assert_eq!(fs::read(&alias).unwrap(), b"unapproved replacement");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn restoration_activates_the_validated_inode_after_target_path_replacement() {
         use std::{

@@ -876,9 +876,18 @@ fn inventory_recovery_matches(
     // replay already checks fresh PTE demand and native target/reader backing;
     // the inventory must still authorize exactly the same helper and batch.
     let action_matches = match (&fresh.action, &scanned.action) {
-        (RecoveryAction::Device { target: a, .. }, RecoveryAction::Device { target: b, .. }) => {
-            a == b
-        }
+        (
+            RecoveryAction::Device {
+                target: a,
+                native_target: native_a,
+                ..
+            },
+            RecoveryAction::Device {
+                target: b,
+                native_target: native_b,
+                ..
+            },
+        ) => a == b && native_a.is_some() && native_a == native_b,
         (
             RecoveryAction::Pages {
                 target: a,
@@ -1429,17 +1438,20 @@ fn handle_advance_request(
                 .ok_or_else(|| anyhow::anyhow!("unknown recovery target"))?;
             let identity = crate::swap::helper(pid, spec)?;
             let invocation_id = recovery_invocation(&identity, inventory_proof)?;
+            let file = crate::swap::open_target(target)?;
+            let native_target = crate::recovery::TargetIdentity::from_file(&file)?;
             if let Some(lease) = &ledger.recovery {
                 ensure!(
                     lease.identity == identity
-                        && matches!(&lease.action, crate::recovery::RecoveryAction::Device {target:t,..} if t.name == target.name),
+                        && matches!(&lease.action, crate::recovery::RecoveryAction::Device {target:t,native_target:Some(native),..}
+                            if t.name == target.name && t.priority == target.priority && *native == native_target),
                     "another native recovery owns capacity"
                 );
                 reply.granted = true;
                 reply.recovery = ledger.recovery.clone();
                 return Ok(());
             }
-            let device = crate::swap::device(target)?
+            let device = crate::swap::device_from_file(&file)?
                 .ok_or_else(|| anyhow::anyhow!("swap target is inactive; restore first"))?;
             if device.used_bytes < spec.minimum_bytes {
                 reply.waiting = Some(WaitReason::SwapReturn);
@@ -1474,6 +1486,7 @@ fn handle_advance_request(
                     action: crate::recovery::RecoveryAction::Device {
                         target,
                         before_used_bytes: device.used_bytes,
+                        native_target: Some(native_target),
                     },
                     return_bytes: device.size_bytes,
                     helper_bytes: spec.helper_bytes,
@@ -1875,6 +1888,31 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_inventory_replay_requires_the_same_bound_native_object() {
+        let value = serde_json::json!({
+            "identity":{"cgroup":"/recovery.service","inode":1,"uid":0,"pid":1,"start_ticks":1},
+            "invocation_id":"11111111111111111111111111111111",
+            "action":{"kind":"device","target":{"name":"swap","path":"/swap","priority":17},
+                "before_used_bytes":1024,"native_target":{"file":[12,34]}},
+            "return_bytes":4096,"helper_bytes":1024
+        });
+        let original =
+            Some(serde_json::from_value::<crate::recovery::RecoveryLease>(value.clone()).unwrap());
+        assert!(inventory_recovery_matches(&original, &original).unwrap());
+        let mut changed = value.clone();
+        changed["action"]["native_target"]["file"][1] = serde_json::json!(35);
+        let replacement = Some(serde_json::from_value(changed).unwrap());
+        assert!(!inventory_recovery_matches(&replacement, &original).unwrap());
+        let mut legacy = value;
+        legacy["action"]
+            .as_object_mut()
+            .unwrap()
+            .remove("native_target");
+        let legacy = Some(serde_json::from_value(legacy).unwrap());
+        assert!(!inventory_recovery_matches(&legacy, &legacy).unwrap());
+    }
 
     #[test]
     fn a_live_preparation_helper_outside_its_runner_cannot_poll_or_consume() {
