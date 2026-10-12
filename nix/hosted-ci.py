@@ -302,6 +302,7 @@ def verify_foreground_evidence(path, kernel_series=None):
         or device.get("interruptedRestored") is not True
         or device.get("brokerUnavailableRestored") is not True
         or device.get("wrongActivePriorityDenied") is not True
+        or device.get("pinnedAliasRestored") is not True
     ):
         raise RuntimeError(
             "Native device-return evidence lacks progress or interrupted restoration"

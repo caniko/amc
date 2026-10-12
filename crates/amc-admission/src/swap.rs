@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -153,6 +153,58 @@ pub fn device(target: &RecoveryTarget) -> Result<Option<Device>> {
     parse_device(&fs::read_to_string("/proc/swaps")?, &path)
 }
 
+/// Observe the exact object held by a caller across activation. Path aliases
+/// match by native device/inode identity, never by a re-resolved target name.
+pub fn device_from_file(file: &fs::File) -> Result<Option<Device>> {
+    parse_pinned_device(&fs::read_to_string("/proc/swaps")?, &file.metadata()?)
+}
+
+fn parse_pinned_device(text: &str, pinned: &fs::Metadata) -> Result<Option<Device>> {
+    ensure!(
+        pinned.is_file() || pinned.file_type().is_block_device(),
+        "invalid pinned swap target"
+    );
+    for line in text.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        ensure!(fields.len() == 5, "invalid native swap table");
+        let Ok(candidate) = fs::metadata(fields[0]) else {
+            continue;
+        };
+        let matches = if pinned.file_type().is_block_device() {
+            candidate.file_type().is_block_device() && candidate.rdev() == pinned.rdev()
+        } else {
+            candidate.is_file()
+                && candidate.dev() == pinned.dev()
+                && candidate.ino() == pinned.ino()
+        };
+        if matches {
+            return Ok(Some(device_fields(&fields, Path::new(fields[0]))?));
+        }
+    }
+    Ok(None)
+}
+
+fn device_fields(fields: &[&str], path: &Path) -> Result<Device> {
+    let size_bytes = fields[2]
+        .parse::<u64>()?
+        .checked_mul(1024)
+        .context("swap size overflow")?;
+    let used_bytes = fields[3]
+        .parse::<u64>()?
+        .checked_mul(1024)
+        .context("swap occupancy overflow")?;
+    ensure!(
+        size_bytes > 0 && used_bytes <= size_bytes,
+        "invalid native swap size"
+    );
+    Ok(Device {
+        path: path.to_owned(),
+        size_bytes,
+        used_bytes,
+        priority: fields[4].parse()?,
+    })
+}
+
 fn parse_device(text: &str, path: &Path) -> Result<Option<Device>> {
     for line in text.lines().skip(1) {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -166,24 +218,7 @@ fn parse_device(text: &str, path: &Path) -> Result<Option<Device>> {
         if candidate != path {
             continue;
         }
-        let size_bytes = fields[2]
-            .parse::<u64>()?
-            .checked_mul(1024)
-            .context("swap size overflow")?;
-        let used_bytes = fields[3]
-            .parse::<u64>()?
-            .checked_mul(1024)
-            .context("swap occupancy overflow")?;
-        ensure!(
-            size_bytes > 0 && used_bytes <= size_bytes,
-            "invalid native swap size"
-        );
-        return Ok(Some(Device {
-            path: path.to_owned(),
-            size_bytes,
-            used_bytes,
-            priority: fields[4].parse()?,
-        }));
+        return Ok(Some(device_fields(&fields, path)?));
     }
     Ok(None)
 }
@@ -590,6 +625,46 @@ impl NativeReturnInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pinned_swap_observation_matches_aliases_but_never_a_replacement_inode() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-pinned-swap-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let alias = root.join("alias");
+        fs::write(&target, b"original").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        let file = fs::File::open(&target).unwrap();
+        let table = |path: &Path| {
+            format!(
+                "Filename Type Size Used Priority\n{} file 1024 0 17\n",
+                path.display()
+            )
+        };
+        assert_eq!(
+            parse_pinned_device(&table(&alias), &file.metadata().unwrap())
+                .unwrap()
+                .unwrap()
+                .priority,
+            17
+        );
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, b"replacement").unwrap();
+        assert!(
+            parse_pinned_device(&table(&target), &file.metadata().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_pinned_device(&table(&alias), &file.metadata().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn wide_replay_can_finish_when_native_observations_exceed_a_broker_tick() {
         let root = std::env::temp_dir().join(format!(

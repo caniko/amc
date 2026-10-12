@@ -1217,6 +1217,15 @@ time.sleep(120)
     )
     machine.succeed('test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10')
     evidence["deviceReturn"]["wrongActivePriorityDenied"] = True
+    # The native restoration path must activate a pinned block-device alias
+    # directly through the kernel while retaining the declared priority.
+    machine.succeed("ln -s /dev/vdb /tmp/page-swap-alias; swapoff /dev/vdb")
+    write_file("/tmp/page-alias-manifest.json", json.dumps([
+        {"name": "vm-alias", "path": "/tmp/page-swap-alias", "priority": 10}
+    ]))
+    machine.succeed("amc recover-swap --restore --restore-manifest /tmp/page-alias-manifest.json")
+    machine.succeed('test "$(awk \'$1 == "/dev/vdb" {print $5}\' /proc/swaps)" = 10')
+    evidence["deviceReturn"]["pinnedAliasRestored"] = True
 
 with test_section(
     "post-grant migration is kernel-blocked on direct and swap-cache recovery paths"

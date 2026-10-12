@@ -31,19 +31,57 @@ pub struct RecoveryArgs {
 }
 
 fn restore(target: &RecoveryTarget) -> Result<()> {
-    if amc_admission::swap::device(target)?.is_none() {
-        ensure!(
-            Command::new("swapon")
-                .args(["--priority", &target.priority.to_string(), &target.path])
-                .status()?
-                .success(),
-            "failed to restore swap {}",
-            target.name
-        );
+    // Linux include/linux/swap.h: explicit priority occupies the low 15 bits.
+    const SWAP_FLAG_PREFER: i32 = 0x8000;
+    restore_with(
+        target,
+        amc_admission::swap::device_from_file,
+        |path, priority| {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            // SAFETY: the CString is NUL terminated and remains alive through the
+            // syscall. The descriptor path resolves to the still-open pinned object.
+            let result = unsafe { nix::libc::swapon(path.as_ptr(), SWAP_FLAG_PREFER | priority) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        },
+    )
+}
+
+fn restore_with(
+    target: &RecoveryTarget,
+    mut observe: impl FnMut(&std::fs::File) -> Result<Option<amc_admission::swap::Device>>,
+    activate: impl FnOnce(&Path, i32) -> Result<()>,
+) -> Result<()> {
+    use std::os::unix::{
+        fs::{FileTypeExt, OpenOptionsExt},
+        io::AsRawFd,
+    };
+    ensure!(
+        (0..=32767).contains(&target.priority),
+        "invalid swap priority"
+    );
+    // O_PATH pins regular files and block aliases without opening device I/O.
+    // Do not use the swapon frontend: its canonicalization can turn this fd path
+    // back into the mutable original pathname before the kernel sees it.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+        .open(&target.path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() || metadata.file_type().is_block_device(),
+        "invalid swap target"
+    );
+    if observe(&file)?.is_none() {
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        activate(&path, target.priority)
+            .with_context(|| format!("failed to restore swap {}", target.name))?;
     }
     ensure!(
-        amc_admission::swap::device(target)?
-            .is_some_and(|device| device.priority == target.priority),
+        observe(&file)?.is_some_and(|device| device.priority == target.priority),
         "swap {} is inactive or differs from declared priority {}",
         target.name,
         target.priority
@@ -360,6 +398,69 @@ fn page_status(remaining: u64, unproven: bool, sweep_complete: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restoration_activates_the_validated_inode_after_target_path_replacement() {
+        use std::{
+            fs,
+            os::unix::{
+                fs::{MetadataExt, symlink},
+                io::AsRawFd,
+            },
+        };
+        let root = std::env::temp_dir().join(format!(
+            "amc-pinned-restore-{}",
+            amc_admission::store::fresh_id().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original");
+        let moved = root.join("moved");
+        let alias = root.join("alias");
+        fs::write(&original, b"validated").unwrap();
+        symlink(&original, &alias).unwrap();
+        let inode = fs::metadata(&original).unwrap().ino();
+        let target = RecoveryTarget {
+            name: "swap".into(),
+            path: alias.to_str().unwrap().into(),
+            priority: 17,
+        };
+        let mut first = true;
+        restore_with(
+            &target,
+            |file| {
+                assert_eq!(file.metadata()?.ino(), inode);
+                assert_eq!(
+                    fs::read(format!("/proc/self/fd/{}", file.as_raw_fd()))?,
+                    b"validated"
+                );
+                if first {
+                    first = false;
+                    fs::rename(&original, &moved)?;
+                    fs::write(&original, b"replacement")?;
+                    Ok(None)
+                } else {
+                    Ok(Some(amc_admission::swap::Device {
+                        path: moved.clone(),
+                        size_bytes: 4096,
+                        used_bytes: 0,
+                        priority: 17,
+                    }))
+                }
+            },
+            |path, priority| {
+                assert_eq!(priority, 17);
+                assert_eq!(
+                    fs::read(path)?,
+                    b"validated",
+                    "activation must resolve the pinned object, not the replaced pathname"
+                );
+                assert_eq!(fs::read(&alias)?, b"replacement");
+                Ok(())
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_discovery_cutoff_cannot_prove_completion_with_zero_destination_counters() {
         assert_eq!(page_status(0, false, false), 75);

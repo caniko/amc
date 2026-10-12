@@ -143,6 +143,7 @@ class NativeEvidenceTests(unittest.TestCase):
                 "interruptedRestored": True,
                 "brokerUnavailableRestored": True,
                 "wrongActivePriorityDenied": True,
+                "pinnedAliasRestored": True,
             },
             "completion": {
                 "parentAndEscrowBytes": 128 * 1048576,
@@ -166,6 +167,12 @@ class NativeEvidenceTests(unittest.TestCase):
             for value in (False, None, "true", 1):
                 path.write_text(json.dumps({**receipt, "userCreatedPreparationHelperDenied": value}))
                 with self.subTest(userCreatedPreparationHelperDenied=value), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path)
+            for value in (False, None, "true", 1):
+                broken = json.loads(json.dumps(receipt))
+                broken["deviceReturn"]["pinnedAliasRestored"] = value
+                path.write_text(json.dumps(broken))
+                with self.subTest(pinnedAliasRestored=value), self.assertRaises(RuntimeError):
                     hosted.verify_foreground_evidence(path)
             path.write_text(json.dumps(receipt))
             with self.assertRaises(RuntimeError):
