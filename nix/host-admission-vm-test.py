@@ -224,6 +224,17 @@ assert reply['error'] and not reply['granted'], reply
     machine.succeed("runuser -u alice -- python3 /tmp/outside-runner-prepare.py")
     assert not status()["preparation_barrier"] and not status()["preparations"]
     evidence["outsideRunnerPreparationDenied"] = True
+    # This unit has the exact accepted prefix, aggregate placement and limits.
+    # Those user-controlled properties must not mint preparation authority.
+    machine.succeed(
+        "runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 "
+        "systemd-run --user --wait --pipe --collect "
+        "--unit=app-amc-prepare-helper-forged --slice=app-amchostrunner.slice "
+        "--property=MemoryMax=67108864 --property=MemorySwapMax=0 -- "
+        "python3 /tmp/outside-runner-prepare.py"
+    )
+    assert not status()["preparation_barrier"] and not status()["preparations"]
+    evidence["userCreatedPreparationHelperDenied"] = True
     launch("helper-drain", 1000, "small", "touch /tmp/helper-drain-entered; while ! test -e /tmp/helper-drain-finish; do sleep .1; done; touch /tmp/helper-drain-completed")
     wait_entered("helper-drain")
     drain_grant = next(r for r in status()["reservations"] if r["granted"] and r["identity"]["uid"] == 1000)

@@ -21,6 +21,7 @@ class NativeEvidenceTests(unittest.TestCase):
             "kernel": "6.18.48",
             "pageReturnGuard": self.guard_evidence(),
             "outsideRunnerPreparationDenied": True,
+            "userCreatedPreparationHelperDenied": True,
             "poolRetirement": {"removedDomainReleased": True, "liveOwnerCleared": True,
                 "descendantRetainedBytes": 96 * 1048576, "finalBytes": 0},
             "abandonedPreparation": {
@@ -147,6 +148,10 @@ class NativeEvidenceTests(unittest.TestCase):
             for value in [False, None]:
                 path.write_text(json.dumps({**receipt, "outsideRunnerPreparationDenied": value}))
                 with self.subTest(outsideRunnerPreparationDenied=value), self.assertRaises(RuntimeError):
+                    hosted.verify_foreground_evidence(path)
+            for value in (False, None, "true", 1):
+                path.write_text(json.dumps({**receipt, "userCreatedPreparationHelperDenied": value}))
+                with self.subTest(userCreatedPreparationHelperDenied=value), self.assertRaises(RuntimeError):
                     hosted.verify_foreground_evidence(path)
             path.write_text(json.dumps(receipt))
             with self.assertRaises(RuntimeError):

@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod preparation_auth;
 mod recovery_manager;
 mod transport;
 
@@ -52,6 +53,12 @@ pub enum Request {
         id: String,
         key: String,
         profile: String,
+    },
+    AuthorizePreparation {
+        version: u32,
+        id: String,
+        profile: String,
+        origin: crate::ledger::ClientIdentity,
     },
     Preparation {
         version: u32,
@@ -1212,6 +1219,26 @@ fn handle_advance_request(
     let (health_file, inventory_proof, burst_evidence) = evidence;
     let now = crate::clock::boot_ms()?;
     match request {
+        Request::AuthorizePreparation {
+            version,
+            id,
+            profile,
+            origin,
+        } => {
+            ensure!(version == 1, "unsupported host protocol");
+            let claims = ledger
+                .native_claims(policy, None)
+                .ok_or_else(|| anyhow::anyhow!("preparation helper backing unavailable"))?;
+            crate::namespace_runner::verify(pid, uid, policy, &claims)?;
+            let helper = crate::ledger::ClientIdentity {
+                pid,
+                start_ticks: host_native::process_start(pid)?,
+            };
+            preparation_auth::authorize(ledger, &id, &profile, (uid, helper), origin, now, policy)?;
+            // The secret is delivered only to the kernel-authenticated waiting
+            // origin. A helper's enrollment does not disclose the capability.
+            reply.granted = true;
+        }
         Request::NamespaceRunner { version } => {
             ensure!(version == 1, "unsupported host protocol");
             let claims = ledger
@@ -1239,15 +1266,19 @@ fn handle_advance_request(
                 host_native::preparation_owner_alive(&owner) == Some(true),
                 "preparation helper lifetime unavailable"
             );
-            ledger.prepare(id.clone(), key.clone(), (uid, owner), &profile, now, policy)?;
+            preparation_auth::prepare(ledger, &id, &key, (uid, owner), &profile, now, policy)?;
             preparation_reply(ledger, policy, &id, &key, uid, reply)?;
         }
         Request::Preparation { version, id, key } => {
             ensure!(version == 1, "unsupported host protocol");
+            preparation_auth::verify_caller(ledger, &id, &key, uid, pid)?;
             preparation_reply(ledger, policy, &id, &key, uid, reply)?;
         }
         Request::CancelPreparation { version, id, key } => {
             ensure!(version == 1, "unsupported host protocol");
+            if ledger.preparations.iter().any(|p| p.id == id) {
+                preparation_auth::verify_caller(ledger, &id, &key, uid, pid)?;
+            }
             ledger.cancel_preparation(&id, &key, uid)?;
         }
         Request::Consume {
@@ -1257,6 +1288,7 @@ fn handle_advance_request(
             origin,
         } => {
             ensure!(version == 1, "unsupported host protocol");
+            let caller = pid;
             let pid = if let Some(origin) = &origin {
                 host_native::prepared_origin(origin, uid)?
             } else {
@@ -1268,6 +1300,26 @@ fn handle_advance_request(
                 .find(|p| p.id == id && p.uid == uid && p.key == key)
                 .ok_or_else(|| anyhow::anyhow!("unknown preparation capability"))?
                 .clone();
+            if let Some(approved) = &p.origin {
+                ensure!(
+                    approved.pid == pid
+                        && host_native::process_start(pid)? == approved.start_ticks
+                        && origin.as_ref().is_none_or(|origin| origin == approved),
+                    "prepared origin differs from the authorized rendezvous"
+                );
+            } else {
+                ensure!(
+                    origin.is_none()
+                        && matches!(
+                            p.phase,
+                            PreparationPhase::Active | PreparationPhase::Reconciling
+                        ),
+                    "preparation rendezvous authorization missing"
+                );
+            }
+            if origin.is_some() {
+                preparation_auth::verify_caller(ledger, &id, &key, uid, caller)?;
+            }
             verify_preparation_helper(ledger, policy, &p)?;
             let (domain, identity, memory_bytes, swap_bytes) = if matches!(
                 p.phase,
@@ -1739,6 +1791,25 @@ fn verify_preparation_helper(
         .owner
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("preparation helper runner lifetime missing"))?;
+    let origin = preparation.origin.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("preparation helper runner rendezvous authorization missing")
+    })?;
+    host_native::prepared_origin(origin, preparation.uid)
+        .map_err(|error| error.context("preparation helper runner rendezvous lifetime changed"))?;
+    ensure!(
+        host_native::preparation_owner_alive(origin) == Some(true),
+        "preparation helper runner rendezvous exited"
+    );
+    ensure!(
+        preparation.helper_cgroup_inode
+            == Some(
+                preparation_auth::helper_boundary(&preparation.id, preparation.uid, owner)
+                    .map_err(
+                        |error| error.context("preparation helper runner invocation changed")
+                    )?
+            ),
+        "preparation helper runner invocation changed"
+    );
     ensure!(
         host_native::preparation_owner_alive(owner) == Some(true)
             && fs::metadata(format!("/proc/{}", owner.pid))?.uid() == preparation.uid,
@@ -1824,6 +1895,7 @@ mod tests {
             ledger.preparations.push(
                 serde_json::from_value(serde_json::json!({
                     "id":"intent", "key":"secret", "uid":uid, "owner":owner,
+                    "origin":owner, "helper_cgroup_inode":1,
                     "profile":"game", "domain":"game", "memory_bytes":134217728, "swap_bytes":0,
                     "requested_ms":0, "expires_ms":3600000, "ready_ms":15000,
                     "phase":phase, "drain":[], "waiting":null

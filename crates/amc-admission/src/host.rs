@@ -250,6 +250,10 @@ pub struct HostLedger {
     pub burst_last_granted: BTreeMap<u32, u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preparations: Vec<crate::preparation::Preparation>,
+    /// Unconsumed rendezvous secrets are bounded and invalidated on restart.
+    #[serde(skip)]
+    pub(crate) preparation_authorizations:
+        BTreeMap<String, crate::host_server::preparation_auth::Authorization>,
     /// Observed uncovered return demand. Invalidated on broker restart.
     #[serde(default)]
     pub swap_return_bytes: Option<u64>,
@@ -304,6 +308,7 @@ impl HostLedger {
             reservations: Vec::new(),
             burst_last_granted: BTreeMap::new(),
             preparations: Vec::new(),
+            preparation_authorizations: BTreeMap::new(),
             swap_return_bytes: None,
             recovery: None,
             continuations: vec![],
@@ -378,6 +383,10 @@ impl HostLedger {
                     && p.owner
                         .as_ref()
                         .is_none_or(|owner| owner.pid > 0 && owner.start_ticks > 0)
+                    && p.origin
+                        .as_ref()
+                        .is_none_or(|origin| origin.pid > 0 && origin.start_ticks > 0)
+                    && p.helper_cgroup_inode.is_none_or(|inode| inode > 0)
                     && p.memory_bytes > 0
                     && p.memory_bytes <= i64::MAX as u64
                     && p.swap_bytes <= i64::MAX as u64

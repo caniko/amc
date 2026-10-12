@@ -107,6 +107,8 @@ def verify_foreground_evidence(path, kernel_series=None):
     verify_kernel_guard_evidence(receipt.get("pageReturnGuard", {}))
     if receipt.get("outsideRunnerPreparationDenied") is not True:
         raise RuntimeError("Native preparation accepted an unbacked runner peer")
+    if receipt.get("userCreatedPreparationHelperDenied") is not True:
+        raise RuntimeError("Native preparation accepted user-created unit metadata as authorization")
     pool = receipt.get("poolRetirement", {})
     if (pool.get("removedDomainReleased") is not True
         or pool.get("liveOwnerCleared") is not True

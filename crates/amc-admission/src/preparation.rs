@@ -89,6 +89,12 @@ pub struct Preparation {
     /// Authenticated host helper lifetime; absent only in pre-upgrade snapshots.
     #[serde(default)]
     pub owner: Option<crate::ledger::ClientIdentity>,
+    /// Kernel-authenticated rendezvous peer that received the broker's secret.
+    /// Legacy pending intents have no authority to hold a new drain barrier.
+    #[serde(default)]
+    pub origin: Option<crate::ledger::ClientIdentity>,
+    #[serde(default)]
+    pub helper_cgroup_inode: Option<u64>,
     pub profile: String,
     pub domain: String,
     pub memory_bytes: u64,
@@ -234,6 +240,8 @@ impl HostLedger {
             key,
             uid,
             owner: Some(owner),
+            origin: None,
+            helper_cgroup_inode: None,
             profile: profile.into(),
             domain: domain.name.clone(),
             memory_bytes: spec.memory_bytes,

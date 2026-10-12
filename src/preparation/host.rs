@@ -43,6 +43,15 @@ struct Progress {
     token: String,
     granted: bool,
     error: Option<String>,
+    #[serde(default)]
+    authorize: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationAck {
+    token: String,
+    key: String,
 }
 
 // Each frame is acknowledged before another is sent: read_frame is deliberately
@@ -59,6 +68,7 @@ fn progress(
             token: token.into(),
             granted,
             error,
+            authorize: false,
         },
     )?;
     let ack: String = read_frame(stream)?;
@@ -72,6 +82,7 @@ impl Drop for Rendezvous {
         // Never recursively delete a pathname that another process may replace.
         let _ = fs::remove_file(self.0.join("socket"));
         let _ = fs::remove_file(self.0.join("token"));
+        let _ = fs::remove_file(self.0.join("authorize"));
         let _ = fs::remove_dir(&self.0);
     }
 }
@@ -106,6 +117,12 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
         fs::Permissions::from_mode(0o600),
     )?;
     listener.set_nonblocking(true)?;
+    let authorization = UnixListener::bind(rendezvous.0.join("authorize"))?;
+    fs::set_permissions(
+        rendezvous.0.join("authorize"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    authorization.set_nonblocking(true)?;
     // No payload, loader environment, or preparation capability is sent through
     // the manager. Its helper obtains the waiting peer's host PID from the kernel.
     crate::control::capture(&mut helper_command(&args, &rendezvous.0, &id)?)
@@ -144,6 +161,43 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
         if let Some(error) = reply.error {
             anyhow::bail!("prepared host helper: {error}");
         }
+        if reply.authorize {
+            ensure!(!reply.granted, "invalid prepared authorization frame");
+            let mut callback = loop {
+                ensure!(
+                    Instant::now() < deadline && signals.cancelled().is_none(),
+                    "prepared authorization callback missing"
+                );
+                match authorization.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25))
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            // Use the socket owner's mapped UID, so this works where initial
+            // host root is unmapped in the waiting process's user namespace.
+            ensure!(
+                getsockopt(&callback, PeerCredentials)?.uid()
+                    == fs::symlink_metadata(&args.socket)?.uid(),
+                "prepared authorization callback UID mismatch"
+            );
+            callback.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let key: String = read_frame(&mut callback)?;
+            ensure!(
+                key.len() == 36 && amc_admission::ledger::valid_name(&key),
+                "invalid prepared authorization key"
+            );
+            write_frame(
+                &mut stream,
+                &AuthorizationAck {
+                    token: token.clone(),
+                    key,
+                },
+            )?;
+            continue;
+        }
         write_frame(&mut stream, &token)?;
         if reply.granted {
             break;
@@ -151,6 +205,7 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
     }
     drop(stream);
     drop(listener);
+    drop(authorization);
     drop(rendezvous);
     drop(signals);
     exec_payload(args.command, args.payload_env)
@@ -200,12 +255,55 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
             .granted,
         "preparation helper has no backed aggregate allowance"
     );
-    progress(&mut stream, &token, false, None)?;
     let result = (|| -> Result<()> {
+        let id = args
+            .rendezvous
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("amc-"))
+            .context("invalid prepared rendezvous name")?
+            .to_owned();
+        ensure!(
+            amc_admission::ledger::valid_name(&id)
+                && args.rendezvous
+                    == std::path::Path::new(&format!("/run/user/{}/amc-{id}", peer.uid())),
+            "prepared rendezvous must be in the host user's runtime directory"
+        );
+        let authorized = broker_call(
+            &args.socket,
+            &Request::AuthorizePreparation {
+                version: 1,
+                id: id.clone(),
+                profile: args.profile.clone(),
+                origin: origin.clone(),
+            },
+            Instant::now() + Duration::from_secs(30),
+            || signals.cancelled().is_some(),
+        )?;
+        ensure!(
+            authorized.granted,
+            "broker did not authorize prepared rendezvous"
+        );
+        write_frame(
+            &mut stream,
+            &Progress {
+                token: token.clone(),
+                granted: false,
+                error: None,
+                authorize: true,
+            },
+        )?;
+        let ack: AuthorizationAck = read_frame(&mut stream)?;
+        ensure!(
+            ack.token == token
+                && ack.key.len() == 36
+                && amc_admission::ledger::valid_name(&ack.key),
+            "prepared rendezvous authorization acknowledgement mismatch"
+        );
         let intent = Intent {
             socket: args.socket,
-            id: amc_admission::store::fresh_id()?,
-            key: amc_admission::store::fresh_id()?,
+            id,
+            key: ack.key,
         };
         let reply = prepare_ready(&intent, args.profile, &signals, || {
             progress(&mut stream, &token, false, None)
