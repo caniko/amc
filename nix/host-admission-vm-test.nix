@@ -5,6 +5,7 @@
   name ? "amc-shared-host-admission",
 }: let
   mib = 1048576;
+  nativeEngine = "${package}/bin/.amc-wrapped";
   userPolicy = pkgs.writeText "host-user-policy.json" (builtins.toJSON {
     version = 1;
     budget_bytes = 160 * mib;
@@ -189,7 +190,12 @@ in
         };
         systemd.services.amc-host-admission.requires = ["builders.slice"];
         systemd.services.amc-host-admission.after = ["builders.slice"];
-        systemd.services.amc-host-admission.path = lib.mkBefore [observer];
+        # The public launcher prepends real systemd to PATH. Inject the observer
+        # at the native engine boundary while retaining its runtime dependencies
+        # and all hardening and lifecycle settings from the production module.
+        systemd.services.amc-host-admission.serviceConfig.ExecStart =
+          lib.mkForce "${nativeEngine} admission host-serve --policy /etc/amc-test-host-policy.json";
+        systemd.services.amc-host-admission.path = lib.mkBefore [observer pkgs.python3 pkgs.systemd pkgs.util-linux];
         systemd.user.services.amc-admission = {
           wantedBy = ["default.target"];
           requires = ["agent-tools.slice" "agent-burst.slice"];
@@ -208,6 +214,7 @@ in
         environment.etc."amc-test-host-policy.json".text = builtins.toJSON config.services.amc.hostAdmission.policy;
         environment.etc."amc-test-observer".source = observer;
         environment.etc."amc-fixture-systemctl".source = "${observer}/bin/systemctl";
+        environment.etc."amc-fixture-native-engine".source = nativeEngine;
         environment.etc."amc-native-completion.py".source = ../tests/native-completion.py;
         virtualisation.memorySize = 2048;
         virtualisation.emptyDiskImages = [512];

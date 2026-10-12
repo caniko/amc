@@ -1080,7 +1080,7 @@ with test_section(
     machine.succeed("chown 0 /tmp/page-restore-manifest.json")
     machine.succeed("mkdir -p /tmp/device-systemctl; ln -s /etc/amc-fixture-systemctl /tmp/device-systemctl/systemctl")
     machine.succeed(
-        "systemd-run --unit=device-host --setenv=PATH=/tmp/device-systemctl:/run/current-system/sw/bin -- amc admission host-serve --policy /tmp/page-device-policy.json "
+        "systemd-run --unit=device-host --setenv=PATH=/tmp/device-systemctl:/run/current-system/sw/bin -- /etc/amc-fixture-native-engine admission host-serve --policy /tmp/page-device-policy.json "
         "--socket /run/amc-device/admission.sock --state /var/lib/amc-device"
     )
     machine.wait_until_succeeds("test -S /run/amc-device/admission.sock")
