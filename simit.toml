@@ -14,6 +14,8 @@ nix_builds = [
 
 [ci.nix_build]
 only = true
+separate_events = true
+push_tags = ["**"]
 timeout_minutes = 240
 max_parallel = 2
 max_jobs = 1
@@ -24,7 +26,7 @@ artifact_retention_days = 30
 extra_setup = [
   "python3 -c 'from pathlib import Path; p = Path.home() / \".config/nix/nix.conf\"; p.parent.mkdir(parents=True, exist_ok=True); p.open(\"a\").write(\"\\nlog-lines = 1000\\n\")'",
   "python3 -B nix/test-hosted-ci.py",
-  "nix run github:caniko/simit/8008329afdadb9b2c6cd917cd4e1736243e5bc74 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
+  "nix run --max-jobs 1 --cores 2 github:caniko/simit/eac437a218b6471df772c9bf73c177988b03aed0 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
 ]
 post_build = ["python3 nix/hosted-ci.py"]
 post_build_always = ["python3 -B nix/retain-diagnostics.py"]
