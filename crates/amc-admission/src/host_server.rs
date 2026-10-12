@@ -357,12 +357,13 @@ pub fn serve_supervised(
             reconcile_recovery(&mut ledger, &recovery_manager);
             reconcile_preparation_helpers(&mut ledger, &policy);
             let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
-            waiting = ledger.advance(
+            waiting = ledger.advance_with_burst_runtime(
                 crate::clock::boot_ms()?,
                 &policy,
                 capacity,
                 &mut healthy_since,
                 host_native::ancestor_headroom,
+                |identity| burst_evidence.runtime(identity),
             );
             if before != serde_json::to_vec(&ledger)? {
                 store.save_snapshot(&ledger)?;

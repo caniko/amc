@@ -40,7 +40,7 @@ fn advance(
     available: u64,
 ) -> BTreeMap<String, WaitReason> {
     let mut healthy = BTreeMap::from([("normal".into(), 0), ("burst".into(), 0)]);
-    ledger.advance(
+    ledger.advance_with_burst_runtime(
         now,
         policy,
         Some(Capacity {
@@ -51,7 +51,32 @@ fn advance(
         }),
         &mut healthy,
         |_, _| Some(1000),
+        |_| Some(5000),
     )
+}
+
+#[test]
+fn queued_bursts_without_current_manager_evidence_cannot_receive_new_grants() {
+    let p = policy();
+    let mut ledger = HostLedger::new("boot".into());
+    ledger.request(job("queued", true, 10), &p).unwrap();
+    let mut healthy = BTreeMap::from([("burst".into(), 0)]);
+    ledger.advance(
+        250,
+        &p,
+        Some(Capacity {
+            available_bytes: 100,
+            swap_free_bytes: 100,
+            memory_full_psi: 0.0,
+            io_full_psi: 0.0,
+        }),
+        &mut healthy,
+        |_, _| Some(100),
+    );
+    assert!(
+        !ledger.reservations[0].granted,
+        "persisted runtime alone is not current manager enforcement"
+    );
 }
 
 #[test]
@@ -237,7 +262,7 @@ fn bursts_backfill_when_drain_cannot_clear_swap_return_or_ancestor_waits() {
         }
         l.request(bulk, &p).unwrap();
         l.request(job("quick", true, 5), &p).unwrap();
-        let waits = l.advance(
+        let waits = l.advance_with_burst_runtime(
             1500,
             &p,
             Some(Capacity {
@@ -256,6 +281,7 @@ fn bursts_backfill_when_drain_cannot_clear_swap_return_or_ancestor_waits() {
                     },
                 )
             },
+            |_| Some(5000),
         );
         assert_eq!(waits["bulk"], reason);
         assert!(!waits.contains_key("quick"), "{reason:?}: {waits:?}");
@@ -332,7 +358,14 @@ fn independent_users_share_the_burst_allowance_and_pressure_gates() {
         memory_full_psi: 0.0,
         io_full_psi: 0.0,
     };
-    let waits = l.advance(250, &p, Some(capacity), &mut healthy, |_, _| Some(1000));
+    let waits = l.advance_with_burst_runtime(
+        250,
+        &p,
+        Some(capacity),
+        &mut healthy,
+        |_, _| Some(1000),
+        |_| Some(5000),
+    );
     assert_eq!(l.burst_committed(), 10);
     assert_eq!(waits["bob"], WaitReason::BurstBudget);
     l.reconcile(|r| Some(r.id == "alice"));
@@ -356,7 +389,21 @@ fn independent_users_share_the_burst_allowance_and_pressure_gates() {
         );
         assert_eq!(l.committed(), 0);
     }
-    l.advance(1000, &p, Some(capacity), &mut healthy, |_, _| Some(1000));
-    l.advance(1250, &p, Some(capacity), &mut healthy, |_, _| Some(1000));
+    l.advance_with_burst_runtime(
+        1000,
+        &p,
+        Some(capacity),
+        &mut healthy,
+        |_, _| Some(1000),
+        |_| Some(5000),
+    );
+    l.advance_with_burst_runtime(
+        1250,
+        &p,
+        Some(capacity),
+        &mut healthy,
+        |_, _| Some(1000),
+        |_| Some(5000),
+    );
     assert_eq!(l.burst_committed(), 5);
 }

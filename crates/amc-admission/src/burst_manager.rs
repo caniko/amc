@@ -6,6 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MAX_ENTRIES: usize = 256;
+const MAX_LIVE: usize = 8;
+// One UID can probe the policy's maximum eight simultaneous bursts without
+// accumulating enough failed/non-live identities to exhaust the shared cache.
+const MAX_PROBES_PER_UID: usize = MAX_LIVE;
+
 #[derive(Clone)]
 pub(crate) struct Observation {
     identity: Identity,
@@ -53,16 +59,35 @@ impl Cache {
     }
 
     pub(crate) fn register(&mut self, identity: &Identity) -> Result<()> {
+        self.register_with(identity, false)
+    }
+
+    fn register_with(&mut self, identity: &Identity, live: bool) -> Result<()> {
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| &entry.identity == identity)
         {
             entry.requested = Instant::now();
+            entry.live |= live;
             return Ok(());
         }
         ensure!(
-            self.entries.len() < 256,
+            live || self
+                .entries
+                .iter()
+                .filter(|entry| !entry.live && entry.identity.uid == identity.uid)
+                .count()
+                < MAX_PROBES_PER_UID,
+            "burst manager per-user observation queue is full"
+        );
+        ensure!(
+            self.entries.len()
+                < if live {
+                    MAX_ENTRIES
+                } else {
+                    MAX_ENTRIES - MAX_LIVE
+                },
             "burst manager observation queue is full"
         );
         self.entries.push(Observation {
@@ -70,7 +95,7 @@ impl Cache {
             runtime: None,
             completed: None,
             requested: Instant::now(),
-            live: false,
+            live,
         });
         Ok(())
     }
@@ -87,15 +112,16 @@ impl Cache {
             entry.live = false;
         }
         for r in ledger.reservations.iter().filter(|r| r.burst && r.granted) {
-            self.register(&r.identity)?;
-            if let Some(entry) = self.entries.iter_mut().find(|e| e.identity == r.identity) {
-                entry.live = true;
-            }
+            self.register_with(&r.identity, true)?;
         }
         self.poll_with(|identity| crate::host_native::burst_runtime(&identity).ok())
     }
 
     fn settle(&mut self, identity: &Identity, runtime: Option<u64>, completed: Instant) {
+        // Failed queue-only probes confer no admission evidence. Drop them
+        // promptly; never evict a live grant whose accounting still exists.
+        self.entries
+            .retain(|entry| &entry.identity != identity || entry.live || runtime.is_some());
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -141,7 +167,7 @@ impl Cache {
         candidates.sort_by_key(|entry| (!entry.live, entry.completed));
         let identities: Vec<_> = candidates
             .into_iter()
-            .take(8 - self.pending.len())
+            .take(MAX_LIVE - self.pending.len())
             .map(|entry| entry.identity.clone())
             .collect();
         let observe = std::sync::Arc::new(observe);
@@ -161,6 +187,116 @@ impl Cache {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn one_users_failed_probes_cannot_exhaust_another_users_registration() {
+        let mut cache = Cache::default();
+        let mut identity = Identity {
+            cgroup: "/burst.service".into(),
+            inode: 1,
+            uid: 1000,
+            pid: 1,
+            start_ticks: 7,
+        };
+        for pid in 1..=256 {
+            identity.pid = pid;
+            let _ = cache.register(&identity);
+        }
+        identity.uid = 1001;
+        identity.pid = 1000;
+        cache
+            .register(&identity)
+            .expect("one UID must not fill the shared observation cache");
+        assert!(cache.entries.len() <= MAX_PROBES_PER_UID + 1);
+    }
+
+    #[test]
+    fn failed_probes_release_slots_but_live_grants_survive_failed_queries() {
+        let mut cache = Cache::default();
+        let mut identity = Identity {
+            cgroup: "/burst.service".into(),
+            inode: 1,
+            uid: 1000,
+            pid: 1,
+            start_ticks: 7,
+        };
+        cache.register(&identity).unwrap();
+        cache.settle(&identity, None, Instant::now());
+        assert!(cache.entries.is_empty());
+        cache.register_with(&identity, true).unwrap();
+        cache.settle(&identity, None, Instant::now());
+        assert!(cache.entries[0].live);
+        for pid in 2..=9 {
+            identity.pid = pid;
+            cache.register(&identity).unwrap();
+        }
+        identity.pid = 10;
+        assert!(cache.register(&identity).is_err());
+        cache.register_with(&identity, true).unwrap();
+        assert_eq!(cache.entries.iter().filter(|entry| entry.live).count(), 2);
+    }
+
+    #[test]
+    fn queued_burst_grants_require_exact_fresh_evidence_after_native_capacity_validation() {
+        let policy: crate::host::HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":80,"reserve_bytes":20,"swap_reserve_bytes":0,
+            "max_memory_full_psi":1.0,"max_io_full_psi":20.0,"resume_ms":250,"aging_ms":1000,"queue_limit":32,
+            "burst":{"budget_bytes":20,"max_job_bytes":10,"max_running":1,"max_runtime_ms":5000,"min_interval_ms":0},
+            "domains":[{"name":"burst","uid":1000,"cgroup":"/burst","ceiling_bytes":10,"swap_bytes":0,"fair_share_bytes":80,"burst":true}]
+        })).unwrap();
+        let request: crate::host::Reservation = serde_json::from_value(serde_json::json!({
+            "id":"queued","domain":"burst","identity":{"cgroup":"/burst/queued","inode":1,"uid":1000,"pid":42,"start_ticks":7},
+            "memory_bytes":10,"swap_bytes":0,"requested_ms":0,"deadline_ms":30000,"granted":false,"owners":[],"burst":true,"runtime_max_ms":5000
+        })).unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.request(request.clone(), &policy).unwrap();
+        for (runtime, age, replaced) in [
+            (None, 0, false),
+            (Some(4000), 0, false),
+            (Some(5000), 2, false),
+            (Some(5000), 0, true),
+            (Some(5000), 0, false),
+        ] {
+            let mut identity = request.identity.clone();
+            if replaced {
+                identity.start_ticks += 1;
+            }
+            let snapshot = Snapshot(vec![Observation {
+                identity,
+                runtime,
+                completed: Some(Instant::now() - Duration::from_secs(age)),
+                requested: Instant::now(),
+                live: false,
+            }]);
+            let checked = std::cell::Cell::new(false);
+            ledger.advance_with_burst_runtime(
+                250,
+                &policy,
+                Some(crate::host::Capacity {
+                    available_bytes: 100,
+                    swap_free_bytes: 100,
+                    memory_full_psi: 0.0,
+                    io_full_psi: 0.0,
+                }),
+                &mut std::collections::BTreeMap::from([("burst".into(), 0)]),
+                |_, _| {
+                    checked.set(true);
+                    Some(100)
+                },
+                |identity| {
+                    assert!(
+                        checked.get(),
+                        "manager freshness is checked after native headroom validation"
+                    );
+                    snapshot.runtime(identity)
+                },
+            );
+            assert_eq!(
+                ledger.reservations[0].granted,
+                runtime == Some(5000) && age == 0 && !replaced
+            );
+        }
+    }
 
     #[test]
     fn slow_manager_queries_leave_broker_polling_nonblocking_and_replaced_peers_unproven() {

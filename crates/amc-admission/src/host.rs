@@ -667,7 +667,21 @@ impl HostLedger {
         policy: &HostPolicy,
         capacity: Option<Capacity>,
         healthy_since: &mut BTreeMap<String, u64>,
+        ancestry: impl FnMut(&Reservation, &[Reservation]) -> Option<u64>,
+    ) -> BTreeMap<String, WaitReason> {
+        self.advance_with_burst_runtime(now, policy, capacity, healthy_since, ancestry, |_| None)
+    }
+
+    /// New burst grants require fresh, exact native manager evidence. Persisted
+    /// runtime limits remain accounting data, not renewed enforcement proof.
+    pub fn advance_with_burst_runtime(
+        &mut self,
+        now: u64,
+        policy: &HostPolicy,
+        capacity: Option<Capacity>,
+        healthy_since: &mut BTreeMap<String, u64>,
         mut ancestry: impl FnMut(&Reservation, &[Reservation]) -> Option<u64>,
+        mut burst_runtime: impl FnMut(&Identity) -> Option<u64>,
     ) -> BTreeMap<String, WaitReason> {
         self.reservations
             .retain(|r| r.granted || now < r.deadline_ms);
@@ -791,6 +805,12 @@ impl HostLedger {
                 // Full ceilings remain counted over live usage in v1. Credit
                 // requires boundary-specific proof, not an RSS approximation.
                 self.completion_ancestry_wait(r, policy, &mut ancestry)
+                    .or_else(|| {
+                        (r.burst
+                            && (r.runtime_max_ms.is_none()
+                                || burst_runtime(&r.identity) != r.runtime_max_ms))
+                            .then_some(WaitReason::Unknown)
+                    })
             };
             if let Some(reason) = reason {
                 // An aged request whose own pressure gate is closed cannot
