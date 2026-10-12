@@ -70,48 +70,50 @@ impl StartupBarrier {
     }
 
     /// Called only with a pinned, live native identity. A pending connection is
-    /// not readiness. An unexpected peer fails closed instead of starting work.
+    /// not readiness. Drop unauthenticated connections without failing the launch;
+    /// bound each batch so a busy public socket cannot block cancellation/deadlines.
     pub(super) fn release(&self, main_pid: u32, group: &str) -> Result<bool> {
-        let (mut stream, _) = match self.listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        let peer = getsockopt(&stream, PeerCredentials)?;
-        if self.host_path.is_some() {
+        ensure!(main_pid > 0, "missing native startup MainPID");
+        for _ in 0..16 {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let peer = getsockopt(&stream, PeerCredentials)?;
+            if peer.uid() != geteuid().as_raw()
+                || (self.host_path.is_none() && (peer.pid() <= 0 || peer.pid() as u32 != main_pid))
+            {
+                continue;
+            }
+            if self.host_path.is_some() {
+                ensure!(
+                    group.starts_with('/') && group.len() <= 4096 && !group.contains('\n'),
+                    "invalid native runner group"
+                );
+                stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+                stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+                stream.write_all(format!("{main_pid}\n{group}\n").as_bytes())?;
+                let mut response = [0];
+                stream.read_exact(&mut response)?;
+                ensure!(
+                    response == [1],
+                    "host runner rejected native startup identity"
+                );
+                return Ok(true);
+            }
+            let placement = std::fs::read_to_string(format!("/proc/{main_pid}/cgroup"))?;
             ensure!(
-                main_pid > 0 && peer.uid() == geteuid().as_raw(),
-                "host runner UID mismatch"
-            );
-            ensure!(
-                group.starts_with('/') && group.len() <= 4096 && !group.contains('\n'),
-                "invalid native runner group"
+                placement
+                    .lines()
+                    .any(|line| line.strip_prefix("0::") == Some(group)),
+                "startup helper does not match native cgroup"
             );
             stream.set_write_timeout(Some(Duration::from_millis(100)))?;
-            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-            stream.write_all(format!("{main_pid}\n{group}\n").as_bytes())?;
-            let mut response = [0];
-            stream.read_exact(&mut response)?;
-            ensure!(
-                response == [1],
-                "host runner rejected native startup identity"
-            );
+            stream.write_all(&[1])?;
             return Ok(true);
         }
-        ensure!(
-            main_pid > 0 && peer.pid() as u32 == main_pid && peer.uid() == geteuid().as_raw(),
-            "startup helper does not match native MainPID/UID"
-        );
-        let placement = std::fs::read_to_string(format!("/proc/{main_pid}/cgroup"))?;
-        ensure!(
-            placement
-                .lines()
-                .any(|line| line.strip_prefix("0::") == Some(group)),
-            "startup helper does not match native cgroup"
-        );
-        stream.set_write_timeout(Some(Duration::from_millis(100)))?;
-        stream.write_all(&[1])?;
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -241,11 +243,55 @@ mod tests {
         assert!(helper.read_exact(&mut [0]).is_err());
         let mut helper = UnixStream::connect_addr(&address(barrier.name()).unwrap()).unwrap();
         assert!(
-            barrier
+            !barrier
                 .release(std::process::id() + 1, "/unrelated")
-                .is_err()
+                .unwrap()
         );
         assert!(helper.read_exact(&mut [0]).is_err());
+    }
+
+    #[test]
+    fn unrelated_socket_peers_do_not_abort_native_startup() {
+        const SOCKET_ENV: &str = "AMC_TEST_UNAUTHENTICATED_STARTUP_SOCKET";
+        if let Ok(name) = std::env::var(SOCKET_ENV) {
+            // A distinct process of the same UID queues unauthenticated peers.
+            // Kernel credentials survive disconnect until the runner accepts.
+            let peers: Vec<_> = (0..20)
+                .map(|_| UnixStream::connect_addr(&address(&name).unwrap()).unwrap())
+                .collect();
+            assert_eq!(peers.len(), 20);
+            return;
+        }
+        let barrier = barrier();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "systemd::startup::tests::unrelated_socket_peers_do_not_abort_native_startup",
+            ])
+            .env(SOCKET_ENV, barrier.name())
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        let placement = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let group = placement
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        let mut helper = UnixStream::connect_addr(&address(barrier.name()).unwrap()).unwrap();
+        helper
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut released = false;
+        for _ in 0..4 {
+            if barrier.release(std::process::id(), group).unwrap() {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "untrusted peers must not consume the rendezvous");
+        let mut ack = [0];
+        helper.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [1]);
     }
 
     #[test]
