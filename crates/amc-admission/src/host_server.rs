@@ -21,6 +21,7 @@ use std::{
 };
 
 pub(crate) mod preparation_auth;
+pub use preparation_auth::PreparationAuthorization;
 mod recovery_manager;
 mod transport;
 
@@ -120,6 +121,9 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(default)]
     pub preparation: Option<crate::preparation::Preparation>,
+    /// Revealed only after a successful native Consume, never in status or Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_consume_proof: Option<String>,
     #[serde(default)]
     pub preparations: Option<Vec<crate::preparation::Preparation>>,
     #[serde(default)]
@@ -1056,6 +1060,7 @@ impl PendingInventory {
 fn public_preparation(p: &crate::preparation::Preparation) -> crate::preparation::Preparation {
     let mut public = p.clone();
     public.key.clear();
+    public.consume_proof = None;
     public
 }
 
@@ -1411,6 +1416,7 @@ fn handle_advance_request(
             }
             ledger.consume(&id, &key, uid, native, now)?;
             reply.granted = true;
+            reply.preparation_consume_proof = p.consume_proof;
             reply.ticket = Some(id);
         }
         Request::RecoveryTargets { version } => {
@@ -1912,6 +1918,34 @@ mod tests {
             .remove("native_target");
         let legacy = Some(serde_json::from_value(legacy).unwrap());
         assert!(!inventory_recovery_matches(&legacy, &legacy).unwrap());
+    }
+
+    #[test]
+    fn public_preparations_never_disclose_completion_proof() {
+        let key = "11111111-1111-1111-1111-111111111111";
+        let proof = "22222222-2222-2222-2222-222222222222";
+        let preparation: crate::preparation::Preparation = serde_json::from_value(serde_json::json!({
+            "id":"intent","key":key,"consume_proof":proof,"uid":1000,
+            "owner":{"pid":42,"start_ticks":7},"origin":{"pid":43,"start_ticks":8},"helper_cgroup_inode":1,
+            "profile":"game","domain":"game","memory_bytes":40,"swap_bytes":0,
+            "requested_ms":0,"expires_ms":15000,"wait_ms":10000,"ready_ms":15000,
+            "phase":"ready","drain_domains":[],"drain":[],"waiting":null
+        })).unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.preparations.push(preparation);
+        for uid in [0, 1000, 1001] {
+            let mut reply = Response {
+                version: 1,
+                ..Default::default()
+            };
+            populate_status(&mut reply, &ledger, uid);
+            reply.preparation = Some(public_preparation(&ledger.preparations[0]));
+            let public = serde_json::to_string(&reply).unwrap();
+            assert!(!public.contains(key));
+            assert!(!public.contains(proof));
+            assert!(reply.preparation_consume_proof.is_none());
+        }
+        assert_eq!(ledger.preparations[0].consume_proof.as_deref(), Some(proof));
     }
 
     #[test]

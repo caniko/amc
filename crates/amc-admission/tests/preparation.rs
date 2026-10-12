@@ -83,6 +83,55 @@ fn advance(l: &mut HostLedger, p: &HostPolicy, now: u64) -> BTreeMap<String, Wai
 }
 
 #[test]
+fn consumption_proof_survives_restart_and_exact_native_replay() {
+    let p = policy();
+    let proof = "22222222-2222-2222-2222-222222222222";
+    let mut ledger = HostLedger::new("boot".into());
+    ledger.swap_return_bytes = Some(0);
+    ledger
+        .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+        .unwrap();
+    ledger.preparations[0].origin = Some(amc_admission::ledger::ClientIdentity {
+        pid: 43,
+        start_ticks: 8,
+    });
+    ledger.preparations[0].helper_cgroup_inode = Some(1);
+    ledger.preparations[0].consume_proof = Some(proof.into());
+    advance(&mut ledger, &p, 250);
+    let mut restored: HostLedger =
+        serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+    restored.validate().unwrap();
+    assert!(
+        restored
+            .consume("intent", "key", 1000, job("intent", "game", 1000, 41), 500)
+            .is_err()
+    );
+    assert!(restored.reservations.is_empty());
+    assert_eq!(restored.preparations[0].phase, PreparationPhase::Ready);
+    restored
+        .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 500)
+        .unwrap();
+    let mut replay: HostLedger =
+        serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+    replay.validate().unwrap();
+    replay
+        .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 750)
+        .unwrap();
+    assert_eq!(replay.preparations[0].consume_proof.as_deref(), Some(proof));
+    assert_eq!(replay.reservations.len(), 1);
+    assert_eq!(replay.committed(), 40);
+    let mut legacy = serde_json::to_value(&replay).unwrap();
+    legacy["preparations"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("consume_proof");
+    let legacy: HostLedger = serde_json::from_value(legacy).unwrap();
+    legacy.validate().unwrap();
+    assert!(legacy.preparations[0].consume_proof.is_none());
+    assert_eq!(legacy.committed(), 40);
+}
+
+#[test]
 fn restart_rejects_changed_wait_policy_for_draining_and_ready_but_retains_consumed_claims() {
     for phase in [
         PreparationPhase::Draining,

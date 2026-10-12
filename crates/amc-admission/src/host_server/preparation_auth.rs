@@ -7,6 +7,15 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::{os::unix::net::UnixStream, path::Path};
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationAuthorization {
+    pub version: u32,
+    pub id: String,
+    pub key: String,
+    pub consume_proof: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Authorization {
     uid: u32,
@@ -15,6 +24,7 @@ pub(crate) struct Authorization {
     origin: ClientIdentity,
     profile: String,
     key: String,
+    consume_proof: String,
     expires_ms: u64,
 }
 
@@ -79,11 +89,12 @@ pub(super) fn authorize(
             origin,
             profile: profile.into(),
             key: crate::store::fresh_id()?,
+            consume_proof: crate::store::fresh_id()?,
             expires_ms: now.saturating_add(30_000),
         }
     };
     let callback = format!("/run/user/{uid}/amc-{id}/authorize");
-    deliver(Path::new(&callback), &authorization)?;
+    deliver(Path::new(&callback), id, &authorization)?;
     ledger
         .preparation_authorizations
         .insert(id.into(), authorization);
@@ -111,11 +122,12 @@ pub(super) fn helper_boundary(id: &str, uid: u32, helper: &ClientIdentity) -> Re
     Ok(std::fs::metadata(crate::native::cgroup_directory(&expected)?)?.ino())
 }
 
-fn deliver(path: &Path, authorization: &Authorization) -> Result<()> {
+fn deliver(path: &Path, id: &str, authorization: &Authorization) -> Result<()> {
     use nix::sys::socket::{
         AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket,
         sockopt::PeerCredentials,
     };
+    use std::io::Write;
     use std::os::fd::AsRawFd;
     // A full caller-owned listen backlog or unread callback cannot occupy the
     // broker loop. No user-controlled response is read on this connection.
@@ -133,7 +145,20 @@ fn deliver(path: &Path, authorization: &Authorization) -> Result<()> {
         "preparation callback is not the nominated rendezvous process"
     );
     host_native::prepared_origin(&authorization.origin, authorization.uid)?;
-    crate::protocol::write_frame(&mut stream, &authorization.key)?;
+    let mut frame = serde_json::to_vec(&PreparationAuthorization {
+        version: 1,
+        id: id.into(),
+        key: authorization.key.clone(),
+        consume_proof: authorization.consume_proof.clone(),
+    })?;
+    frame.push(b'\n');
+    ensure!(frame.len() <= 1024, "preparation callback exceeds bound");
+    // write_frame polls on EAGAIN even for a nonblocking socket. This small
+    // callback instead makes one nonblocking write and fails on a short send.
+    ensure!(
+        stream.write(&frame)? == frame.len(),
+        "incomplete preparation callback"
+    );
     host_native::prepared_origin(&authorization.origin, authorization.uid)?;
     Ok(())
 }
@@ -148,7 +173,7 @@ pub(super) fn prepare(
     policy: &HostPolicy,
 ) -> Result<()> {
     let (uid, helper) = peer;
-    let (origin, helper_cgroup_inode) =
+    let (origin, helper_cgroup_inode, consume_proof) =
         if let Some(previous) = ledger.preparations.iter().find(|p| p.id == id) {
             ensure!(
                 previous.uid == uid
@@ -164,6 +189,7 @@ pub(super) fn prepare(
                 previous
                     .helper_cgroup_inode
                     .ok_or_else(|| anyhow::anyhow!("preparation helper invocation missing"))?,
+                previous.consume_proof.clone(),
             )
         } else {
             let authorization = ledger
@@ -181,6 +207,7 @@ pub(super) fn prepare(
             (
                 authorization.origin.clone(),
                 authorization.helper_cgroup_inode,
+                Some(authorization.consume_proof.clone()),
             )
         };
     host_native::prepared_origin(&origin, uid)?;
@@ -196,6 +223,7 @@ pub(super) fn prepare(
         .expect("prepared intent");
     preparation.origin = Some(origin);
     preparation.helper_cgroup_inode = Some(helper_cgroup_inode);
+    preparation.consume_proof = consume_proof;
     ledger.preparation_authorizations.remove(id);
     Ok(())
 }
@@ -288,18 +316,24 @@ mod tests {
             origin: origin.clone(),
             profile: "game".into(),
             key: crate::store::fresh_id().unwrap(),
+            consume_proof: crate::store::fresh_id().unwrap(),
             expires_ms: 30_000,
         };
-        deliver(&root.join("authorize"), &binding).unwrap();
+        deliver(&root.join("authorize"), "intent", &binding).unwrap();
         let (mut callback, _) = listener.accept().unwrap();
-        let secret: String = crate::protocol::read_frame(&mut callback).unwrap();
-        assert_eq!(secret, binding.key);
+        let receipt: PreparationAuthorization = crate::protocol::read_frame(&mut callback).unwrap();
+        assert_eq!(receipt.version, 1);
+        assert_eq!(receipt.id, "intent");
+        assert_eq!(receipt.key, binding.key);
+        assert_eq!(receipt.consume_proof, binding.consume_proof);
+        assert_ne!(receipt.consume_proof, receipt.key);
+        let secret = receipt.key;
 
         let mut wrong_origin = binding.clone();
         wrong_origin.origin.start_ticks += 1;
-        assert!(deliver(&root.join("authorize"), &wrong_origin).is_err());
+        assert!(deliver(&root.join("authorize"), "intent", &wrong_origin).is_err());
         wrong_origin.origin = helper.clone();
-        assert!(deliver(&root.join("authorize"), &wrong_origin).is_err());
+        assert!(deliver(&root.join("authorize"), "intent", &wrong_origin).is_err());
 
         let mut ledger = HostLedger::new("boot".into());
         ledger
@@ -354,9 +388,17 @@ mod tests {
             "authorization must be consumed exactly once"
         );
         assert_eq!(ledger.preparations[0].origin, Some(origin));
+        assert_eq!(
+            ledger.preparations[0].consume_proof.as_ref(),
+            Some(&receipt.consume_proof)
+        );
         assert!(ledger.preparation_barrier());
         let mut restored: HostLedger =
             serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert_eq!(
+            restored.preparations[0].consume_proof.as_ref(),
+            Some(&receipt.consume_proof)
+        );
         prepare(
             &mut restored,
             "intent",

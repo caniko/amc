@@ -85,6 +85,10 @@ pub struct Preparation {
     pub id: String,
     /// Never include the capability in public status replies.
     pub key: String,
+    /// Independent completion secret; public projections must remove it. The
+    /// waiter knows it before launch, the helper learns it only after Consume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consume_proof: Option<String>,
     pub uid: u32,
     /// Authenticated host helper lifetime; absent only in pre-upgrade snapshots.
     #[serde(default)]
@@ -243,6 +247,7 @@ impl HostLedger {
         self.preparations.push(Preparation {
             id,
             key,
+            consume_proof: None,
             uid,
             owner: Some(owner),
             origin: None,

@@ -377,6 +377,14 @@ impl HostLedger {
             ensure!(
                 crate::ledger::valid_name(&p.id)
                     && crate::ledger::valid_name(&p.key)
+                    && p.consume_proof.as_ref().is_none_or(|proof| {
+                        proof.len() == 36
+                            && crate::ledger::valid_name(proof)
+                            && proof != &p.key
+                            && p.owner.is_some()
+                            && p.origin.is_some()
+                            && p.helper_cgroup_inode.is_some()
+                    })
                     && crate::ledger::valid_name(&p.profile)
                     && crate::ledger::valid_name(&p.domain)
                     && p.uid != 0

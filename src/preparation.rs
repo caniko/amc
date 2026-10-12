@@ -72,11 +72,24 @@ fn prepare_ready(
     intent: &Intent,
     profile: String,
     signals: &crate::control::Signals,
+    pulse: impl FnMut() -> Result<()>,
+) -> Result<Response> {
+    prepare_ready_using(intent, profile, signals, pulse, |request, deadline| {
+        broker_call(&intent.socket, request, deadline, || {
+            signals.cancelled().is_some()
+        })
+    })
+}
+
+fn prepare_ready_using(
+    intent: &Intent,
+    profile: String,
+    signals: &crate::control::Signals,
     mut pulse: impl FnMut() -> Result<()>,
+    mut rpc: impl FnMut(&Request, Instant) -> Result<Response>,
 ) -> Result<Response> {
     let mut deadline = Instant::now() + Duration::from_secs(30);
-    let mut reply = broker_call(
-        &intent.socket,
+    let mut reply = rpc(
         &Request::Prepare {
             version: 1,
             id: intent.id.clone(),
@@ -84,7 +97,6 @@ fn prepare_ready(
             profile,
         },
         deadline,
-        || signals.cancelled().is_some(),
     )?;
     if let Some(p) = &reply.preparation {
         deadline = polling_deadline(p, amc_admission::clock::boot_ms()?, Instant::now())?;
@@ -98,15 +110,13 @@ fn prepare_ready(
             previous = reply.waiting;
         }
         thread::sleep(Duration::from_millis(250));
-        reply = broker_call(
-            &intent.socket,
+        reply = rpc(
             &Request::Preparation {
                 version: 1,
                 id: intent.id.clone(),
                 key: intent.key.clone(),
             },
             deadline,
-            || signals.cancelled().is_some(),
         )?;
     }
     ensure!(signals.cancelled().is_none(), "preparation cancelled");
@@ -209,6 +219,51 @@ fn payload_environment(value: &str) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn polling_can_observe_ready_after_the_original_draining_deadline() {
+        let intent = Intent {
+            socket: "/amc-nonexistent/admission.sock".into(),
+            id: "intent".into(),
+            key: "key".into(),
+        };
+        let signals = crate::control::Signals::install().unwrap();
+        let mut replies = 0;
+        let ready = prepare_ready_using(
+            &intent,
+            "game".into(),
+            &signals,
+            || Ok(()),
+            |request, deadline| {
+                ensure!(
+                    Instant::now() < deadline,
+                    "preparation cancelled or timed out"
+                );
+                replies += 1;
+                if matches!(request, Request::Prepare { .. }) {
+                    let now = amc_admission::clock::boot_ms()?;
+                    return Ok(serde_json::from_value(serde_json::json!({
+                        "version":1,"granted":false,"ticket":"intent","waiting":"draining","committed_bytes":0,"reservations":null,"error":null,
+                        "preparation":{"id":"intent","key":"","uid":1000,"profile":"game","domain":"game",
+                            "memory_bytes":40,"swap_bytes":0,"requested_ms":now,"expires_ms":now+50,
+                            "wait_ms":1000,"ready_ms":15000,"phase":"draining","drain":[],"waiting":"draining"}
+                    }))?);
+                }
+                assert!(matches!(request, Request::Preparation { .. }));
+                Ok(Response {
+                    version: 1,
+                    granted: true,
+                    ..Default::default()
+                })
+            },
+        );
+        assert!(
+            ready
+                .expect("Ready may be reached during the final polling interval")
+                .granted
+        );
+        assert_eq!(replies, 2);
+    }
+
     #[test]
     fn polling_deadline_includes_the_broker_ready_extension() {
         let mut preparation: amc_admission::preparation::Preparation = serde_json::from_value(serde_json::json!({

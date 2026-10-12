@@ -82,7 +82,11 @@ fn projected_claims(allowances: &BTreeMap<u32, u64>) -> Vec<Reservation> {
 
 fn aggregate_empty(uid: u32) -> Option<bool> {
     let directory = crate::native::cgroup_directory(&cgroup(uid)).ok()?;
-    match fs::metadata(&directory) {
+    aggregate_empty_at(&directory)
+}
+
+fn aggregate_empty_at(directory: &Path) -> Option<bool> {
+    match fs::metadata(directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
         Err(_) => None,
         Ok(_) => {
@@ -118,8 +122,24 @@ fn reconcile_with(
 /// Observe only current enrollment or durable, authenticated allowances. A
 /// user-created slice alone does not establish past enrollment at startup.
 pub(crate) fn discover(ledger: &mut HostLedger, policy: &HostPolicy) -> Result<()> {
+    discover_reconciled_at(ledger, policy, Path::new("/sys/fs/cgroup/user.slice"))
+}
+
+fn discover_reconciled_at(ledger: &mut HostLedger, policy: &HostPolicy, root: &Path) -> Result<()> {
+    ensure!(
+        ledger.namespace_runners.len() <= 256,
+        "runner discovery exceeds bound"
+    );
+    // Retained keys can have emptied while the broker was stopped. Reconcile
+    // positive native cleanup before combining them with new enrollment, so a
+    // full historical ledger does not permanently prevent a valid restart.
+    ledger.namespace_runners.retain(|uid, _| {
+        aggregate_empty_at(&root.join(format!(
+            "user-{uid}.slice/user@{uid}.service/app.slice/app-amchostrunner.slice"
+        ))) != Some(true)
+    });
     ledger.namespace_runners = allowances(&ledger.namespace_runners, policy);
-    discover_at(ledger, Path::new("/sys/fs/cgroup/user.slice"))
+    discover_at(ledger, root)
 }
 
 fn discover_at(ledger: &mut HostLedger, root: &Path) -> Result<()> {
@@ -258,6 +278,53 @@ pub fn verify(pid: i32, uid: u32, policy: &HostPolicy, claims: &[Reservation]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_retained_runners_are_reconciled_before_the_startup_key_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-runner-key-cap-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version":1,"budget_bytes":1073741824,"reserve_bytes":67108864,"swap_reserve_bytes":0,
+            "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
+            "namespace_runner_bytes":67108864,
+            "domains":[{"name":"new-user","uid":3000,"cgroup":"/new-user","ceiling_bytes":100,"swap_bytes":0,"fair_share_bytes":100}]
+        })).unwrap();
+        let mut saved = HostLedger::new("boot".into());
+        for uid in 1000..1256 {
+            saved.namespace_runners.insert(uid, SERVICE_BYTES);
+            let directory = root.join(format!(
+                "user-{uid}.slice/user@{uid}.service/app.slice/app-amchostrunner.slice"
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("cgroup.events"), "populated 1\n").unwrap();
+            fs::write(directory.join("memory.max"), SERVICE_BYTES.to_string()).unwrap();
+        }
+        let empty =
+            root.join("user-1255.slice/user@1255.service/app.slice/app-amchostrunner.slice");
+        for events in ["populated 1\n", "unavailable\n"] {
+            let mut restored: HostLedger =
+                serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            fs::write(empty.join("cgroup.events"), events).unwrap();
+            assert!(discover_reconciled_at(&mut restored, &policy, &root).is_err());
+            assert_eq!(restored.namespace_runners.get(&1255), Some(&SERVICE_BYTES));
+        }
+        let mut restored: HostLedger =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        fs::write(empty.join("cgroup.events"), "populated 0\n").unwrap();
+        // Exercise the startup order, using the same filesystem discovery that
+        // retains surviving native ceilings. One obsolete key must free room.
+        let result = discover_reconciled_at(&mut restored, &policy, &root);
+        fs::remove_dir_all(root).unwrap();
+        result.expect("positive empty evidence must free a key before current enrollment");
+        assert_eq!(restored.namespace_runners.len(), 256);
+        assert!(!restored.namespace_runners.contains_key(&1255));
+        assert_eq!(restored.namespace_runners.get(&3000), Some(&SERVICE_BYTES));
+        for uid in 1000..1255 {
+            assert_eq!(restored.namespace_runners.get(&uid), Some(&SERVICE_BYTES));
+        }
+    }
+
     #[test]
     fn unrelated_user_directories_cannot_exhaust_authenticated_runner_discovery() {
         let root = std::env::temp_dir().join(format!(

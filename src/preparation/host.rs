@@ -3,7 +3,7 @@
 use super::{Intent, PrepareArgs, broker_call, exec_payload, prepare_ready};
 use amc_admission::{
     host_native,
-    host_server::{Request, Response},
+    host_server::{PreparationAuthorization, Request, Response},
     ledger::ClientIdentity,
     protocol::{read_frame, write_frame},
 };
@@ -45,6 +45,8 @@ struct Progress {
     error: Option<String>,
     #[serde(default)]
     authorize: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consume_proof: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -54,6 +56,21 @@ struct AuthorizationAck {
     key: String,
 }
 
+fn verify_progress(reply: &Progress, token: &str, consume_proof: Option<&str>) -> Result<()> {
+    ensure!(reply.token == token, "prepared helper session mismatch");
+    ensure!(
+        if reply.granted {
+            !reply.authorize
+                && consume_proof.is_some()
+                && reply.consume_proof.as_deref() == consume_proof
+        } else {
+            reply.consume_proof.is_none()
+        },
+        "prepared grant has no matching broker consumption proof"
+    );
+    Ok(())
+}
+
 // Each frame is acknowledged before another is sent: read_frame is deliberately
 // one-frame-only, and this prevents coalesced progress/ready frames being lost.
 fn progress(
@@ -61,6 +78,7 @@ fn progress(
     token: &str,
     granted: bool,
     error: Option<String>,
+    consume_proof: Option<String>,
 ) -> Result<()> {
     write_frame(
         stream,
@@ -69,6 +87,7 @@ fn progress(
             granted,
             error,
             authorize: false,
+            consume_proof,
         },
     )?;
     let ack: String = read_frame(stream)?;
@@ -152,9 +171,10 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
     );
     stream.set_read_timeout(Some(Duration::from_secs(35)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut consume_proof = None;
     loop {
         let reply: Progress = read_frame(&mut stream)?;
-        ensure!(reply.token == token, "prepared helper session mismatch");
+        verify_progress(&reply, &token, consume_proof.as_deref())?;
         if let Some(signal) = signals.cancelled() {
             return Ok(128 + signal);
         }
@@ -162,7 +182,10 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
             anyhow::bail!("prepared host helper: {error}");
         }
         if reply.authorize {
-            ensure!(!reply.granted, "invalid prepared authorization frame");
+            ensure!(
+                consume_proof.is_none(),
+                "repeated prepared authorization frame"
+            );
             let mut callback = loop {
                 ensure!(
                     Instant::now() < deadline && signals.cancelled().is_none(),
@@ -184,16 +207,23 @@ pub(super) fn execute(args: PrepareArgs) -> Result<i32> {
                 "prepared authorization callback UID mismatch"
             );
             callback.set_read_timeout(Some(Duration::from_secs(2)))?;
-            let key: String = read_frame(&mut callback)?;
+            let receipt: PreparationAuthorization = read_frame(&mut callback)?;
             ensure!(
-                key.len() == 36 && amc_admission::ledger::valid_name(&key),
-                "invalid prepared authorization key"
+                receipt.version == 1
+                    && receipt.id == id
+                    && receipt.key.len() == 36
+                    && amc_admission::ledger::valid_name(&receipt.key)
+                    && receipt.consume_proof.len() == 36
+                    && amc_admission::ledger::valid_name(&receipt.consume_proof)
+                    && receipt.consume_proof != receipt.key,
+                "invalid prepared authorization receipt"
             );
+            consume_proof = Some(receipt.consume_proof);
             write_frame(
                 &mut stream,
                 &AuthorizationAck {
                     token: token.clone(),
-                    key,
+                    key: receipt.key,
                 },
             )?;
             continue;
@@ -291,6 +321,7 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
                 granted: false,
                 error: None,
                 authorize: true,
+                consume_proof: None,
             },
         )?;
         let ack: AuthorizationAck = read_frame(&mut stream)?;
@@ -306,7 +337,7 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
             key: ack.key,
         };
         let reply = prepare_ready(&intent, args.profile, &signals, || {
-            progress(&mut stream, &token, false, None)
+            progress(&mut stream, &token, false, None, None)
         })?;
         // Pin the original host PID/start pair around native registration. The
         // waiting process stays alive and cannot execute its command before ack.
@@ -344,10 +375,16 @@ pub(super) fn serve(args: HostArgs) -> Result<i32> {
             || signals.cancelled().is_some(),
         )?;
         ensure!(reply.granted, "broker did not transfer prepared capacity");
-        progress(&mut stream, &token, true, None)
+        progress(
+            &mut stream,
+            &token,
+            true,
+            None,
+            reply.preparation_consume_proof,
+        )
     })();
     if let Err(error) = &result {
-        let _ = progress(&mut stream, &token, false, Some(format!("{error:#}")));
+        let _ = progress(&mut stream, &token, false, Some(format!("{error:#}")), None);
     }
     result.map(|()| 0)
 }
@@ -489,6 +526,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_same_uid_progress_peer_cannot_grant_without_broker_consumption() {
+        let (mut attacker, mut waiter) = UnixStream::pair().unwrap();
+        write_frame(
+            &mut attacker,
+            &Progress {
+                token: "known-rendezvous-token".into(),
+                granted: true,
+                error: None,
+                authorize: false,
+                consume_proof: None,
+            },
+        )
+        .unwrap();
+        let mut forged: Progress = read_frame(&mut waiter).unwrap();
+        assert!(
+            verify_progress(&forged, "known-rendezvous-token", None).is_err(),
+            "the shared token must not open the payload gate without broker authority"
+        );
+        assert!(
+            verify_progress(
+                &forged,
+                "known-rendezvous-token",
+                Some("private-consume-proof")
+            )
+            .is_err(),
+            "even after authorization, knowing the helper key must not prove consumption"
+        );
+        forged.consume_proof = Some("helper-authorization-key".into());
+        assert!(
+            verify_progress(
+                &forged,
+                "known-rendezvous-token",
+                Some("private-consume-proof")
+            )
+            .is_err()
+        );
+        forged.consume_proof = Some("private-consume-proof".into());
+        assert!(verify_progress(&forged, "known-rendezvous-token", None).is_err());
+        verify_progress(
+            &forged,
+            "known-rendezvous-token",
+            Some("private-consume-proof"),
+        )
+        .unwrap();
+        forged.authorize = true;
+        assert!(
+            verify_progress(
+                &forged,
+                "known-rendezvous-token",
+                Some("private-consume-proof")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn generated_helper_argv_parses_literal_hyphen_leading_profiles() {
         use clap::Parser;
         for profile in ["game-$literal", "-game", "--game", "--"] {
@@ -525,8 +618,8 @@ mod tests {
         let (mut host, mut waiter) = UnixStream::pair().unwrap();
         host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let thread = thread::spawn(move || {
-            progress(&mut host, "session", false, None).unwrap();
-            assert!(progress(&mut host, "session", true, None).is_err());
+            progress(&mut host, "session", false, None, None).unwrap();
+            assert!(progress(&mut host, "session", true, None, Some("proof".into())).is_err());
         });
         let first: Progress = read_frame(&mut waiter).unwrap();
         assert!(!first.granted);
@@ -538,6 +631,6 @@ mod tests {
 
         let (mut host, waiter) = UnixStream::pair().unwrap();
         drop(waiter);
-        assert!(progress(&mut host, "session", false, None).is_err());
+        assert!(progress(&mut host, "session", false, None, None).is_err());
     }
 }
