@@ -109,6 +109,26 @@ impl ContinuationPolicy {
 }
 
 impl HostLedger {
+    /// A removed child domain withdraws its completion contract. Revoke the
+    /// untransferred escrow and queued children together; consumed native grants
+    /// remain independently charged until positive cleanup proves their exit.
+    pub fn reconcile_continuation_policy(&mut self, policy: &HostPolicy) {
+        self.continuations.retain(|c| {
+            c.policy
+                .domains
+                .iter()
+                .all(|name| policy.domains.iter().any(|domain| &domain.name == name))
+        });
+        self.reservations.retain(|r| {
+            r.granted
+                || r.continuation.as_ref().is_none_or(|parent| {
+                    self.continuations
+                        .iter()
+                        .any(|c| &c.capability.parent == parent)
+                })
+        });
+    }
+
     pub(crate) fn completion_spec<'a>(
         &self,
         r: &Reservation,

@@ -297,6 +297,7 @@ pub fn serve_supervised(
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
     ledger.swap_return_bytes = None;
+    ledger.reconcile_continuation_policy(&policy);
     crate::namespace_runner::discover(&mut ledger, &policy)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
     reconcile_preparation_helpers(&mut ledger, &policy);
@@ -1137,6 +1138,7 @@ fn observe(
     // collected scope for damaged enforcement until the next periodic tick.
     // Unknown cleanup and surviving descendants retain their claims.
     ledger.reconcile(host_native::empty_reservation);
+    ledger.reconcile_continuation_policy(policy);
     ledger.retain_pool_operations();
     crate::namespace_runner::reconcile(ledger, policy);
     if ledger.recovery.is_none()

@@ -686,6 +686,7 @@ impl HostLedger {
         self.reservations
             .retain(|r| r.granted || now < r.deadline_ms);
         self.retain_continuations();
+        self.reconcile_continuation_policy(policy);
         // Every supported cooldown is <= one hour; older history can be pruned.
         self.burst_last_granted
             .retain(|_, last| now.saturating_sub(*last) <= 3_600_000);
