@@ -115,9 +115,10 @@ fn reconcile_with(
     ledger.namespace_runners = allowances(&ledger.namespace_runners, policy);
 }
 
-/// Upgrade from older snapshots also discovers still-populated aggregate slices
-/// whose users disappeared from the new policy. This runs once before listening.
-pub(crate) fn discover(ledger: &mut HostLedger) -> Result<()> {
+/// Observe only current enrollment or durable, authenticated allowances. A
+/// user-created slice alone does not establish past enrollment at startup.
+pub(crate) fn discover(ledger: &mut HostLedger, policy: &HostPolicy) -> Result<()> {
+    ledger.namespace_runners = allowances(&ledger.namespace_runners, policy);
     discover_at(ledger, Path::new("/sys/fs/cgroup/user.slice"))
 }
 
@@ -147,6 +148,9 @@ fn discover_at(ledger: &mut HostLedger, root: &Path) -> Result<()> {
         else {
             continue;
         };
+        if !ledger.namespace_runners.contains_key(&uid) {
+            continue;
+        }
         let directory = entry.path().join(format!(
             "user@{uid}.service/app.slice/app-amchostrunner.slice"
         ));
@@ -268,6 +272,31 @@ pub fn verify(pid: i32, uid: u32, policy: &HostPolicy, claims: &[Reservation]) -
 mod tests {
     use super::*;
     #[test]
+    fn startup_discovery_ignores_unenrolled_user_created_runner_slices() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-runner-unenrolled-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.namespace_runners.insert(1000, SERVICE_BYTES);
+        for uid in [1000, 9999] {
+            let directory = root.join(format!(
+                "user-{uid}.slice/user@{uid}.service/app.slice/app-amchostrunner.slice"
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("cgroup.events"), "populated 1\n").unwrap();
+            fs::write(directory.join("memory.max"), SERVICE_BYTES.to_string()).unwrap();
+        }
+        discover_at(&mut ledger, &root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            ledger.namespace_runners,
+            BTreeMap::from([(1000, SERVICE_BYTES)]),
+            "an arbitrary user's populated slice must not acquire a durable allowance"
+        );
+    }
+
+    #[test]
     fn removed_users_keep_their_runner_allowance_across_restart_until_positive_cleanup() {
         let policy: HostPolicy = serde_json::from_value(serde_json::json!({
             "version":1,"budget_bytes":1073741824,"reserve_bytes":134217728,"swap_reserve_bytes":0,
@@ -306,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_upgrade_discovers_removed_users_native_runner_ceilings() {
+    fn startup_preserves_authenticated_removed_users_native_runner_ceilings() {
         let root = std::env::temp_dir().join(format!(
             "amc-runner-upgrade-{}",
             crate::store::fresh_id().unwrap()
@@ -317,6 +346,7 @@ mod tests {
         fs::write(directory.join("cgroup.events"), "populated 1\n").unwrap();
         fs::write(directory.join("memory.max"), SERVICE_BYTES.to_string()).unwrap();
         let mut ledger = HostLedger::new("boot".into());
+        ledger.namespace_runners.insert(1000, SERVICE_BYTES);
         discover_at(&mut ledger, &root).unwrap();
         assert_eq!(ledger.namespace_runners.get(&1000), Some(&SERVICE_BYTES));
         ledger.validate().unwrap();

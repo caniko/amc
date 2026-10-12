@@ -83,6 +83,43 @@ fn advance(l: &mut HostLedger, p: &HostPolicy, now: u64) -> BTreeMap<String, Wai
 }
 
 #[test]
+fn restart_rejects_changed_drain_domains_in_pending_and_ready_intents() {
+    for ready in [false, true] {
+        let mut p = policy();
+        p.preparations[0].drain_domains = vec!["work".into()];
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.swap_return_bytes = Some(0);
+        let mut running = job("builder", "builders", 0, 20);
+        running.granted = true;
+        ledger.reservations.push(running);
+        ledger
+            .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+            .unwrap();
+        if ready {
+            advance(&mut ledger, &p, 250);
+        }
+        let mut restored: HostLedger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        p.preparations[0].drain_domains.push("builders".into());
+        advance(&mut restored, &p, 500);
+        assert!(
+            restored.preparations.is_empty(),
+            "a changed drain policy must invalidate the old pending/ready capability"
+        );
+        assert!(
+            restored.reservations[0].granted,
+            "policy invalidation must retain already running work"
+        );
+        restored
+            .prepare("replacement".into(), "key".into(), peer(), "game", 501, &p)
+            .unwrap();
+        advance(&mut restored, &p, 750);
+        assert_eq!(restored.preparations[0].phase, PreparationPhase::Draining);
+        assert!(restored.preparations[0].drain.contains(&"builder".into()));
+    }
+}
+
+#[test]
 fn ready_preparation_blocks_new_recovery_until_native_transfer() {
     let p = policy();
     let mut ledger = HostLedger::new("boot".into());

@@ -97,8 +97,31 @@ pub struct Preparation {
     pub expires_ms: u64,
     pub ready_ms: u64,
     pub phase: PreparationPhase,
+    /// Original policy selection, distinct from the selected live operation IDs.
+    /// Legacy pending capabilities without this binding cannot become Ready.
+    #[serde(default)]
+    pub drain_domains: Option<Vec<String>>,
     pub drain: Vec<String>,
     pub waiting: Option<WaitReason>,
+}
+
+impl Preparation {
+    pub(crate) fn policy_matches(&self, policy: &HostPolicy) -> bool {
+        policy.preparations.iter().any(|spec| {
+            spec.name == self.profile
+                && spec.domain == self.domain
+                && spec.memory_bytes == self.memory_bytes
+                && spec.swap_bytes == self.swap_bytes
+                && spec.ready_ms == self.ready_ms
+                && self.drain_domains.as_ref().is_some_and(|domains| {
+                    domains.iter().collect::<std::collections::BTreeSet<_>>()
+                        == spec
+                            .drain_domains
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                })
+        })
+    }
 }
 
 impl HostLedger {
@@ -219,6 +242,7 @@ impl HostLedger {
             expires_ms: now.saturating_add(spec.wait_ms),
             ready_ms: spec.ready_ms,
             phase: PreparationPhase::Draining,
+            drain_domains: Some(spec.drain_domains.clone()),
             drain,
             waiting: Some(WaitReason::Draining),
         });
@@ -309,7 +333,9 @@ impl HostLedger {
         ancestry: &mut impl FnMut(&Reservation, &[Reservation]) -> Option<u64>,
     ) {
         self.preparations.retain(|p| match p.phase {
-            PreparationPhase::Draining | PreparationPhase::Ready => now < p.expires_ms,
+            PreparationPhase::Draining | PreparationPhase::Ready => {
+                now < p.expires_ms && p.policy_matches(policy)
+            }
             PreparationPhase::Active | PreparationPhase::Reconciling => {
                 self.reservations.iter().any(|r| r.id == p.id)
             }
@@ -327,12 +353,6 @@ impl HostLedger {
             return;
         }
         let p = &self.preparations[index];
-        let spec_matches = policy.preparations.iter().any(|spec| {
-            spec.name == p.profile
-                && spec.domain == p.domain
-                && spec.memory_bytes == p.memory_bytes
-                && spec.swap_bytes == p.swap_bytes
-        });
         let candidate = Reservation {
             id: p.id.clone(),
             domain: p.domain.clone(),
@@ -358,8 +378,7 @@ impl HostLedger {
             continuation: None,
             owners_finished: false,
         };
-        let waiting = if !spec_matches
-            || capacity.is_none()
+        let waiting = if capacity.is_none()
             || (policy.reserve_swap_return && self.swap_return_bytes.is_none())
         {
             Some(WaitReason::Unknown)

@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod recovery_manager;
 mod transport;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -289,7 +290,7 @@ pub fn serve_supervised(
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
     ledger.swap_return_bytes = None;
-    crate::namespace_runner::discover(&mut ledger)?;
+    crate::namespace_runner::discover(&mut ledger, &policy)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
     reconcile_preparation_helpers(&mut ledger, &policy);
     let parent = socket
@@ -328,9 +329,11 @@ pub fn serve_supervised(
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
     let mut burst_manager = crate::burst_manager::Cache::default();
+    let mut recovery_manager = recovery_manager::Cache::default();
     let mut connections = transport::Connections::default();
     while !stopping() {
         burst_manager.refresh(&ledger)?;
+        recovery_manager.refresh(ledger.recovery.as_ref())?;
         let burst_evidence = burst_manager.snapshot();
         if tick.elapsed() >= Duration::from_millis(250) {
             let before = serde_json::to_vec(&ledger)?;
@@ -344,7 +347,7 @@ pub fn serve_supervised(
                     }
                 }
             }
-            reconcile_recovery(&mut ledger);
+            reconcile_recovery(&mut ledger, &recovery_manager);
             reconcile_preparation_helpers(&mut ledger, &policy);
             let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
             waiting = ledger.advance(
@@ -367,6 +370,7 @@ pub fn serve_supervised(
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("native inventory worker failed")))
                 .and_then(|(reply, _native_demand, completed)| {
+                    let validated_lease = reply.recovery.clone();
                     InventoryReplay {
                         owner: &task.owner,
                         backing: &task.backing,
@@ -384,7 +388,14 @@ pub fn serve_supervised(
                             0,
                             &policy,
                             ledger,
-                            (health_file, Some(true), &burst_evidence),
+                            (
+                                health_file,
+                                Some(InventoryProof {
+                                    safe: true,
+                                    validated_lease: validated_lease.as_ref(),
+                                }),
+                                &burst_evidence,
+                            ),
                             &mut fresh,
                         )?;
                         Ok(fresh)
@@ -770,11 +781,34 @@ struct InventoryReplay<'a> {
     stream: &'a UnixStream,
 }
 
-// A result must reach the loop within one second. Its authenticated replay may
-// additionally spend the shared, bounded query budget validating the recovery
-// unit with systemd. Identity, demand and peer checks still apply at commit.
-const INVENTORY_REPLAY_MAX_AGE: Duration =
-    Duration::from_secs(1).saturating_add(amc_runner::systemd::QUERY_TIMEOUT);
+fn finish_inventory(
+    manager: impl FnOnce() -> Result<Response>,
+    native: impl FnOnce(Response) -> Result<Response>,
+) -> Result<(Response, Instant)> {
+    let response = native(manager()?)?;
+    Ok((response, Instant::now()))
+}
+
+#[derive(Clone, Copy)]
+struct InventoryProof<'a> {
+    safe: bool,
+    // Present only for the main loop's replay of a completed off-loop result.
+    // The worker checked the manager before revalidating the full frontier.
+    validated_lease: Option<&'a crate::recovery::RecoveryLease>,
+}
+
+fn recovery_invocation(identity: &Identity, proof: Option<InventoryProof<'_>>) -> Result<String> {
+    if let Some(lease) = proof.and_then(|p| p.validated_lease) {
+        ensure!(
+            lease.identity == *identity,
+            "recovery helper changed after native validation"
+        );
+        return lease.invocation_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("completed inventory has no manager invocation identity")
+        });
+    }
+    host_native::recovery_invocation(identity)
+}
 
 impl InventoryReplay<'_> {
     fn apply(
@@ -806,7 +840,7 @@ impl InventoryReplay<'_> {
             let fresh = replay(ledger)?;
             if fresh.granted {
                 ensure!(
-                    self.completed.elapsed() <= INVENTORY_REPLAY_MAX_AGE
+                    self.completed.elapsed() <= Duration::from_secs(1)
                         && host_native::owner_alive(self.owner) == Some(true)
                         && inventory_peer_connected(self.stream),
                     "native recovery replay expired before persistence"
@@ -913,10 +947,6 @@ impl PendingInventory {
         let worker = thread::Builder::new()
             .name("amc-native-inventory".into())
             .spawn(move || {
-                let mut reply = Response {
-                    version: 1,
-                    ..Default::default()
-                };
                 let (inventory_proof, native_demand) =
                     if matches!(&scan_request, Request::AcquireRecovery { .. }) {
                         let spec = scan_policy
@@ -956,24 +986,44 @@ impl PendingInventory {
                     } else {
                         (None, None)
                     };
-                handle_advance_request(
-                    scan_request,
-                    pid,
-                    0,
-                    &scan_policy,
-                    &mut scan_ledger,
-                    (health_file.as_deref(), inventory_proof, &burst_evidence),
-                    &mut reply,
+                let (reply, completed) = finish_inventory(
+                    || {
+                        let mut reply = Response {
+                            version: 1,
+                            ..Default::default()
+                        };
+                        handle_advance_request(
+                            scan_request,
+                            pid,
+                            0,
+                            &scan_policy,
+                            &mut scan_ledger,
+                            (
+                                health_file.as_deref(),
+                                inventory_proof.map(|safe| InventoryProof {
+                                    safe,
+                                    validated_lease: None,
+                                }),
+                                &burst_evidence,
+                            ),
+                            &mut reply,
+                        )?;
+                        Ok(reply)
+                    },
+                    |reply| {
+                        if reply.granted {
+                            ensure!(
+                                native_demand.as_ref().map_or(
+                                    Ok(true),
+                                    crate::swap::NativeReturnInventory::current
+                                )?,
+                                "native recovery demand or frontier changed during inventory replay"
+                            );
+                        }
+                        Ok(reply)
+                    },
                 )?;
-                if reply.granted {
-                    ensure!(
-                        native_demand
-                            .as_ref()
-                            .map_or(Ok(true), crate::swap::NativeReturnInventory::current)?,
-                        "native recovery demand or frontier changed during inventory replay"
-                    );
-                }
-                Ok((reply, native_demand, Instant::now()))
+                Ok((reply, native_demand, completed))
             })?;
         Ok(Self {
             stream,
@@ -1116,7 +1166,7 @@ fn cached_enforcement(r: &Reservation, evidence: &crate::burst_manager::Snapshot
                 .is_some_and(|runtime| Some(runtime) == r.runtime_max_ms))
 }
 
-fn reconcile_recovery(ledger: &mut HostLedger) {
+fn reconcile_recovery(ledger: &mut HostLedger, manager: &recovery_manager::Cache) {
     let Some(lease) = &ledger.recovery else {
         return;
     };
@@ -1139,7 +1189,7 @@ fn reconcile_recovery(ledger: &mut HostLedger) {
         owners_finished: false,
     };
     if host_native::empty_reservation(&reservation) == Some(true)
-        || host_native::recovery_replaced(lease) == Some(true)
+        || manager.replaced(lease) == Some(true)
     {
         ledger.recovery = None;
     }
@@ -1151,7 +1201,11 @@ fn handle_advance_request(
     uid: u32,
     policy: &HostPolicy,
     ledger: &mut HostLedger,
-    evidence: (Option<&Path>, Option<bool>, &crate::burst_manager::Snapshot),
+    evidence: (
+        Option<&Path>,
+        Option<InventoryProof<'_>>,
+        &crate::burst_manager::Snapshot,
+    ),
     reply: &mut Response,
 ) -> Result<()> {
     use crate::preparation::PreparationPhase;
@@ -1257,13 +1311,7 @@ fn handle_advance_request(
                 owners_finished: false,
             };
             if p.phase == PreparationPhase::Ready {
-                ensure!(
-                    policy.preparations.iter().any(|spec| spec.name == p.profile
-                        && spec.domain == p.domain
-                        && spec.memory_bytes == p.memory_bytes
-                        && spec.swap_bytes == p.swap_bytes),
-                    "preparation policy changed"
-                );
+                ensure!(p.policy_matches(policy), "preparation policy changed");
                 let capacity = observe(ledger, policy, health_file, burst_evidence)
                     .ok_or_else(|| anyhow::anyhow!("fresh host evidence unavailable"))?;
                 ensure!(
@@ -1325,7 +1373,7 @@ fn handle_advance_request(
                 .find(|t| t.name == target)
                 .ok_or_else(|| anyhow::anyhow!("unknown recovery target"))?;
             let identity = crate::swap::helper(pid, spec)?;
-            let invocation_id = host_native::recovery_invocation(&identity)?;
+            let invocation_id = recovery_invocation(&identity, inventory_proof)?;
             if let Some(lease) = &ledger.recovery {
                 ensure!(
                     lease.identity == identity
@@ -1349,7 +1397,7 @@ fn handle_advance_request(
                         .native_claims(policy, None)
                         .ok_or_else(|| anyhow::anyhow!("native recovery claims are unproven"))?;
                     claims.push(crate::recovery::helper_claim(&identity, spec.helper_bytes));
-                    proven && crate::page_return::native_headroom(&identity, &claims, 0)?
+                    proven.safe && crate::page_return::native_headroom(&identity, &claims, 0)?
                 }
                 None => {
                     crate::swap::native_return_safe(ledger, policy, &identity, spec.helper_bytes)?
@@ -1392,7 +1440,7 @@ fn handle_advance_request(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("swap recovery disabled"))?;
             let helper = crate::swap::helper(pid, spec)?;
-            let invocation_id = host_native::recovery_invocation(&helper)?;
+            let invocation_id = recovery_invocation(&helper, inventory_proof)?;
             let target = crate::page_return::identity(target_pid, start_ticks, spec)?;
             let target_guard = crate::page_return::open_memory(&target)?;
             let helper_guard = crate::page_return::open_memory(&helper)?;
@@ -1449,7 +1497,7 @@ fn handle_advance_request(
                 Some(proven) => {
                     let mut fresh_claims = claims;
                     fresh_claims.push(crate::recovery::helper_claim(&helper, spec.helper_bytes));
-                    proven
+                    proven.safe
                         && crate::page_return::native_headroom(&target, &fresh_claims, bytes)?
                         && crate::page_return::native_headroom(&helper, &fresh_claims, bytes)?
                 }
@@ -2066,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_replay_allows_a_successful_bounded_manager_validation() {
+    fn inventory_completion_allows_manager_latency_before_final_native_validation() {
         let policy: HostPolicy = serde_json::from_value(serde_json::json!({
             "version":1,"budget_bytes":1073741824,"reserve_bytes":10,"swap_reserve_bytes":0,
             "max_memory_full_psi":10.0,"max_io_full_psi":10.0,"resume_ms":250,"aging_ms":1000,"queue_limit":16,
@@ -2094,16 +2142,22 @@ mod tests {
             recovery: Some(lease.clone()),
             ..Default::default()
         };
+        let (scanned, completed) = finish_inventory(
+            || {
+                // Successful systemd queries may take two seconds, off-loop.
+                thread::sleep(Duration::from_millis(1100));
+                Ok(scanned)
+            },
+            Ok,
+        )
+        .unwrap();
         let result = InventoryReplay {
             owner: &owner,
             backing: &backing,
-            completed: Instant::now(),
+            completed,
             stream: &stream,
         }
         .apply(&mut ledger, &policy, scanned, |candidate| {
-            // Successful systemd queries are allowed two seconds. Keep the
-            // exact batch/identity and emulate a healthy 1.1-second query.
-            thread::sleep(Duration::from_millis(1100));
             candidate.recovery = Some(lease.clone());
             Ok(Response {
                 version: 1,
@@ -2318,5 +2372,31 @@ mod tests {
             let wire = serde_json::to_string(&reply).unwrap();
             assert!(!wire.contains("private-target") && !wire.contains("305418240"));
         }
+    }
+    #[test]
+    fn inventory_completion_rejects_owner_headroom_consumed_during_manager_query() {
+        use std::cell::Cell;
+        let headroom = Cell::new(8192u64);
+        let result = finish_inventory(
+            || {
+                headroom.set(0);
+                Ok(Response {
+                    version: 1,
+                    granted: true,
+                    ..Default::default()
+                })
+            },
+            |response| {
+                ensure!(
+                    headroom.get() >= 4096,
+                    "possible charge owner lost finite headroom"
+                );
+                Ok(response)
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a pre-query owner frontier must not authorize faults after headroom was consumed"
+        );
     }
 }
