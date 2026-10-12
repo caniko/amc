@@ -14,6 +14,20 @@ spec.loader.exec_module(hosted)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_generator_identity_tracks_the_canonical_pinned_invocation(self):
+        source = (hosted.ROOT / "simit.toml").read_text()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "simit.toml").write_text(source)
+            self.assertEqual(hosted.generator_revision(root), "eac437a218b6471df772c9bf73c177988b03aed0")
+            replacement = "1234567890abcdef1234567890abcdef12345678"
+            (root / "simit.toml").write_text(source.replace("eac437a218b6471df772c9bf73c177988b03aed0", replacement))
+            self.assertEqual(hosted.generator_revision(root), replacement)
+            for invalid in ["main", "1234567", "", replacement.upper()]:
+                (root / "simit.toml").write_text(source.replace("eac437a218b6471df772c9bf73c177988b03aed0", invalid))
+                with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                    hosted.generator_revision(root)
+
     def test_foreground_receipt_rejects_partial_return_unbacked_transfer_and_new_work(
         self,
     ):

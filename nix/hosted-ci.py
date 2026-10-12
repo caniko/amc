@@ -3,10 +3,14 @@
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED = {
@@ -491,6 +495,27 @@ def verify_supervision_evidence(path):
         raise RuntimeError("Native supervision report contains OOM events")
 
 
+def generator_revision(root=ROOT):
+    config = tomllib.loads((root / "simit.toml").read_text())
+    invocations = []
+    for command in config["ci"]["nix_build"]["extra_setup"]:
+        args = shlex.split(command)
+        sources = [arg for arg in args if arg.startswith("github:caniko/simit/")]
+        if not sources:
+            continue
+        if (len(sources) != 1 or args[:2] != ["nix", "run"]
+                or args[args.index(sources[0]) + 1:] != ["--", "init", "ci", "--platform", "github",
+                    "--ci-provider", "actions", "--runtime", "nix", "--check", "--diff"]):
+            raise RuntimeError("Unrecognized canonical Simit generator invocation")
+        match = re.fullmatch(r"github:caniko/simit/([0-9a-f]{40})", sources[0])
+        if match is None:
+            raise RuntimeError("Canonical Simit generator must have an exact revision")
+        invocations.append(match.group(1))
+    if len(invocations) != 1:
+        raise RuntimeError("Expected exactly one canonical Simit generator invocation")
+    return invocations[0]
+
+
 def retain():
     evidence = Path(os.environ["SIMIT_NIX_BUILD_RESULTS"])
     installable = (evidence / "installable").read_text().strip()
@@ -536,7 +561,7 @@ def retain():
                 "passed": True,
                 "revision": revision,
                 "installable": installable,
-                "generatorRevision": "8008329afdadb9b2c6cd917cd4e1736243e5bc74",
+                "generatorRevision": generator_revision(),
                 "runId": os.environ.get("GITHUB_RUN_ID"),
                 "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
                 "eventSha": os.environ.get("GITHUB_SHA"),
