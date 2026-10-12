@@ -101,6 +101,10 @@ pub struct Preparation {
     pub swap_bytes: u64,
     pub requested_ms: u64,
     pub expires_ms: u64,
+    /// Original draining policy, retained even after Ready replaces the expiry.
+    /// Legacy pending intents without this binding cannot regain authority.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
     pub ready_ms: u64,
     pub phase: PreparationPhase,
     /// Original policy selection, distinct from the selected live operation IDs.
@@ -118,6 +122,7 @@ impl Preparation {
                 && spec.domain == self.domain
                 && spec.memory_bytes == self.memory_bytes
                 && spec.swap_bytes == self.swap_bytes
+                && self.wait_ms == Some(spec.wait_ms)
                 && spec.ready_ms == self.ready_ms
                 && self.drain_domains.as_ref().is_some_and(|domains| {
                     domains.iter().collect::<std::collections::BTreeSet<_>>()
@@ -248,6 +253,7 @@ impl HostLedger {
             swap_bytes: spec.swap_bytes,
             requested_ms: now,
             expires_ms: now.saturating_add(spec.wait_ms),
+            wait_ms: Some(spec.wait_ms),
             ready_ms: spec.ready_ms,
             phase: PreparationPhase::Draining,
             drain_domains: Some(spec.drain_domains.clone()),

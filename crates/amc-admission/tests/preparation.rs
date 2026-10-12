@@ -83,6 +83,62 @@ fn advance(l: &mut HostLedger, p: &HostPolicy, now: u64) -> BTreeMap<String, Wai
 }
 
 #[test]
+fn restart_rejects_changed_wait_policy_for_draining_and_ready_but_retains_consumed_claims() {
+    for phase in [
+        PreparationPhase::Draining,
+        PreparationPhase::Ready,
+        PreparationPhase::Active,
+    ] {
+        let mut p = policy();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger.swap_return_bytes = Some(0);
+        ledger
+            .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+            .unwrap();
+        if phase != PreparationPhase::Draining {
+            advance(&mut ledger, &p, 250);
+        }
+        if phase == PreparationPhase::Active {
+            ledger
+                .consume("intent", "key", 1000, job("intent", "game", 1000, 40), 500)
+                .unwrap();
+        }
+        let mut restored: HostLedger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        p.preparations[0].wait_ms = 1000;
+        advance(&mut restored, &p, 750);
+        assert_eq!(
+            restored.preparations.len(),
+            usize::from(phase == PreparationPhase::Active),
+            "a changed wait policy must invalidate pending capabilities, including Ready ones"
+        );
+        assert_eq!(
+            restored.reservations.len(),
+            usize::from(phase == PreparationPhase::Active)
+        );
+    }
+}
+
+#[test]
+fn legacy_pending_intents_without_wait_binding_cannot_reacquire_authority() {
+    let p = policy();
+    let mut ledger = HostLedger::new("boot".into());
+    ledger.swap_return_bytes = Some(0);
+    ledger
+        .prepare("intent".into(), "key".into(), peer(), "game", 0, &p)
+        .unwrap();
+    advance(&mut ledger, &p, 250);
+    let mut saved = serde_json::to_value(&ledger).unwrap();
+    saved["preparations"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("wait_ms");
+    let mut restored: HostLedger = serde_json::from_value(saved).unwrap();
+    advance(&mut restored, &p, 500);
+    assert!(restored.preparations.is_empty());
+}
+
+#[test]
 fn restart_rejects_changed_drain_domains_in_pending_and_ready_intents() {
     for ready in [false, true] {
         let mut p = policy();
