@@ -122,10 +122,10 @@ def stale_helper():
 
 
 def deny_changed_owner():
-    observed = Path("/tmp/amc-page-inventory-observed")
+    observed = Path("/run/amc-host/amc-page-inventory-observed")
     observed.unlink(missing_ok=True)
     RESULT.unlink(missing_ok=True)
-    Path("/tmp/amc-page-inventory-pause").touch()
+    Path("/run/amc-host/amc-page-inventory-pause").touch()
     subprocess.run(["systemd-run", "--collect", "--unit=page-return", "--property=MemoryMax=128M",
                     "--property=MemorySwapMax=0", "--", "python3", __file__, "--helper-stale"], check=True)
     wait(observed.exists)

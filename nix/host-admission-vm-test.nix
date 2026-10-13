@@ -40,25 +40,27 @@
   });
   observer = pkgs.writeShellScriptBin "systemctl" ''
     # Simulate loss of manager observations without changing native enforcement.
-    if test -e /tmp/amc-observation-unavailable; then
+    # ProtectSystem=strict makes /tmp read-only inside the host broker. Keep
+    # fixture rendezvous in its existing writable RuntimeDirectory instead.
+    if test -e /run/amc-host/amc-observation-unavailable; then
       exit 1
     fi
     case "$*" in
       *InvocationID*)
-        if test -e /tmp/amc-page-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-page-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-page-inventory-observed
+        if test -e /run/amc-host/amc-page-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/amc-page-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-page-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
-        if test -e /tmp/amc-device-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-device-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-device-inventory-observed
+        if test -e /run/amc-host/amc-device-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/amc-device-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-device-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
       *RuntimeMaxUSec*)
-        if test -e /tmp/amc-burst-observation-slow; then
-          ${pkgs.coreutils}/bin/touch /tmp/amc-burst-observation-entered
+        if test -e /run/amc-host/amc-burst-observation-slow; then
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-burst-observation-entered
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
