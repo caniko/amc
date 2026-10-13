@@ -16,7 +16,9 @@ nix_builds = [
 only = true
 separate_events = true
 push_tags = ["**"]
-timeout_minutes = 240
+# Cold hosted LTO kernel realization exceeded four hours before the native VM.
+# Keep the two-core bound and allow the complete kernel/VM gate six hours.
+timeout_minutes = 360
 max_parallel = 2
 max_jobs = 1
 cores = 2
