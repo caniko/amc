@@ -190,6 +190,16 @@ in
         };
         systemd.services.amc-host-admission.requires = ["builders.slice"];
         systemd.services.amc-host-admission.after = ["builders.slice"];
+        assertions = [
+          {
+            assertion = config.systemd.services.amc-host-admission.serviceConfig.ProtectHome == "read-only";
+            message = "Preparation authorization requires readable runtime rendezvous sockets.";
+          }
+          {
+            assertion = builtins.all (path: builtins.elem path config.systemd.services.amc-host-admission.serviceConfig.InaccessiblePaths) ["/home" "/root"];
+            message = "Preparation runtime visibility must not expose home trees.";
+          }
+        ];
         # The public launcher prepends real systemd to PATH. Inject the observer
         # at the native engine boundary while retaining its runtime dependencies
         # and all hardening and lifecycle settings from the production module.
