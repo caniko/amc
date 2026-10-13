@@ -1119,13 +1119,23 @@ assert 'native recovery demand or frontier changed' in response['error'], respon
 with open('/tmp/device-stale-demand-denied', 'w') as receipt:
     json.dump(response, receipt)
 """)
-    machine.succeed("touch /run/amc-host/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/device-stale-demand.py")
+    # Retain this short-lived fixture's result until the driver verifies it.
+    # Otherwise successful exit can collect the unit before explicit cleanup.
+    machine.succeed("touch /run/amc-host/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --property=RemainAfterExit=yes -- python3 /tmp/device-stale-demand.py")
     machine.wait_until_succeeds("test -e /run/amc-host/amc-device-inventory-observed")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=32M")
     machine.wait_until_succeeds("test -e /tmp/device-stale-demand-denied")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=128M")
     stale_status = json.loads(machine.succeed("amc admission host-status --socket /run/amc-device/admission.sock"))
     assert stale_status["recovery"] is None, stale_status
+    machine.wait_until_succeeds(
+        'test "$(systemctl show page-return --property=SubState --value)" = exited',
+        timeout=10,
+    )
+    machine.succeed(
+        'test "$(systemctl show page-return --property=Result --value)" = success && '
+        'test "$(systemctl show page-return --property=ExecMainStatus --value)" = 0'
+    )
     machine.succeed("systemctl stop page-return")
     machine.succeed(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- "
