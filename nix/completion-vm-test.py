@@ -205,8 +205,20 @@ time.sleep(120)
     assert state["committed_bytes"] == 64 * 1048576, state
     game = next(r for r in state["reservations"] if r["domain"] == "foreground-1000")
     stop_scope(game)
+    # The completed submission client may already have been garbage-collected.
+    # Querying a missing unit returns inactive with no processes; stopping it
+    # would instead fail. A live or failed client must still fail this test.
+    client_state = dict(
+        line.split("=", 1)
+        for line in machine.succeed(
+            "systemctl show completion-game-client.service --property=ActiveState,MainPID,ControlPID"
+        ).splitlines()
+    )
+    assert client_state == {
+        "ActiveState": "inactive", "MainPID": "0", "ControlPID": "0"
+    }, client_state
     machine.succeed(
-        "systemctl stop completion-worker completion-game-client completion-host"
+        "systemctl stop completion-worker completion-host"
     )
     evidence["completion"] = {
         "parentAndEscrowBytes": parent_charge,

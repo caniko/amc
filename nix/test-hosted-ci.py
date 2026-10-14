@@ -1,6 +1,8 @@
+import ast
 import hashlib
 import importlib.util
 import json
+import runpy
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -14,6 +16,61 @@ spec.loader.exec_module(hosted)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_completion_teardown_requires_an_exited_client_and_strict_stops(self):
+        tree = ast.parse((hosted.ROOT / "nix/completion-vm-test.py").read_text())
+        section = tree.body[0]
+        stop = next(
+            index for index, node in enumerate(section.body)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "stop_scope"
+        )
+        # Execute the real teardown statements, ending before the receipt.
+        cleanup = ast.unparse(
+            ast.Module(body=section.body[stop + 1:-1], type_ignores=[])
+        )
+
+        def run_cleanup(machine):
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "completion-teardown.py"
+                path.write_text(cleanup)
+                runpy.run_path(str(path), init_globals={"machine": machine})
+
+        class Machine:
+            def __init__(self, state, stop_error=False):
+                self.state = state
+                self.stop_error = stop_error
+                self.stopped = False
+
+            def succeed(self, command):
+                if command == "systemctl show completion-game-client.service --property=ActiveState,MainPID,ControlPID":
+                    return self.state
+                if command != "systemctl stop completion-worker completion-host":
+                    raise AssertionError(command)
+                if self.stop_error:
+                    raise RuntimeError("strict stop failed")
+                self.stopped = True
+                return ""
+
+        # systemctl show reports these properties even for an unloaded unit.
+        inactive = "ActiveState=inactive\nMainPID=0\nControlPID=0\n"
+        machine = Machine(inactive)
+        run_cleanup(machine)
+        self.assertTrue(machine.stopped)
+        for state in [
+            "ActiveState=active\nMainPID=123\nControlPID=0\n",
+            "ActiveState=deactivating\nMainPID=123\nControlPID=0\n",
+            "ActiveState=failed\nMainPID=0\nControlPID=0\n",
+            "ActiveState=inactive\nMainPID=0\nControlPID=123\n",
+        ]:
+            with self.subTest(state=state):
+                machine = Machine(state)
+                with self.assertRaises(AssertionError):
+                    run_cleanup(machine)
+                self.assertFalse(machine.stopped)
+        with self.assertRaisesRegex(RuntimeError, "strict stop failed"):
+            run_cleanup(Machine(inactive, stop_error=True))
+
     def test_generator_identity_tracks_the_canonical_pinned_invocation(self):
         source = (hosted.ROOT / "simit.toml").read_text()
         with tempfile.TemporaryDirectory() as temp:
