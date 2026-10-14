@@ -126,13 +126,18 @@ def deny_changed_owner():
     observed.unlink(missing_ok=True)
     RESULT.unlink(missing_ok=True)
     Path("/run/amc-host/amc-page-inventory-pause").touch()
-    subprocess.run(["systemd-run", "--collect", "--unit=page-return", "--property=MemoryMax=128M",
-                    "--property=MemorySwapMax=0", "--", "python3", __file__, "--helper-stale"], check=True)
+    subprocess.run(["systemd-run", "--unit=page-return", "--property=MemoryMax=128M",
+                     "--property=MemorySwapMax=0", "--property=RemainAfterExit=yes", "--", "python3", __file__, "--helper-stale"], check=True)
     wait(observed.exists)
     original = ROOT / "original"
     (original / "memory.max").write_text((original / "memory.current").read_text().strip())
     wait(RESULT.exists)
     assert request({"op": "status", "version": 1}).get("recovery") is None
+    # Retain the completed helper until its exit status and explicit cleanup
+    # are verified, just as in the whole-device stale-demand fixture.
+    wait(lambda: subprocess.check_output(["systemctl", "show", "page-return", "--property=SubState", "--value"], text=True).strip() == "exited")
+    result = subprocess.check_output(["systemctl", "show", "page-return", "--property=Result,ExecMainStatus"], text=True)
+    assert dict(line.split("=", 1) for line in result.splitlines()) == {"Result": "success", "ExecMainStatus": "0"}, result
     subprocess.run(["systemctl", "stop", "page-return"], check=True)
     (original / "memory.max").write_text(str(128 * MIB))
     RESULT.unlink()
@@ -217,7 +222,9 @@ def prove_path(path):
         policy = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
         policy["swap_recovery"]["page_cgroups"] = ["/amc-guard-proof"]
         Path("/tmp/guard-policy.json").write_text(json.dumps(policy))
-        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--setenv=PATH=/etc/amc-test-observer/bin:/run/current-system/sw/bin", "--", "amc", "admission", "host-serve",
+        # The public launcher prepends real systemd, masking the post-scan
+        # observer. Use the same native engine as the other inventory fixtures.
+        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--setenv=PATH=/etc/amc-test-observer/bin:/run/current-system/sw/bin", "--", "/etc/amc-fixture-native-engine", "admission", "host-serve",
                         "--policy", "/tmp/guard-policy.json", "--socket", SOCKET, "--state", f"/var/lib/amc-guard-{path}"], check=True)
         wait(host_ready)
         stale_denied = deny_changed_owner()

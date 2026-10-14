@@ -1106,6 +1106,18 @@ with test_section(
     before_device = int(
         machine.succeed("awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps")
     )
+    # Occupied slots may still be backed by resident swap cache, in which case
+    # reducing the ceiling need not invalidate return headroom. Reuse the
+    # target-local eviction fixture and prove actual nonresident demand before
+    # asking the replay to reject it; no global pressure or swapoff is needed.
+    machine.succeed("python3 /tmp/page-return-evict.py")
+    machine.wait_until_succeeds(
+        "python3 /etc/page-return-target.py --snapshot | python3 -c "
+        + shlex.quote(
+            'import json,sys; s=json.load(sys.stdin); assert s["returnBytes"] >= 33554432 and s["swappedBytes"] >= 33554432'
+        ),
+        timeout=30,
+    )
     # Delay the post-scan manager identity reply, then reduce the target's native
     # ceiling while the logical reservation set is unchanged. The replay must
     # use new resident-plus-return demand before publishing any device lease.
