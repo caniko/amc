@@ -1252,7 +1252,9 @@ time.sleep(120)
 with test_section(
     "post-grant migration is kernel-blocked on direct and swap-cache recovery paths"
 ):
-    machine.succeed("python3 /etc/page-return-guard-proof.py", timeout=240)
+    # A second full run proves cleanup permits fresh cgroups, services and zram.
+    for _ in range(2):
+        machine.succeed("python3 /etc/page-return-guard-proof.py", timeout=240)
     evidence["pageReturnGuard"] = json.loads(
         machine.succeed("cat /tmp/page-return-guard-evidence.json")
     )

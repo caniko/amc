@@ -1,4 +1,5 @@
 import ast
+import errno
 import hashlib
 import importlib.util
 import json
@@ -7,12 +8,128 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "hosted_ci", Path(__file__).with_name("hosted-ci.py")
 )
 hosted = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hosted)
+
+guard_spec = importlib.util.spec_from_file_location(
+    "guard_proof", Path(__file__).with_name("page-return-guard-proof.py")
+)
+guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(guard)
+
+
+class GuardCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0
+        self.real_diagnostics = guard.cleanup_diagnostics
+        self.reader = mock.patch.object(
+            guard.Path, "read_text", autospec=True,
+            side_effect=lambda path: "Filename Type Size Used Priority\n" if str(path) == "/proc/swaps" else "0\n",
+        )
+        self.reader.start()
+        self.addCleanup(self.reader.stop)
+        clock = mock.patch.object(guard.time, "monotonic", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        sleeper = mock.patch.object(guard.time, "sleep", side_effect=self.advance)
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
+        diagnostics = mock.patch.object(guard, "cleanup_diagnostics", return_value='{"phase":"fixture-reset","swaps":"inactive"}')
+        diagnostics.start()
+        self.addCleanup(diagnostics.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def test_reset_retries_only_transient_busy_and_closes_each_attempt(self):
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = [OSError(errno.EBUSY, "busy"), 1]
+            guard.reset_zram(timeout=.1)
+            self.assertEqual(handle.write.call_count, 2)
+            self.assertEqual(opened.return_value.__exit__.call_count, 2)
+            self.assertEqual(self.now, .05)
+
+    def test_persistent_busy_exhausts_the_bound_with_diagnostics(self):
+        busy = OSError(errno.EBUSY, "held open")
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = busy
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram(timeout=.1)
+            self.assertIs(caught.exception, busy)
+            self.assertEqual(handle.write.call_count, 3)
+            self.assertEqual(self.now, .1)
+            self.assertIn("exhausted", " ".join(busy.__notes__))
+            self.assertIn("inactive", " ".join(busy.__notes__))
+
+    def test_unrelated_reset_error_propagates_without_retry(self):
+        error = OSError(errno.EIO, "broken reset")
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = error
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram()
+            self.assertIs(caught.exception, error)
+            self.assertEqual(handle.write.call_count, 1)
+            self.sleep.assert_not_called()
+
+    def test_reset_refuses_active_swap_before_opening_reset(self):
+        self.reader.stop()
+        with (
+            mock.patch.object(guard.Path, "read_text", return_value="Filename Type Size Used Priority\n/dev/zram0 partition 100 1 100\n"),
+            mock.patch.object(guard.Path, "open") as opened,
+        ):
+            with self.assertRaisesRegex(AssertionError, "still active swap"):
+                guard.reset_zram()
+            opened.assert_not_called()
+
+    def test_cleanup_preserves_primary_and_attempts_independent_steps(self):
+        completed = []
+        primary = AssertionError("migration proof failed")
+        cleanup_error = OSError(errno.EBUSY, "reset failed")
+
+        def fail():
+            raise cleanup_error
+
+        steps = {"remaining": lambda: completed.append("remaining"), "reset": fail}
+        with (
+            self.assertLogs(level="ERROR"),
+            self.assertRaises(guard.builtins.BaseExceptionGroup) as caught,
+            guard.cleanup_scope("direct", steps),
+        ):
+            raise primary
+        self.assertEqual(list(caught.exception.exceptions), [primary, cleanup_error])
+        self.assertEqual(completed, ["remaining"])
+        self.assertIn("primary failure", " ".join(primary.__notes__))
+        self.assertIn("cleanup step=reset", " ".join(cleanup_error.__notes__))
+
+    def test_successful_cleanup_does_not_replace_primary_failure(self):
+        primary = AssertionError("original guard failure")
+        with self.assertRaises(AssertionError) as caught, guard.cleanup_scope("cache", {}):
+            raise primary
+        self.assertIs(caught.exception, primary)
+
+    def test_diagnostic_failure_is_reported_without_replacing_cleanup_error(self):
+        # Exercise the real diagnostic collector with a failing manager query.
+        error = OSError(errno.EIO, "reset failed")
+        with (
+            self.assertLogs(level="ERROR"),
+            mock.patch.object(guard, "cleanup_diagnostics", self.real_diagnostics),
+            mock.patch.object(guard.subprocess, "check_output", side_effect=RuntimeError("manager unavailable")),
+            mock.patch.object(guard.Path, "open") as opened,
+        ):
+            opened.return_value.__enter__.return_value.write.side_effect = error
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram()
+        self.assertIs(caught.exception, error)
+        self.assertIn("zram-reset-error", " ".join(error.__notes__))
+        self.assertIn("manager unavailable", " ".join(error.__notes__))
 
 
 class NativeEvidenceTests(unittest.TestCase):
