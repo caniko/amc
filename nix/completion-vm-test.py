@@ -118,8 +118,10 @@ for line in Path('/proc/meminfo').read_text().splitlines():
     worker = """import json, socket, time
 from pathlib import Path
 origin = json.loads(Path('/tmp/completion-origin.json').read_text())
-def call(op, serial, with_origin=False):
-    request = {'op':op,'version':1,'domain':'builders','operation':serial}
+def call(op, serial=0, with_origin=False, expected_error=None):
+    request = {'op':op,'version':1}
+    if op != 'status':
+        request.update({'domain':'builders','operation':serial})
     if op == 'acquire_pool':
         request['wait_ms'] = 60000
     if with_origin:
@@ -129,12 +131,20 @@ def call(op, serial, with_origin=False):
         connection.connect('/run/amc-completion/admission.sock')
         connection.sendall((json.dumps(request)+'\\n').encode())
         response = json.loads(connection.makefile().readline())
-    assert response['error'] is None, response
+    assert response['error'] == expected_error, response
     return response
 while not call('acquire_pool',1,True)['granted']:
     time.sleep(.25)
 assert call('acquire_pool',2,True)['granted']
-assert call('release_pool',999)['granted']
+before = call('status')
+response = call('release_pool',999,expected_error='pool release does not match persisted Worker ownership')
+assert not response['granted'], response
+after = call('status')
+assert after['committed_bytes'] == before['committed_bytes'], (before, after)
+def pool_backing(status):
+    pool = next(r for r in status['reservations'] if r['domain'] == 'builders')
+    return {key:pool.get(key) for key in ('identity','owners','owners_finished','memory_bytes','swap_bytes')}
+assert pool_backing(after) == pool_backing(before), (before, after)
 Path('/tmp/completion-worker-entered').touch()
 while not Path('/tmp/completion-inner-finish').exists():
     time.sleep(.1)
