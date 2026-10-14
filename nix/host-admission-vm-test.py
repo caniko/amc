@@ -13,6 +13,23 @@ for user, uid in [("alice", 1000), ("bob", 1001)]:
     )
     machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/admission.sock")
 
+with test_section("broker hides runtime and home paths even after late user starts"):
+    machine.succeed("touch /root/amc-private-marker /home/alice/amc-private-marker")
+    broker = machine.succeed(
+        "systemctl show amc-host-admission.service -p MainPID --value"
+    ).strip()
+    assert int(broker) > 0
+    namespace = f"nsenter --target {broker} --mount -- "
+    for uid in [1000, 1001]:
+        machine.fail(namespace + f"test -S /run/user/{uid}/amc/admission.sock")
+        machine.fail(namespace + f"touch /run/user/{uid}/amc/broker-write-forbidden")
+        machine.fail(f"test -e /run/user/{uid}/amc/broker-write-forbidden")
+    # Positive command in the actual namespace prevents a missing/broken nsenter
+    # from silently satisfying every expected failure.
+    machine.succeed(namespace + "test -d /proc/self")
+    machine.fail(namespace + "test -e /root/amc-private-marker")
+    machine.fail(namespace + "test -e /home/alice/amc-private-marker")
+
 
 def write_file(path, text):
     machine.succeed("printf '%s' " + shlex.quote(text) + " > " + shlex.quote(path))

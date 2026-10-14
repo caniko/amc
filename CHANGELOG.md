@@ -25,6 +25,10 @@
 
 ### Changed
 
+- Resolve preparation authorization callbacks through the authenticated waiting
+  process's pinned filesystem root. The broker retains `ProtectHome=yes` and
+  hidden user-runtime/home paths, including late user starts, while connecting
+  only to the kernel-authenticated peer's existing rendezvous socket.
 - Observation summaries now report per-field interval endpoints, attempted and
   persisted samples, storage durability, and collection timing.
 - Workstation delivery prioritizes foreground stability and bounded useful
