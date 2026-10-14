@@ -133,6 +133,52 @@ class GuardCleanupTests(unittest.TestCase):
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_supervision_settlement_uses_one_coherent_status_snapshot(self):
+        tree = ast.parse((hosted.ROOT / "nix/supervision-recovery-failures.py").read_text())
+        settled = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "settled")
+        source = ast.unparse(ast.Module(body=[settled], type_ignores=[]))
+        snapshots = iter([
+            {"recovery": {"active": None, "attempts": []}},
+            {"recovery": {"active": {"phase": "cooling"}, "attempts": [1]}},
+            {"recovery": {"active": None, "attempts": [1]}},
+        ])
+        current = None
+        observations = []
+
+        def read():
+            nonlocal current
+            current = next(snapshots, current)
+            return current
+
+        def wait_for(predicate, seconds):
+            self.assertEqual(seconds, 30)
+            for _ in range(3):
+                result = predicate()
+                observations.append(result)
+                if result:
+                    return
+            raise AssertionError("did not settle")
+
+        machine = mock.Mock()
+
+        def wait_for_unit(unit):
+            self.assertEqual(unit, "amc-failure@budget-a.service")
+            self.assertIsNone(current["recovery"]["active"], "fixture accepted a mixed startup/cooling snapshot")
+            self.assertEqual(len(current["recovery"]["attempts"]), 1)
+
+        machine.wait_for_unit.side_effect = wait_for_unit
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settlement.py"
+            path.write_text(source)
+            namespace = runpy.run_path(str(path), init_globals={
+                "wait_for": wait_for, "machine": machine,
+                "unit": lambda name: f"amc-failure@{name}.service",
+            })
+            receipt = namespace["settled"](read, "budget-a", 1)
+        self.assertEqual(observations, [False, False, True])
+        self.assertEqual(receipt, current)
+        machine.wait_for_unit.assert_called_once()
+
     def test_completion_teardown_requires_an_exited_client_and_strict_stops(self):
         tree = ast.parse((hosted.ROOT / "nix/completion-vm-test.py").read_text())
         section = tree.body[0]
