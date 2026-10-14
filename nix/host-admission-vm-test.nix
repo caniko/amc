@@ -47,12 +47,18 @@
     fi
     case "$*" in
       *InvocationID*)
-        if test -e /run/amc-host/amc-page-inventory-pause; then
+        # Other brokers and private admission also query InvocationID. Only
+        # the selected broker's post-scan recovery query may consume a flag.
+        if test "$*" = 'show --property=ControlGroup,MainPID,Restart,KillMode,InvocationID -- page-return.service' \
+          && test "$(${pkgs.coreutils}/bin/cat /proc/$PPID/cgroup)" = '0::/system.slice/guard-owner-host.service' \
+          && test -e /run/amc-host/amc-page-inventory-pause; then
           ${pkgs.coreutils}/bin/rm /run/amc-host/amc-page-inventory-pause
           ${pkgs.coreutils}/bin/touch /run/amc-host/amc-page-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
-        if test -e /run/amc-host/amc-device-inventory-pause; then
+        if test "$*" = 'show --property=ControlGroup,MainPID,Restart,KillMode,InvocationID -- page-return.service' \
+          && test "$(${pkgs.coreutils}/bin/cat /proc/$PPID/cgroup)" = '0::/system.slice/device-host.service' \
+          && test -e /run/amc-host/amc-device-inventory-pause; then
           ${pkgs.coreutils}/bin/rm /run/amc-host/amc-device-inventory-pause
           ${pkgs.coreutils}/bin/touch /run/amc-host/amc-device-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
