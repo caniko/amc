@@ -56,6 +56,18 @@ fn data<'a>(property: &'a Value, kind: &str) -> Option<&'a Value> {
 }
 
 pub(super) fn query(uid: u32, unit: &str) -> Option<UnitState> {
+    match observe(uid, unit)? {
+        Snapshot::Coherent(state) => Some(state),
+        Snapshot::Transition => None,
+    }
+}
+
+enum Snapshot {
+    Coherent(UnitState),
+    Transition,
+}
+
+fn observe(uid: u32, unit: &str) -> Option<Snapshot> {
     if !valid_unit(unit) {
         return None;
     }
@@ -74,7 +86,7 @@ pub(super) fn query(uid: u32, unit: &str) -> Option<UnitState> {
 fn snapshot(
     unit: &str,
     mut properties: impl FnMut(&str, &[&str]) -> Option<Vec<Value>>,
-) -> Option<UnitState> {
+) -> Option<Snapshot> {
     const UNIT_PROPERTIES: &[&str] = &["Id", "LoadState", "ActiveState", "InvocationID"];
     let unit_fields = properties("org.freedesktop.systemd1.Unit", UNIT_PROPERTIES)?;
     let mut state = unit_state(unit, &unit_fields)?;
@@ -106,10 +118,10 @@ fn snapshot(
         // pin or release startup from that mixed snapshot; retry under execute's
         // existing startup deadline. Invocation replacement is likewise unknown.
         if properties("org.freedesktop.systemd1.Unit", UNIT_PROPERTIES)? != unit_fields {
-            return None;
+            return Some(Snapshot::Transition);
         }
     }
-    Some(state)
+    Some(Snapshot::Coherent(state))
 }
 
 fn unit_state(unit: &str, fields: &[Value]) -> Option<UnitState> {
@@ -155,29 +167,52 @@ pub(super) fn cleanup(uid: u32, unit: &str) -> Cleanup {
         return Cleanup::Unknown;
     }
     let deadline = Instant::now() + Duration::from_secs(5);
+    let result = await_cleanup(
+        || observe(uid, unit),
+        terminated,
+        || {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+            true
+        },
+    );
+    if result == Cleanup::Stopped {
+        let _ = manager_call(uid, "ResetFailedUnit", "s", &[unit]);
+    }
+    result
+}
+
+fn await_cleanup(
+    mut observe: impl FnMut() -> Option<Snapshot>,
+    terminated: impl Fn(Option<&str>) -> Option<bool>,
+    mut retry: impl FnMut() -> bool,
+) -> Cleanup {
     loop {
-        match query(uid, unit) {
-            Some(state)
+        match observe() {
+            Some(Snapshot::Coherent(state))
                 if state.loaded
                     && state.stopped
                     && terminated(state.control_group.as_deref()) == Some(true) =>
             {
-                let _ = manager_call(uid, "ResetFailedUnit", "s", &[unit]);
                 return Cleanup::Stopped;
             }
-            Some(state)
+            Some(Snapshot::Coherent(state))
                 if state.loaded
                     && !state.stopped
                     && state
                         .control_group
                         .as_deref()
                         .and_then(safe_cgroup_path)
-                        .is_some()
-                    && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(25))
-            }
+                        .is_some() => {}
+            // Only a positively detected manager transition is retryable.
+            // Missing or invalid observations remain unknown immediately.
+            Some(Snapshot::Transition) => {}
             _ => return Cleanup::Unknown,
+        }
+        if !retry() {
+            return Cleanup::Unknown;
         }
     }
 }
@@ -241,15 +276,105 @@ mod tests {
             let mut responses = [before, service.clone(), after].into_iter();
             let state = snapshot(unit, |_, _| responses.next());
             if stable {
-                let state = state.expect("a stable native snapshot remains observable");
+                let Some(Snapshot::Coherent(state)) = state else {
+                    panic!("a stable native snapshot remains observable");
+                };
                 assert!(state.started && !state.stopped);
                 assert_eq!(state.main_pid, Some(123));
             } else {
                 assert!(
-                    state.is_none(),
+                    matches!(state, Some(Snapshot::Transition)),
                     "mixed manager observations must be retried"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cleanup_retries_a_transition_until_stopped_and_empty() {
+        let stopped = UnitState {
+            loaded: true,
+            stopped: true,
+            invocation: Some("01".repeat(16)),
+            started: true,
+            control_group: Some("/app.slice/app-amc-cleanup.service".into()),
+            main_pid: None,
+            workload_code: Some(0),
+        };
+        let mut observations = [
+            Some(Snapshot::Transition),
+            Some(Snapshot::Coherent(stopped)),
+        ]
+        .into_iter();
+        let mut retries = 0;
+        let result = await_cleanup(
+            || {
+                observations
+                    .next()
+                    .expect("cleanup must consume bounded observations")
+            },
+            |path| {
+                assert_eq!(path, Some("/app.slice/app-amc-cleanup.service"));
+                Some(true)
+            },
+            || {
+                retries += 1;
+                true
+            },
+        );
+        assert_eq!(result, Cleanup::Stopped);
+        assert_eq!(retries, 1);
+    }
+
+    #[test]
+    fn cleanup_transition_retries_are_deadline_bounded_and_unknown_fails_closed() {
+        let mut observations = 0;
+        let mut retries = 0;
+        assert_eq!(
+            await_cleanup(
+                || {
+                    observations += 1;
+                    Some(Snapshot::Transition)
+                },
+                |_| panic!("incoherent observations cannot prove termination"),
+                || {
+                    retries += 1;
+                    retries < 3
+                },
+            ),
+            Cleanup::Unknown,
+        );
+        assert_eq!(observations, 3);
+        assert_eq!(retries, 3);
+        assert_eq!(
+            await_cleanup(
+                || None,
+                |_| panic!("unavailable observations cannot prove termination"),
+                || panic!("unavailable observations must not be retried"),
+            ),
+            Cleanup::Unknown,
+        );
+    }
+
+    #[test]
+    fn cleanup_never_accepts_a_stopped_unit_with_unconfirmed_descendants() {
+        for empty in [None, Some(false)] {
+            let result = await_cleanup(
+                || {
+                    Some(Snapshot::Coherent(UnitState {
+                        loaded: true,
+                        stopped: true,
+                        invocation: Some("01".repeat(16)),
+                        started: true,
+                        control_group: Some("/app.slice/app-amc-cleanup.service".into()),
+                        main_pid: None,
+                        workload_code: Some(0),
+                    }))
+                },
+                |_| empty,
+                || panic!("a stopped unit with unconfirmed descendants must fail closed"),
+            );
+            assert_eq!(result, Cleanup::Unknown);
         }
     }
 }
