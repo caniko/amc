@@ -1,8 +1,13 @@
+import ast
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -14,6 +19,27 @@ spec.loader.exec_module(hosted)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_burst_responsiveness_uses_host_status_response_schema(self):
+        source = ast.parse((hosted.ROOT / "nix/host-admission-vm-test.py").read_text())
+        probes = [node.value for node in ast.walk(source)
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and "elapsedSeconds" in node.value and "subprocess.run" in node.value]
+        self.assertEqual(len(probes), 1)
+        probe = probes[0].removeprefix("python3 - <<'PY'\n").removesuffix("\nPY")
+        response = {"version": 1, "error": None, "reservations": []}
+        with patch("subprocess.run", return_value=types.SimpleNamespace(stdout=json.dumps(response))) as run:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(probe, {})
+            self.assertEqual(json.loads(output.getvalue())["responses"], 3)
+            self.assertEqual(run.call_count, 3)
+            self.assertTrue(all(call.kwargs["timeout"] == 1 for call in run.call_args_list))
+        for invalid in [{**response, "version": 2}, {**response, "error": "denied"},
+                        {**response, "reservations": None}, {}]:
+            with self.subTest(response=invalid), patch("subprocess.run", return_value=types.SimpleNamespace(stdout=json.dumps(invalid))):
+                with self.assertRaises((AssertionError, KeyError)):
+                    exec(probe, {})
+
     def test_generator_identity_tracks_the_canonical_pinned_invocation(self):
         source = (hosted.ROOT / "simit.toml").read_text()
         with tempfile.TemporaryDirectory() as temp:

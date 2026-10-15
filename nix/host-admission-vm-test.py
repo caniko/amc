@@ -505,7 +505,7 @@ with test_section(
     machine.wait_until_succeeds(
         "test -e /run/amc-host/burst-observation-entered", timeout=10
     )
-    responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    assert json.loads(result.stdout)['ok']\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
+    responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    response = json.loads(result.stdout)\n    assert response['version'] == 1 and response['error'] is None and isinstance(response['reservations'], list), response\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
     assert responsive["elapsedSeconds"] < 1, responsive
     machine.succeed("rm /run/amc-host/burst-observation-slow")
     evidence["burstManagerResponsiveness"] = responsive
