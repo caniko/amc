@@ -16,10 +16,12 @@ nix_builds = [
 only = true
 separate_events = true
 push_tags = ["**"]
-timeout_minutes = 240
+# Both original ThinLTO builds exhausted four hours before VM startup. Public
+# ubuntu-24.04 runners provide four CPUs; keep realization serial per runner.
+timeout_minutes = 360
 max_parallel = 2
 max_jobs = 1
-cores = 2
+cores = 4
 kvm = true
 capture_results = true
 artifact_retention_days = 30

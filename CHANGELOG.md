@@ -36,6 +36,9 @@
 
 ### Fixed
 
+- Use all four CPUs of the public hosted runner and a bounded six-hour job
+  window for patched ThinLTO kernel qualification after both original kernel
+  builds exhausted four hours before VM startup.
 - Keep hosted root-observer rendezvous files in the broker's writable runtime
   directory, preserving its read-only `/tmp` and hidden user-runtime/home paths.
   Bound observer acknowledgements and require the native sandbox proof in hosted
