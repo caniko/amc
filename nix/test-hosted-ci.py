@@ -23,6 +23,48 @@ guard = importlib.util.module_from_spec(guard_spec)
 guard_spec.loader.exec_module(guard)
 
 
+class QuietWindowTests(unittest.TestCase):
+    def test_actual_guest_barrier_uses_request_age_and_requires_the_first_charge(self):
+        tree = ast.parse((hosted.ROOT / "nix/host-admission-vm-test.py").read_text())
+        call = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "succeed" and node.args
+                    and "agedOrdinary" in ast.unparse(node.args[0]))
+        command = eval(compile(ast.Expression(call.args[0]), "quiet-window-command", "eval"))
+        guest = command.removeprefix("python3 - <<'PY'\n").removesuffix("\nPY")
+        for charged in [True, False]:
+            with self.subTest(charged=charged):
+                elapsed = [0.0]
+                state = {"burst_committed_bytes": 33554432 if charged else 0,
+                         "reservations": [{"granted": False, "memory_bytes": 100663296,
+                                           "requested_ms": 1000}]}
+
+                def advance(seconds):
+                    elapsed[0] += seconds
+
+                with (
+                    mock.patch("pathlib.Path.read_text", return_value='{"aging_ms":1000}'),
+                    mock.patch("subprocess.check_output", return_value=json.dumps(state)) as probe,
+                    mock.patch("time.monotonic", side_effect=lambda: elapsed[0]),
+                    mock.patch("time.time_ns", side_effect=lambda: int((1.5 + elapsed[0]) * 1_000_000_000)),
+                    mock.patch("time.sleep", side_effect=advance),
+                    mock.patch("builtins.print") as report,
+                ):
+                    if charged:
+                        exec(compile(guest, "quiet-window-guest", "exec"), {})
+                        self.assertGreaterEqual(elapsed[0], .5)
+                        self.assertLess(elapsed[0], .55)
+                        self.assertGreater(probe.call_count, 1)
+                        receipt = json.loads(report.call_args.args[0])
+                        self.assertEqual(receipt["agedOrdinary"], state["reservations"][0])
+                        self.assertEqual(receipt["burstCommittedBytes"], 33554432)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(guest, "quiet-window-guest", "exec"), {})
+                        self.assertEqual(probe.call_count, 1)
+                        report.assert_not_called()
+
+
 class GuardCleanupTests(unittest.TestCase):
     def setUp(self):
         self.now = 0

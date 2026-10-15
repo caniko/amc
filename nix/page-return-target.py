@@ -40,6 +40,8 @@ def snapshot():
     # Inventory only PTE flags, never read payload bytes. This distinguishes an
     # accounting tail from swapped pages outside the known disposable mapping.
     inventory = {"privateReadable": 0, "other": 0}
+    swapped_mappings = []
+    swapped_mapping_count = 0
     short_reads = scanned = 0
     mappings = Path(f"/proc/{pid}/maps").read_text().splitlines()
     assert len(mappings) <= 8192
@@ -52,6 +54,7 @@ def snapshot():
                 if fields[1].startswith("r") and fields[1].endswith("p")
                 else "other"
             )
+            mapping_swapped = 0
             for address in range(first, last, mmap.PAGESIZE * 512):
                 count = min((last - address) // mmap.PAGESIZE, 512)
                 scanned += count
@@ -62,7 +65,7 @@ def snapshot():
                 if len(entries) != count * 8:
                     short_reads += 1
                     continue
-                inventory[category] += (
+                swapped_bytes = (
                     sum(
                         bool(
                             int.from_bytes(entries[i : i + 8], sys.byteorder)
@@ -72,6 +75,17 @@ def snapshot():
                     )
                     * mmap.PAGESIZE
                 )
+                inventory[category] += swapped_bytes
+                mapping_swapped += swapped_bytes
+            if mapping_swapped:
+                swapped_mapping_count += 1
+                if len(swapped_mappings) < 32:
+                    swapped_mappings.append({
+                        "range": fields[0],
+                        "permissions": fields[1],
+                        "name": " ".join(fields[5:])[:256],
+                        "swappedBytes": mapping_swapped,
+                    })
     return {
         "swapBytes": after,
         "cachedBytes": cached,
@@ -82,6 +96,8 @@ def snapshot():
         "swappedBytes": swapped * mmap.PAGESIZE,
         "mmSwappedBytes": inventory,
         "pagemapShortReads": short_reads,
+        "swappedMappings": swapped_mappings,
+        "swappedMappingCount": swapped_mapping_count,
     }
 
 

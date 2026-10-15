@@ -656,17 +656,34 @@ with test_section("an aged ordinary request receives a native burst quiet window
     )
     wait_entered("quiet-first")
     launch("quiet-bulk", 1001, "tool", "touch /tmp/quiet-bulk-entered; sleep 120")
-    machine.wait_until_succeeds(
-        "amc admission host-status | python3 -c "
-        + shlex.quote(
-            'import sys,json; assert any(not r["granted"] and r["memory_bytes"] == 100663296 for r in json.load(sys.stdin)["reservations"])'
-        ),
-        timeout=10,
-    )
+    # Observe the broker's real request timestamp inside the guest. Driver
+    # one-second polling plus a subsequent fixed sleep consumed most of the
+    # first burst's five-second native lifetime before the late client enrolled.
+    # Keep the same runtime and aging limits, and prove the age/charge overlap.
+    machine.succeed("python3 - <<'PY'\n" + """
+import json
+from pathlib import Path
+import subprocess
+import time
+aging_ms = json.loads(Path('/etc/amc-test-host-policy.json').read_text())['aging_ms']
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    state = json.loads(subprocess.check_output(
+        ['amc', 'admission', 'host-status'], text=True,
+        timeout=min(1, max(.001, deadline - time.monotonic()))))
+    assert state['burst_committed_bytes'] == 33554432, state
+    ordinary = [r for r in state['reservations']
+                if not r['granted'] and r['memory_bytes'] == 100663296]
+    if ordinary and time.time_ns() // 1000000 - ordinary[0]['requested_ms'] >= aging_ms:
+        print(json.dumps({'agedOrdinary': ordinary[0], 'burstCommittedBytes': state['burst_committed_bytes']}))
+        break
+    time.sleep(min(.025, max(0, deadline - time.monotonic())))
+else:
+    raise AssertionError(('ordinary request did not age while first burst was charged', state))
+""" + "\nPY")
     # 64 MiB ordinary + 96 MiB bulk fits only after the first burst drains.
     # A second 32 MiB burst would fit physically and within its allowance, but
     # must not backfill past the one-second aging threshold.
-    machine.sleep(1.25)
     burst("quiet-late", 1001, "touch /tmp/quiet-late-entered; sleep 120")
     machine.wait_until_succeeds(
         "amc admission host-status | python3 -c "
@@ -1006,11 +1023,18 @@ time.sleep(120)
     )
     print("page return native result", return_code, json.dumps(after_native))
     if return_code != 0:
-        machine.sleep(3)
-        print(
-            "page return delayed native result",
-            machine.succeed("python3 /etc/page-return-target.py --snapshot"),
-        )
+        # Preserve the original failure while retaining the exact durable
+        # frontier and native service/lease state. Never fault target bytes in.
+        for name, command in {
+            "discovery": "head -c 16384 /var/lib/amc-page-return/ledger.json",
+            "service": "systemctl show page-return --property=ActiveState,Result,ExecMainStatus,MainPID,ControlGroup",
+            "host": "amc admission host-status",
+        }.items():
+            try:
+                diagnostic = machine.execute("timeout 2s " + command)
+            except Exception as diagnostic_error:
+                diagnostic = ("diagnostic failed", repr(diagnostic_error))
+            print("page return failure diagnostic", name, diagnostic)
     assert return_code == 0, return_output
     assert after_native["returnBytes"] == 0 and after_native["swappedBytes"] == 0, (
         after_native

@@ -262,7 +262,8 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     }
     let helper = amc_admission::swap::helper(std::process::id().try_into()?, &policy)?;
     let _helper_guard = amc_admission::page_return::open_memory(&helper)?;
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(45);
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut discovery) = amc_admission::store::Store::open_discovery(state, boot.trim())?;
     discovery.select(&policy);
@@ -274,10 +275,12 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     // that a previous (possibly interrupted or failed) campaign visited.
     let mut sweep = page_discovery::Sweep::new(&discovery);
     let mut frontier = page_discovery::frontier(&policy)?;
+    let mut iterations = 0;
     for _ in 0..1024 {
         if Instant::now() >= deadline {
             break;
         }
+        iterations += 1;
         if discovery.active.is_none() {
             let candidates = page_discovery::candidates(discovery.after_pid)?;
             if candidates.is_empty() {
@@ -429,6 +432,14 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     sweep_complete &= page_discovery::frontier(&policy)? == frontier;
     eprintln!(
         "page return: proved {returned} bytes resident, {remaining} nonresident return bytes remain in selected subtrees"
+    );
+    eprintln!(
+        "page return campaign: elapsed_ms={} iterations={iterations} deadline_exhausted={} sweep_complete={sweep_complete} unproven={unproven} after_pid={} active_pid={:?} next_address={:?}",
+        started.elapsed().as_millis(),
+        Instant::now() >= deadline,
+        discovery.after_pid,
+        discovery.active.as_ref().map(|cursor| cursor.target.pid),
+        discovery.active.as_ref().map(|cursor| cursor.address),
     );
     // Partial progress, unreadable/unsupported pages and campaign cutoffs remain
     // stalled. The next timer can resume, but this invocation did not complete.
