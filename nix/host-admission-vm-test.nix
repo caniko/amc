@@ -39,26 +39,29 @@
     };
   });
   observer = pkgs.writeShellScriptBin "systemctl" ''
+    set -eu
     # Simulate loss of manager observations without changing native enforcement.
     if test -e /tmp/amc-observation-unavailable; then
       exit 1
     fi
     case "$*" in
       *InvocationID*)
-        if test -e /tmp/amc-page-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-page-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-page-inventory-observed
+        # ProtectSystem=strict makes /tmp read-only in the root broker. Its
+        # existing RuntimeDirectory is writable without relaxing the sandbox.
+        if test "$EUID" -eq 0 && test -e /run/amc-host/page-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/page-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/page-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
-        if test -e /tmp/amc-device-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-device-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-device-inventory-observed
+        if test "$EUID" -eq 0 && test -e /run/amc-host/device-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/device-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/device-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
       *RuntimeMaxUSec*)
-        if test -e /tmp/amc-burst-observation-slow; then
-          ${pkgs.coreutils}/bin/touch /tmp/amc-burst-observation-entered
+        if test "$EUID" -eq 0 && test -e /run/amc-host/burst-observation-slow; then
+          ${pkgs.coreutils}/bin/touch /run/amc-host/burst-observation-entered
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;

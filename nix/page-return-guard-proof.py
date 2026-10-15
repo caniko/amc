@@ -122,10 +122,10 @@ def stale_helper():
 
 
 def deny_changed_owner():
-    observed = Path("/tmp/amc-page-inventory-observed")
+    observed = Path("/run/amc-host/page-inventory-observed")
     observed.unlink(missing_ok=True)
     RESULT.unlink(missing_ok=True)
-    Path("/tmp/amc-page-inventory-pause").touch()
+    Path("/run/amc-host/page-inventory-pause").touch()
     subprocess.run(["systemd-run", "--collect", "--unit=page-return", "--property=MemoryMax=128M",
                     "--property=MemorySwapMax=0", "--", "python3", __file__, "--helper-stale"], check=True)
     wait(observed.exists)
@@ -217,7 +217,9 @@ def prove_path(path):
         policy = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
         policy["swap_recovery"]["page_cgroups"] = ["/amc-guard-proof"]
         Path("/tmp/guard-policy.json").write_text(json.dumps(policy))
-        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--setenv=PATH=/etc/amc-test-observer/bin:/run/current-system/sw/bin", "--", "amc", "admission", "host-serve",
+        # The public package launcher prepends real systemd to PATH. Keep this
+        # fixture's observer first at the same native boundary as the main broker.
+        subprocess.run(["systemd-run", "--unit=guard-owner-host", "--setenv=PATH=/etc/amc-test-observer/bin:/run/current-system/sw/bin", "--", "/etc/amc-fixture-native-engine", "admission", "host-serve",
                         "--policy", "/tmp/guard-policy.json", "--socket", SOCKET, "--state", f"/var/lib/amc-guard-{path}"], check=True)
         wait(host_ready)
         stale_denied = deny_changed_owner()

@@ -29,6 +29,11 @@ with test_section("broker hides runtime and home paths even after late user star
     machine.succeed(namespace + "test -d /proc/self")
     machine.fail(namespace + "test -e /root/amc-private-marker")
     machine.fail(namespace + "test -e /home/alice/amc-private-marker")
+    machine.fail(namespace + "touch /tmp/amc-broker-write-forbidden")
+    machine.fail("test -e /tmp/amc-broker-write-forbidden")
+    machine.succeed(namespace + "touch /run/amc-host/observer-write-probe")
+    machine.succeed("test -e /run/amc-host/observer-write-probe")
+    machine.succeed(namespace + "rm /run/amc-host/observer-write-probe")
 
 
 def write_file(path, text):
@@ -496,11 +501,13 @@ with test_section(
     assert state["committed_bytes"] > state["budget_bytes"]
     assert state["burst_committed_bytes"] == 32 * 1048576
     assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
-    machine.succeed("touch /tmp/amc-burst-observation-slow")
-    machine.wait_until_succeeds("test -e /tmp/amc-burst-observation-entered")
+    machine.succeed("touch /run/amc-host/burst-observation-slow")
+    machine.wait_until_succeeds(
+        "test -e /run/amc-host/burst-observation-entered", timeout=10
+    )
     responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    assert json.loads(result.stdout)['ok']\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
     assert responsive["elapsedSeconds"] < 1, responsive
-    machine.succeed("rm /tmp/amc-burst-observation-slow")
+    machine.succeed("rm /run/amc-host/burst-observation-slow")
     evidence["burstManagerResponsiveness"] = responsive
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
@@ -1150,8 +1157,10 @@ assert 'native recovery demand or frontier changed' in response['error'], respon
 with open('/tmp/device-stale-demand-denied', 'w') as receipt:
     json.dump(response, receipt)
 """)
-    machine.succeed("touch /tmp/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/device-stale-demand.py")
-    machine.wait_until_succeeds("test -e /tmp/amc-device-inventory-observed")
+    machine.succeed("touch /run/amc-host/device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/device-stale-demand.py")
+    machine.wait_until_succeeds(
+        "test -e /run/amc-host/device-inventory-observed", timeout=10
+    )
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=32M")
     machine.wait_until_succeeds("test -e /tmp/device-stale-demand-denied")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=128M")

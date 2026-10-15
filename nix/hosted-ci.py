@@ -22,6 +22,7 @@ ALLOWED = {
     ".#nixosTests.x86_64-linux.supervision",
 }
 NATIVE_CASES = {
+    "broker hides runtime and home paths even after late user starts",
     "rapid native and admitted jobs preserve completion and fail closed on startup loss",
     "namespace runners share a host-reserve-backed aggregate ceiling",
     "concurrent preparation helpers share the reserve-backed runner slice",

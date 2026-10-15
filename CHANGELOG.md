@@ -36,6 +36,10 @@
 
 ### Fixed
 
+- Keep hosted root-observer rendezvous files in the broker's writable runtime
+  directory, preserving its read-only `/tmp` and hidden user-runtime/home paths.
+  Bound observer acknowledgements and require the native sandbox proof in hosted
+  admission evidence.
 - Preserve bounded native startup refusal reasons in host-runner errors,
   distinguishing manager/cgroup identity loss from a socket-handshake failure.
   The retained diagnostic does not change unknown cleanup or admission authority.
