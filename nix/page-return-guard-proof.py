@@ -115,6 +115,12 @@ def stop_fixture_service(unit):
     assert state["ActiveState"] in ("inactive", "failed") and state["MainPID"] == state["ControlPID"] == "0", state
     events = Path("/sys/fs/cgroup/system.slice") / unit / "cgroup.events"
     assert not events.exists() or "populated 0" in events.read_text().splitlines(), (unit, state)
+    # A deliberately killed transient unit stays loaded in the failed state.
+    # Its outcome has been checked above/by the caller; release its name before
+    # the next proof starts a fresh helper or broker with the same unit name.
+    if state["ActiveState"] == "failed":
+        subprocess.run(["systemctl", "reset-failed", unit], check=True, timeout=10)
+    wait(lambda: service_state(unit)["LoadState"] == "not-found")
 
 
 def reap_target(pid):
