@@ -7,6 +7,7 @@ import runpy
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -63,6 +64,49 @@ class QuietWindowTests(unittest.TestCase):
                             exec(compile(guest, "quiet-window-guest", "exec"), {})
                         self.assertEqual(probe.call_count, 1)
                         report.assert_not_called()
+
+
+class GuardNonresidentSetupTests(unittest.TestCase):
+    def test_target_stays_frozen_through_reclaim_and_destination_migration(self):
+        writes = {}
+        original = guard.ROOT / "original"
+        backed = guard.ROOT / "backed"
+
+        def write(path, value):
+            if path.name == "memory.reclaim":
+                self.assertEqual(writes.get(original / "cgroup.freeze"), "1",
+                                 "the executing target can refault reclaimed pages")
+            if path == backed / "cgroup.procs":
+                self.assertEqual(writes.get(backed / "cgroup.freeze"), "1",
+                                 "migration must not thaw the target")
+            writes[path] = value
+
+        def read(path):
+            if path.name == "cgroup.events":
+                self.assertEqual(writes.get(path.parent / "cgroup.freeze"), "1")
+                return "populated 1\nfrozen 1\n"
+            if path.name == "memory.stat":
+                return "swapcached 0\n"
+            if path.name == "memory.swap.current":
+                return str(4 * guard.MIB)
+            self.assertEqual(str(path), "/etc/amc-test-host-policy.json")
+            return '{"swap_recovery":{"page_cgroups":[]}}'
+
+        with (
+            mock.patch.object(guard, "cleanup_scope", return_value=nullcontext()),
+            mock.patch.object(guard.Path, "mkdir"),
+            mock.patch.object(guard.Path, "write_text", autospec=True, side_effect=write),
+            mock.patch.object(guard.Path, "read_text", autospec=True, side_effect=read),
+            mock.patch.object(guard.os, "pipe", return_value=(100, 101)),
+            mock.patch.object(guard.os, "fork", return_value=123),
+            mock.patch.object(guard.os, "close"),
+            mock.patch.object(guard.os, "read", return_value=b"ready"),
+            mock.patch.object(guard.subprocess, "run", side_effect=RuntimeError("setup complete")),
+            self.assertRaisesRegex(RuntimeError, "setup complete"),
+        ):
+            guard.prove_path("cache")
+        self.assertIn(original / "memory.reclaim", writes)
+        self.assertEqual(writes[backed / "cgroup.procs"], "123")
 
 
 class GuardCleanupTests(unittest.TestCase):

@@ -387,6 +387,11 @@ def prove_path(path):
         os.close(ready_write)
         del steps["ready write"]
         assert os.read(ready_read, 5) == b"ready"
+        # Keep the Python target from refaulting its interpreter/stack during
+        # reclaim, including across migration into the eventual guarded group.
+        (ROOT / "original" / "cgroup.freeze").write_text("1")
+        wait(lambda: "frozen 1" in (ROOT / "original" / "cgroup.events").read_text().splitlines())
+        (ROOT / "backed" / "cgroup.freeze").write_text("1")
         try:
             (ROOT / "original" / "memory.reclaim").write_text(f"{8 * MIB} swappiness=max")
         except OSError as error:
@@ -397,7 +402,6 @@ def prove_path(path):
             return int((ROOT / "original" / "memory.swap.current").read_text()) >= 4 * MIB and int(stat["swapcached"]) == 0
         wait(nonresident)
         (ROOT / "backed" / "cgroup.procs").write_text(str(pid))
-        (ROOT / "backed" / "cgroup.freeze").write_text("1")
         wait(lambda: "frozen 1" in (ROOT / "backed" / "cgroup.events").read_text())
         policy = json.loads(Path("/etc/amc-test-host-policy.json").read_text())
         policy["swap_recovery"]["page_cgroups"] = ["/amc-guard-proof"]
