@@ -81,6 +81,8 @@ pub struct Domain {
     pub burst: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<crate::continuation::ContinuationPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_pool: Option<crate::protected_pool::ProtectedPool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -123,7 +125,24 @@ impl HostPolicy {
             );
         }
         let mut names = BTreeSet::new();
+        let mut pool_users = BTreeSet::new();
+        let mut pool_bytes = 0u64;
         for d in &self.domains {
+            if let Some(pool) = &d.protected_pool {
+                pool.validate()?;
+                ensure!(
+                    d.uid != 0
+                        && pool_users.insert(d.uid)
+                        && !d.burst
+                        && d.continuation.is_none()
+                        && d.swap_bytes == 0
+                        && d.ceiling_bytes <= pool.max_job_bytes,
+                    "protected pools require one exclusive zero-swap user domain"
+                );
+                pool_bytes = pool_bytes
+                    .checked_add(pool.memory_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("protected backing overflow"))?;
+            }
             ensure!(
                 crate::ledger::valid_name(&d.name) && names.insert(&d.name),
                 "invalid or duplicate host domain"
@@ -175,6 +194,30 @@ impl HostPolicy {
                 );
             }
         }
+        ensure!(
+            pool_bytes <= self.budget_bytes,
+            "protected pools cannot fit host budget"
+        );
+        ensure!(
+            self.domains
+                .iter()
+                .filter_map(|d| d.protected_pool.as_ref())
+                .map(|p| p.max_running)
+                .sum::<usize>()
+                <= 8,
+            "too many simultaneous protected calls"
+        );
+        ensure!(
+            self.queue_limit
+                + self
+                    .domains
+                    .iter()
+                    .filter_map(|d| d.protected_pool.as_ref())
+                    .map(|p| p.queue_limit)
+                    .sum::<usize>()
+                <= 256,
+            "combined host queues exceed ledger bound"
+        );
         let mut profiles = BTreeSet::new();
         ensure!(
             self.preparations.len() <= 64,
@@ -268,6 +311,8 @@ pub struct HostLedger {
     /// native cleanup is positively observed, including across broker restart.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub namespace_runners: BTreeMap<u32, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protected_pools: BTreeMap<String, crate::protected_pool::Backing>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -289,6 +334,8 @@ pub enum WaitReason {
     SwapReturn,
     Recovery,
     ContinuationSlot,
+    ProtectedPool,
+    ProtectedConcurrency,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -314,10 +361,12 @@ impl HostLedger {
             continuations: vec![],
             pool_operations: BTreeMap::new(),
             namespace_runners: BTreeMap::new(),
+            protected_pools: BTreeMap::new(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        crate::protected_pool::validate_backing(self)?;
         ensure!(
             self.namespace_runners.len() <= 256
                 && self.namespace_runners.iter().all(|(uid, bytes)| *uid != 0
@@ -353,7 +402,7 @@ impl HostLedger {
                 "invalid host reservation"
             );
             ensure!(
-                if r.burst {
+                if r.burst || self.protected_owner(r).is_some() {
                     r.identity.uid != 0
                         && r.swap_bytes == 0
                         && r.runtime_max_ms
@@ -479,8 +528,13 @@ impl HostLedger {
     pub fn committed(&self) -> u64 {
         self.reservations
             .iter()
-            .filter(|r| r.granted)
+            .filter(|r| r.granted && self.protected_owner(r).is_none())
             .fold(0u64, |sum, r| sum.saturating_add(r.memory_bytes))
+            .saturating_add(
+                self.protected_pools
+                    .values()
+                    .fold(0u64, |sum, p| sum.saturating_add(p.memory_bytes)),
+            )
             .saturating_add(
                 self.preparations
                     .iter()
@@ -593,10 +647,28 @@ impl HostLedger {
                         .is_some_and(|ms| ms > 0 && ms <= burst.max_runtime_ms),
                 "burst requires a small zero-swap boundary and verified short native deadline"
             );
-        } else {
+        } else if domain.protected_pool.is_none() {
             ensure!(
                 reservation.runtime_max_ms.is_none(),
                 "unexpected burst deadline proof"
+            );
+        }
+        if let Some(pool) = &domain.protected_pool {
+            ensure!(
+                self.protected_owner(&reservation).is_some()
+                    && reservation.swap_bytes == 0
+                    && !reservation.burst
+                    && reservation.continuation.is_none()
+                    && reservation.memory_bytes <= pool.max_job_bytes
+                    && reservation
+                        .runtime_max_ms
+                        .is_some_and(|ms| ms > 0 && ms <= pool.runtime_max_sec * 1000),
+                "protected execution requires current backing and verified short native bounds"
+            );
+        } else {
+            ensure!(
+                self.protected_owner(&reservation).is_none(),
+                "protected backing is retiring"
             );
         }
         ensure!(
@@ -653,7 +725,18 @@ impl HostLedger {
             return Ok(r.id.clone());
         }
         ensure!(
-            self.reservations.len() < policy.queue_limit
+            self.reservations
+                .iter()
+                .filter(|r| if domain.protected_pool.is_some() {
+                    r.domain == domain.name
+                } else {
+                    self.protected_owner(r).is_none()
+                })
+                .count()
+                < domain
+                    .protected_pool
+                    .as_ref()
+                    .map_or(policy.queue_limit, |p| p.queue_limit)
                 && self.reservations.iter().all(|r| r.id != reservation.id),
             "host admission queue is full or ticket exists"
         );
@@ -761,6 +844,10 @@ impl HostLedger {
                 continue;
             }
             let committed = self.committed();
+            let protected = policy
+                .domains
+                .iter()
+                .any(|d| d.name == r.domain && d.protected_pool.is_some());
             let ready = healthy_since
                 .get(&r.domain)
                 .is_some_and(|since| now.saturating_sub(*since) >= policy.resume_ms);
@@ -782,6 +869,16 @@ impl HostLedger {
                 Some(WaitReason::Unknown)
             } else if !ready {
                 Some(WaitReason::Pressure)
+            } else if protected {
+                if capacity.map_or(0, |c| c.available_bytes)
+                    < policy
+                        .reserve_bytes
+                        .saturating_add(self.return_claim(policy))
+                {
+                    Some(WaitReason::SwapReturn)
+                } else {
+                    self.protected_wait(r, policy, burst_runtime(&r.identity), &mut ancestry)
+                }
             } else if let Some(reason) = burst_wait {
                 Some(reason)
             } else if self.completion_slot_busy(r) {
@@ -825,6 +922,7 @@ impl HostLedger {
                 // An aged request whose own pressure gate is closed cannot
                 // veto healthy peers. Capacity/fairness waits still age-block.
                 aged_block |= !r.burst
+                    && !protected
                     && matches!(
                         reason,
                         WaitReason::Budget
@@ -838,6 +936,7 @@ impl HostLedger {
                 // A waiting bulk job that could fit once bursts drain must get
                 // that quiet window. A full normal budget can still serve bursts.
                 if !r.burst
+                    && !protected
                     && matches!(
                         reason,
                         WaitReason::Budget

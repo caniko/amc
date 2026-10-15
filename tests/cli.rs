@@ -281,6 +281,7 @@ fn delayed_admission_grants_cannot_submit_after_the_client_deadline() {
                 contract: Contract {
                     burst: false,
                     runtime_max_sec: None,
+                    protected_pool: None,
                     slice: "app.slice".into(),
                     memory_max: 1024,
                     memory_swap_max: 0,

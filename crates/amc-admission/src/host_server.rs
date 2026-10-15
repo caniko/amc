@@ -117,6 +117,8 @@ pub struct Response {
     pub burst_budget_bytes: u64,
     #[serde(default)]
     pub burst_committed_bytes: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protected_pools: BTreeMap<String, crate::protected_pool::Backing>,
     pub reservations: Option<Vec<Reservation>>,
     pub error: Option<String>,
     #[serde(default)]
@@ -264,7 +266,7 @@ pub fn verify_entry(
                 && r.memory_bytes == contract.memory_max
                 && r.swap_bytes == contract.memory_swap_max
                 && r.burst == contract.burst
-                && (!r.burst
+                && (!(r.burst || contract.protected_pool.is_some())
                     || r.runtime_max_ms.is_some_and(|ms| contract
                         .runtime_max_sec
                         .is_some_and(|seconds| ms <= seconds * 1000))))),
@@ -302,6 +304,7 @@ pub fn serve_supervised(
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
     ledger.swap_return_bytes = None;
     ledger.reconcile_continuation_policy(&policy);
+    ledger.sync_protected_pools(&policy, crate::protected_pool::empty)?;
     crate::namespace_runner::discover(&mut ledger, &policy)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
     reconcile_preparation_helpers(&mut ledger, &policy);
@@ -341,12 +344,17 @@ pub fn serve_supervised(
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
     let mut burst_manager = crate::burst_manager::Cache::default();
+    // Separate bounded queues/workers: bulk/burst probes cannot consume the
+    // protected lane's native deadline observations.
+    let mut protected_manager = crate::burst_manager::Cache::default();
     let mut recovery_manager = recovery_manager::Cache::default();
     let mut connections = transport::Connections::default();
     while !stopping() {
         burst_manager.refresh(&ledger)?;
+        protected_manager.refresh_protected(&ledger)?;
         recovery_manager.refresh(ledger.recovery.as_ref())?;
-        let burst_evidence = burst_manager.snapshot();
+        let mut burst_evidence = burst_manager.snapshot();
+        burst_evidence.extend(protected_manager.snapshot());
         if tick.elapsed() >= Duration::from_millis(250) {
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
@@ -530,9 +538,14 @@ pub fn serve_supervised(
                                     .iter()
                                     .find(|r| r.granted && r.identity == identity)
                             {
-                                if grant.burst {
-                                    burst_manager.register(&identity)?;
-                                    if burst_manager.runtime(&identity) != grant.runtime_max_ms {
+                                if grant.runtime_max_ms.is_some() {
+                                    let manager = if ledger.protected_owner(grant).is_some() {
+                                        &mut protected_manager
+                                    } else {
+                                        &mut burst_manager
+                                    };
+                                    manager.register(&identity)?;
+                                    if manager.runtime(&identity) != grant.runtime_max_ms {
                                         reply.waiting = Some(WaitReason::Unknown);
                                         return Ok(reply);
                                     }
@@ -546,9 +559,19 @@ pub fn serve_supervised(
                             }
                             let now = crate::clock::boot_ms()?;
                             let burst = policy.domains.iter().any(|d| d.name == domain && d.burst);
-                            let runtime_max_ms = if burst {
-                                burst_manager.register(&identity)?;
-                                let Some(runtime) = burst_manager.runtime(&identity) else {
+                            let short_call = burst
+                                || policy
+                                    .domains
+                                    .iter()
+                                    .any(|d| d.name == domain && d.protected_pool.is_some());
+                            let runtime_max_ms = if short_call {
+                                let manager = if burst {
+                                    &mut burst_manager
+                                } else {
+                                    &mut protected_manager
+                                };
+                                manager.register(&identity)?;
+                                let Some(runtime) = manager.runtime(&identity) else {
                                     reply.waiting = Some(WaitReason::Unknown);
                                     return Ok(reply);
                                 };
@@ -1079,6 +1102,9 @@ fn root_operation(request: &Request, uid: u32, preparations: bool) -> Result<Opt
 }
 
 fn populate_status(reply: &mut Response, ledger: &HostLedger, uid: u32) {
+    reply.protected_pools = ledger.protected_pools.iter()
+        .filter(|(_, backing)| uid == 0 || backing.uid == uid)
+        .map(|(name, backing)| (name.clone(), backing.clone())).collect();
     reply.reservations = Some(
         ledger
             .reservations
@@ -1155,6 +1181,9 @@ fn observe(
     ledger.reconcile_continuation_policy(policy);
     ledger.retain_pool_operations();
     crate::namespace_runner::reconcile(ledger, policy);
+    ledger
+        .sync_protected_pools(policy, crate::protected_pool::empty)
+        .ok()?;
     if ledger.recovery.is_none()
         && policy.swap_recovery.as_ref().is_some_and(|p| {
             p.targets
@@ -1168,6 +1197,7 @@ fn observe(
         ledger.swap_return_bytes = crate::swap::return_bytes(ledger).ok();
     }
     if crate::namespace_runner::enforcement(ledger, policy) == Some(true)
+        && crate::protected_pool::enforcement(ledger, policy) == Some(true)
         && ledger
             .reservations
             .iter()
@@ -1184,7 +1214,7 @@ fn observe(
 
 fn cached_enforcement(r: &Reservation, evidence: &crate::burst_manager::Snapshot) -> bool {
     host_native::memory_enforcement(r).is_some()
-        && (!r.burst
+        && (r.runtime_max_ms.is_none()
             || evidence
                 .runtime(&r.identity)
                 .is_some_and(|runtime| Some(runtime) == r.runtime_max_ms))

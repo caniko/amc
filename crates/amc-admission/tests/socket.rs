@@ -62,6 +62,7 @@ fn policy() -> Policy {
                 pause_file: None,
                 burst: false,
                 runtime_max_sec: None,
+                protected_pool: None,
             },
         )]),
     }
@@ -294,6 +295,7 @@ fn sized_wire_calls_shrink_contracts_and_bursts_require_a_host_broker() {
                     pause_file: None,
                     burst: true,
                     runtime_max_sec: Some(5),
+                    protected_pool: None,
                 },
             );
             serve(

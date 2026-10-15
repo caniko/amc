@@ -15,6 +15,7 @@ pub mod native;
 pub mod page_discovery;
 pub mod page_return;
 pub mod preparation;
+pub mod protected_pool;
 pub mod protocol;
 pub mod recovery;
 mod root_pool;
