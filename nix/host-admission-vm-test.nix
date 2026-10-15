@@ -40,25 +40,33 @@
   });
   observer = pkgs.writeShellScriptBin "systemctl" ''
     # Simulate loss of manager observations without changing native enforcement.
-    if test -e /tmp/amc-observation-unavailable; then
+    # ProtectSystem=strict makes /tmp read-only inside the host broker. Keep
+    # fixture rendezvous in its existing writable RuntimeDirectory instead.
+    if test -e /run/amc-host/amc-observation-unavailable; then
       exit 1
     fi
     case "$*" in
       *InvocationID*)
-        if test -e /tmp/amc-page-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-page-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-page-inventory-observed
+        # Other brokers and private admission also query InvocationID. Only
+        # the selected broker's post-scan recovery query may consume a flag.
+        if test "$*" = 'show --property=ControlGroup,MainPID,Restart,KillMode,InvocationID -- page-return.service' \
+          && test "$(${pkgs.coreutils}/bin/cat /proc/$PPID/cgroup)" = '0::/system.slice/guard-owner-host.service' \
+          && test -e /run/amc-host/amc-page-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/amc-page-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-page-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
-        if test -e /tmp/amc-device-inventory-pause; then
-          ${pkgs.coreutils}/bin/rm /tmp/amc-device-inventory-pause
-          ${pkgs.coreutils}/bin/touch /tmp/amc-device-inventory-observed
+        if test "$*" = 'show --property=ControlGroup,MainPID,Restart,KillMode,InvocationID -- page-return.service' \
+          && test "$(${pkgs.coreutils}/bin/cat /proc/$PPID/cgroup)" = '0::/system.slice/device-host.service' \
+          && test -e /run/amc-host/amc-device-inventory-pause; then
+          ${pkgs.coreutils}/bin/rm /run/amc-host/amc-device-inventory-pause
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-device-inventory-observed
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
       *RuntimeMaxUSec*)
-        if test -e /tmp/amc-burst-observation-slow; then
-          ${pkgs.coreutils}/bin/touch /tmp/amc-burst-observation-entered
+        if test -e /run/amc-host/amc-burst-observation-slow; then
+          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-burst-observation-entered
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
@@ -190,6 +198,16 @@ in
         };
         systemd.services.amc-host-admission.requires = ["builders.slice"];
         systemd.services.amc-host-admission.after = ["builders.slice"];
+        assertions = [
+          {
+            assertion = config.systemd.services.amc-host-admission.serviceConfig.ProtectHome == "read-only";
+            message = "Preparation authorization requires readable runtime rendezvous sockets.";
+          }
+          {
+            assertion = builtins.all (path: builtins.elem path config.systemd.services.amc-host-admission.serviceConfig.InaccessiblePaths) ["/home" "/root"];
+            message = "Preparation runtime visibility must not expose home trees.";
+          }
+        ];
         # The public launcher prepends real systemd to PATH. Inject the observer
         # at the native engine boundary while retaining its runtime dependencies
         # and all hardening and lifecycle settings from the production module.

@@ -1,10 +1,14 @@
+import ast
+import errno
 import hashlib
 import importlib.util
 import json
+import runpy
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "hosted_ci", Path(__file__).with_name("hosted-ci.py")
@@ -12,8 +16,266 @@ spec = importlib.util.spec_from_file_location(
 hosted = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hosted)
 
+guard_spec = importlib.util.spec_from_file_location(
+    "guard_proof", Path(__file__).with_name("page-return-guard-proof.py")
+)
+guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(guard)
+
+
+class QuietWindowTests(unittest.TestCase):
+    def test_actual_guest_barrier_uses_request_age_and_requires_the_first_charge(self):
+        tree = ast.parse((hosted.ROOT / "nix/host-admission-vm-test.py").read_text())
+        call = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "succeed" and node.args
+                    and "agedOrdinary" in ast.unparse(node.args[0]))
+        command = eval(compile(ast.Expression(call.args[0]), "quiet-window-command", "eval"))
+        guest = command.removeprefix("python3 - <<'PY'\n").removesuffix("\nPY")
+        for charged in [True, False]:
+            with self.subTest(charged=charged):
+                elapsed = [0.0]
+                state = {"burst_committed_bytes": 33554432 if charged else 0,
+                         "reservations": [{"granted": False, "memory_bytes": 100663296,
+                                           "requested_ms": 1000}]}
+
+                def advance(seconds):
+                    elapsed[0] += seconds
+
+                with (
+                    mock.patch("pathlib.Path.read_text", return_value='{"aging_ms":1000}'),
+                    mock.patch("subprocess.check_output", return_value=json.dumps(state)) as probe,
+                    mock.patch("time.monotonic", side_effect=lambda: elapsed[0]),
+                    mock.patch("time.time_ns", side_effect=lambda: int((1.5 + elapsed[0]) * 1_000_000_000)),
+                    mock.patch("time.sleep", side_effect=advance),
+                    mock.patch("builtins.print") as report,
+                ):
+                    if charged:
+                        exec(compile(guest, "quiet-window-guest", "exec"), {})
+                        self.assertGreaterEqual(elapsed[0], .5)
+                        self.assertLess(elapsed[0], .55)
+                        self.assertGreater(probe.call_count, 1)
+                        receipt = json.loads(report.call_args.args[0])
+                        self.assertEqual(receipt["agedOrdinary"], state["reservations"][0])
+                        self.assertEqual(receipt["burstCommittedBytes"], 33554432)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(guest, "quiet-window-guest", "exec"), {})
+                        self.assertEqual(probe.call_count, 1)
+                        report.assert_not_called()
+
+
+class GuardCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0
+        self.real_diagnostics = guard.cleanup_diagnostics
+        self.reader = mock.patch.object(
+            guard.Path, "read_text", autospec=True,
+            side_effect=lambda path: "Filename Type Size Used Priority\n" if str(path) == "/proc/swaps" else "0\n",
+        )
+        self.reader.start()
+        self.addCleanup(self.reader.stop)
+        clock = mock.patch.object(guard.time, "monotonic", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        sleeper = mock.patch.object(guard.time, "sleep", side_effect=self.advance)
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
+        diagnostics = mock.patch.object(guard, "cleanup_diagnostics", return_value='{"phase":"fixture-reset","swaps":"inactive"}')
+        diagnostics.start()
+        self.addCleanup(diagnostics.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def test_reset_retries_only_transient_busy_and_closes_each_attempt(self):
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = [OSError(errno.EBUSY, "busy"), 1]
+            guard.reset_zram(timeout=.1)
+            self.assertEqual(handle.write.call_count, 2)
+            self.assertEqual(opened.return_value.__exit__.call_count, 2)
+            self.assertEqual(self.now, .05)
+
+    def test_persistent_busy_exhausts_the_bound_with_diagnostics(self):
+        busy = OSError(errno.EBUSY, "held open")
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = busy
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram(timeout=.1)
+            self.assertIs(caught.exception, busy)
+            self.assertEqual(handle.write.call_count, 3)
+            self.assertEqual(self.now, .1)
+            self.assertIn("exhausted", " ".join(busy.__notes__))
+            self.assertIn("inactive", " ".join(busy.__notes__))
+
+    def test_unrelated_reset_error_propagates_without_retry(self):
+        error = OSError(errno.EIO, "broken reset")
+        with mock.patch.object(guard.Path, "open") as opened:
+            handle = opened.return_value.__enter__.return_value
+            handle.write.side_effect = error
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram()
+            self.assertIs(caught.exception, error)
+            self.assertEqual(handle.write.call_count, 1)
+            self.sleep.assert_not_called()
+
+    def test_reset_refuses_active_swap_before_opening_reset(self):
+        self.reader.stop()
+        with (
+            mock.patch.object(guard.Path, "read_text", return_value="Filename Type Size Used Priority\n/dev/zram0 partition 100 1 100\n"),
+            mock.patch.object(guard.Path, "open") as opened,
+        ):
+            with self.assertRaisesRegex(AssertionError, "still active swap"):
+                guard.reset_zram()
+            opened.assert_not_called()
+
+    def test_cleanup_preserves_primary_and_attempts_independent_steps(self):
+        completed = []
+        primary = AssertionError("migration proof failed")
+        cleanup_error = OSError(errno.EBUSY, "reset failed")
+
+        def fail():
+            raise cleanup_error
+
+        steps = {"remaining": lambda: completed.append("remaining"), "reset": fail}
+        with (
+            self.assertLogs(level="ERROR"),
+            self.assertRaises(guard.builtins.BaseExceptionGroup) as caught,
+            guard.cleanup_scope("direct", steps),
+        ):
+            raise primary
+        self.assertEqual(list(caught.exception.exceptions), [primary, cleanup_error])
+        self.assertEqual(completed, ["remaining"])
+        self.assertIn("primary failure", " ".join(primary.__notes__))
+        self.assertIn("cleanup step=reset", " ".join(cleanup_error.__notes__))
+
+    def test_successful_cleanup_does_not_replace_primary_failure(self):
+        primary = AssertionError("original guard failure")
+        with self.assertRaises(AssertionError) as caught, guard.cleanup_scope("cache", {}):
+            raise primary
+        self.assertIs(caught.exception, primary)
+
+    def test_diagnostic_failure_is_reported_without_replacing_cleanup_error(self):
+        # Exercise the real diagnostic collector with a failing manager query.
+        error = OSError(errno.EIO, "reset failed")
+        with (
+            self.assertLogs(level="ERROR"),
+            mock.patch.object(guard, "cleanup_diagnostics", self.real_diagnostics),
+            mock.patch.object(guard.subprocess, "check_output", side_effect=RuntimeError("manager unavailable")),
+            mock.patch.object(guard.Path, "open") as opened,
+        ):
+            opened.return_value.__enter__.return_value.write.side_effect = error
+            with self.assertRaises(OSError) as caught:
+                guard.reset_zram()
+        self.assertIs(caught.exception, error)
+        self.assertIn("zram-reset-error", " ".join(error.__notes__))
+        self.assertIn("manager unavailable", " ".join(error.__notes__))
+
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_supervision_settlement_uses_one_coherent_status_snapshot(self):
+        tree = ast.parse((hosted.ROOT / "nix/supervision-recovery-failures.py").read_text())
+        settled = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "settled")
+        source = ast.unparse(ast.Module(body=[settled], type_ignores=[]))
+        snapshots = iter([
+            {"recovery": {"active": None, "attempts": []}},
+            {"recovery": {"active": {"phase": "cooling"}, "attempts": [1]}},
+            {"recovery": {"active": None, "attempts": [1]}},
+        ])
+        current = None
+        observations = []
+
+        def read():
+            nonlocal current
+            current = next(snapshots, current)
+            return current
+
+        def wait_for(predicate, seconds):
+            self.assertEqual(seconds, 30)
+            for _ in range(3):
+                result = predicate()
+                observations.append(result)
+                if result:
+                    return
+            raise AssertionError("did not settle")
+
+        machine = mock.Mock()
+
+        def wait_for_unit(unit):
+            self.assertEqual(unit, "amc-failure@budget-a.service")
+            self.assertIsNone(current["recovery"]["active"], "fixture accepted a mixed startup/cooling snapshot")
+            self.assertEqual(len(current["recovery"]["attempts"]), 1)
+
+        machine.wait_for_unit.side_effect = wait_for_unit
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settlement.py"
+            path.write_text(source)
+            namespace = runpy.run_path(str(path), init_globals={
+                "wait_for": wait_for, "machine": machine,
+                "unit": lambda name: f"amc-failure@{name}.service",
+            })
+            receipt = namespace["settled"](read, "budget-a", 1)
+        self.assertEqual(observations, [False, False, True])
+        self.assertEqual(receipt, current)
+        machine.wait_for_unit.assert_called_once()
+
+    def test_completion_teardown_requires_an_exited_client_and_strict_stops(self):
+        tree = ast.parse((hosted.ROOT / "nix/completion-vm-test.py").read_text())
+        section = tree.body[0]
+        stop = next(
+            index for index, node in enumerate(section.body)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "stop_scope"
+        )
+        # Execute the real teardown statements, ending before the receipt.
+        cleanup = ast.unparse(
+            ast.Module(body=section.body[stop + 1:-1], type_ignores=[])
+        )
+
+        def run_cleanup(machine):
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "completion-teardown.py"
+                path.write_text(cleanup)
+                runpy.run_path(str(path), init_globals={"machine": machine})
+
+        class Machine:
+            def __init__(self, state, stop_error=False):
+                self.state = state
+                self.stop_error = stop_error
+                self.stopped = False
+
+            def succeed(self, command):
+                if command == "systemctl show completion-game-client.service --property=ActiveState,MainPID,ControlPID":
+                    return self.state
+                if command != "systemctl stop completion-worker completion-host":
+                    raise AssertionError(command)
+                if self.stop_error:
+                    raise RuntimeError("strict stop failed")
+                self.stopped = True
+                return ""
+
+        # systemctl show reports these properties even for an unloaded unit.
+        inactive = "ActiveState=inactive\nMainPID=0\nControlPID=0\n"
+        machine = Machine(inactive)
+        run_cleanup(machine)
+        self.assertTrue(machine.stopped)
+        for state in [
+            "ActiveState=active\nMainPID=123\nControlPID=0\n",
+            "ActiveState=deactivating\nMainPID=123\nControlPID=0\n",
+            "ActiveState=failed\nMainPID=0\nControlPID=0\n",
+            "ActiveState=inactive\nMainPID=0\nControlPID=123\n",
+        ]:
+            with self.subTest(state=state):
+                machine = Machine(state)
+                with self.assertRaises(AssertionError):
+                    run_cleanup(machine)
+                self.assertFalse(machine.stopped)
+        with self.assertRaisesRegex(RuntimeError, "strict stop failed"):
+            run_cleanup(Machine(inactive, stop_error=True))
+
     def test_generator_identity_tracks_the_canonical_pinned_invocation(self):
         source = (hosted.ROOT / "simit.toml").read_text()
         with tempfile.TemporaryDirectory() as temp:

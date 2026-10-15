@@ -56,7 +56,13 @@ def launch(name, domains, domain_limit, host_limit, cooldown=2000):
 
 
 def settled(read, name, count):
-    wait_for(lambda: read()["recovery"]["active"] is None and len(read()["recovery"]["attempts"]) == count, 30)
+    def complete():
+        # Recovery startup can publish between reads. Both facts must come
+        # from the same atomic status document before checking the native unit.
+        recovery = read()["recovery"]
+        return recovery["active"] is None and len(recovery["attempts"]) == count
+
+    wait_for(complete, 30)
     machine.wait_for_unit(unit(name))
     return read()
 

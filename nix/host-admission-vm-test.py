@@ -465,11 +465,11 @@ with test_section(
     assert state["committed_bytes"] > state["budget_bytes"]
     assert state["burst_committed_bytes"] == 32 * 1048576
     assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
-    machine.succeed("touch /tmp/amc-burst-observation-slow")
-    machine.wait_until_succeeds("test -e /tmp/amc-burst-observation-entered")
-    responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    assert json.loads(result.stdout)['ok']\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
+    machine.succeed("touch /run/amc-host/amc-burst-observation-slow")
+    machine.wait_until_succeeds("test -e /run/amc-host/amc-burst-observation-entered", timeout=10)
+    responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    status = json.loads(result.stdout)\n    assert status['version'] == 1 and status['error'] is None, status\n    assert status['budget_bytes'] == 160 * 1048576 and isinstance(status['reservations'], list), status\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
     assert responsive["elapsedSeconds"] < 1, responsive
-    machine.succeed("rm /tmp/amc-burst-observation-slow")
+    machine.succeed("rm /run/amc-host/amc-burst-observation-slow")
     evidence["burstManagerResponsiveness"] = responsive
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
@@ -591,7 +591,7 @@ with test_section(
     assert any(
         e["phase"] == "running" and e["contract"]["burst"] for e in restored["entries"]
     ), restored
-    machine.succeed("touch /tmp/amc-observation-unavailable")
+    machine.succeed("touch /run/amc-host/amc-observation-unavailable")
     machine.succeed("systemctl kill --kill-whom=main --signal=KILL burst-loss-client")
     # Real systemd deadlines clean the entire cgroup while the private broker
     # lacks evidence. Neither client death, restart nor expiry may free its grant.
@@ -607,7 +607,7 @@ with test_section(
     machine.succeed(
         f"test ! -e {group} || grep -q '^populated 0$' {group}/cgroup.events"
     )
-    machine.succeed("rm /tmp/amc-observation-unavailable")
+    machine.succeed("rm /run/amc-host/amc-observation-unavailable")
     machine.wait_until_succeeds(
         private
         + " | python3 -c "
@@ -656,17 +656,34 @@ with test_section("an aged ordinary request receives a native burst quiet window
     )
     wait_entered("quiet-first")
     launch("quiet-bulk", 1001, "tool", "touch /tmp/quiet-bulk-entered; sleep 120")
-    machine.wait_until_succeeds(
-        "amc admission host-status | python3 -c "
-        + shlex.quote(
-            'import sys,json; assert any(not r["granted"] and r["memory_bytes"] == 100663296 for r in json.load(sys.stdin)["reservations"])'
-        ),
-        timeout=10,
-    )
+    # Observe the broker's real request timestamp inside the guest. Driver
+    # one-second polling plus a subsequent fixed sleep consumed most of the
+    # first burst's five-second native lifetime before the late client enrolled.
+    # Keep the same runtime and aging limits, and prove the age/charge overlap.
+    machine.succeed("python3 - <<'PY'\n" + """
+import json
+from pathlib import Path
+import subprocess
+import time
+aging_ms = json.loads(Path('/etc/amc-test-host-policy.json').read_text())['aging_ms']
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    state = json.loads(subprocess.check_output(
+        ['amc', 'admission', 'host-status'], text=True,
+        timeout=min(1, max(.001, deadline - time.monotonic()))))
+    assert state['burst_committed_bytes'] == 33554432, state
+    ordinary = [r for r in state['reservations']
+                if not r['granted'] and r['memory_bytes'] == 100663296]
+    if ordinary and time.time_ns() // 1000000 - ordinary[0]['requested_ms'] >= aging_ms:
+        print(json.dumps({'agedOrdinary': ordinary[0], 'burstCommittedBytes': state['burst_committed_bytes']}))
+        break
+    time.sleep(min(.025, max(0, deadline - time.monotonic())))
+else:
+    raise AssertionError(('ordinary request did not age while first burst was charged', state))
+""" + "\nPY")
     # 64 MiB ordinary + 96 MiB bulk fits only after the first burst drains.
     # A second 32 MiB burst would fit physically and within its allowance, but
     # must not backfill past the one-second aging threshold.
-    machine.sleep(1.25)
     burst("quiet-late", 1001, "touch /tmp/quiet-late-entered; sleep 120")
     machine.wait_until_succeeds(
         "amc admission host-status | python3 -c "
@@ -1006,11 +1023,18 @@ time.sleep(120)
     )
     print("page return native result", return_code, json.dumps(after_native))
     if return_code != 0:
-        machine.sleep(3)
-        print(
-            "page return delayed native result",
-            machine.succeed("python3 /etc/page-return-target.py --snapshot"),
-        )
+        # Preserve the original failure while retaining the exact durable
+        # frontier and native service/lease state. Never fault target bytes in.
+        for name, command in {
+            "discovery": "head -c 16384 /var/lib/amc-page-return/ledger.json",
+            "service": "systemctl show page-return --property=ActiveState,Result,ExecMainStatus,MainPID,ControlGroup",
+            "host": "amc admission host-status",
+        }.items():
+            try:
+                diagnostic = machine.execute("timeout 2s " + command)
+            except Exception as diagnostic_error:
+                diagnostic = ("diagnostic failed", repr(diagnostic_error))
+            print("page return failure diagnostic", name, diagnostic)
     assert return_code == 0, return_output
     assert after_native["returnBytes"] == 0 and after_native["swappedBytes"] == 0, (
         after_native
@@ -1106,6 +1130,18 @@ with test_section(
     before_device = int(
         machine.succeed("awk '$1 == \"/dev/vdb\" {print $4}' /proc/swaps")
     )
+    # Occupied slots may still be backed by resident swap cache, in which case
+    # reducing the ceiling need not invalidate return headroom. Reuse the
+    # target-local eviction fixture and prove actual nonresident demand before
+    # asking the replay to reject it; no global pressure or swapoff is needed.
+    machine.succeed("python3 /tmp/page-return-evict.py")
+    machine.wait_until_succeeds(
+        "python3 /etc/page-return-target.py --snapshot | python3 -c "
+        + shlex.quote(
+            'import json,sys; s=json.load(sys.stdin); assert s["returnBytes"] >= 33554432 and s["swappedBytes"] >= 33554432'
+        ),
+        timeout=30,
+    )
     # Delay the post-scan manager identity reply, then reduce the target's native
     # ceiling while the logical reservation set is unchanged. The replay must
     # use new resident-plus-return demand before publishing any device lease.
@@ -1119,13 +1155,23 @@ assert 'native recovery demand or frontier changed' in response['error'], respon
 with open('/tmp/device-stale-demand-denied', 'w') as receipt:
     json.dump(response, receipt)
 """)
-    machine.succeed("touch /tmp/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 -- python3 /tmp/device-stale-demand.py")
-    machine.wait_until_succeeds("test -e /tmp/amc-device-inventory-observed")
+    # Retain this short-lived fixture's result until the driver verifies it.
+    # Otherwise successful exit can collect the unit before explicit cleanup.
+    machine.succeed("touch /run/amc-host/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --property=RemainAfterExit=yes -- python3 /tmp/device-stale-demand.py")
+    machine.wait_until_succeeds("test -e /run/amc-host/amc-device-inventory-observed")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=32M")
     machine.wait_until_succeeds("test -e /tmp/device-stale-demand-denied")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=128M")
     stale_status = json.loads(machine.succeed("amc admission host-status --socket /run/amc-device/admission.sock"))
     assert stale_status["recovery"] is None, stale_status
+    machine.wait_until_succeeds(
+        'test "$(systemctl show page-return --property=SubState --value)" = exited',
+        timeout=10,
+    )
+    machine.succeed(
+        'test "$(systemctl show page-return --property=Result --value)" = success && '
+        'test "$(systemctl show page-return --property=ExecMainStatus --value)" = 0'
+    )
     machine.succeed("systemctl stop page-return")
     machine.succeed(
         "systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --wait -- "
@@ -1230,7 +1276,9 @@ time.sleep(120)
 with test_section(
     "post-grant migration is kernel-blocked on direct and swap-cache recovery paths"
 ):
-    machine.succeed("python3 /etc/page-return-guard-proof.py", timeout=240)
+    # A second full run proves cleanup permits fresh cgroups, services and zram.
+    for _ in range(2):
+        machine.succeed("python3 /etc/page-return-guard-proof.py", timeout=240)
     evidence["pageReturnGuard"] = json.loads(
         machine.succeed("cat /tmp/page-return-guard-evidence.json")
     )
