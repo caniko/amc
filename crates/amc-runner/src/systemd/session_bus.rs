@@ -66,17 +66,20 @@ pub(super) fn query(uid: u32, unit: &str) -> Option<UnitState> {
     if !path.starts_with("/org/freedesktop/systemd1/unit/") {
         return None;
     }
-    let unit_fields = properties(
-        uid,
-        path,
-        "org.freedesktop.systemd1.Unit",
-        &["Id", "LoadState", "ActiveState", "InvocationID"],
-    )?;
+    snapshot(unit, |interface, names| {
+        properties(uid, path, interface, names)
+    })
+}
+
+fn snapshot(
+    unit: &str,
+    mut properties: impl FnMut(&str, &[&str]) -> Option<Vec<Value>>,
+) -> Option<UnitState> {
+    const UNIT_PROPERTIES: &[&str] = &["Id", "LoadState", "ActiveState", "InvocationID"];
+    let unit_fields = properties("org.freedesktop.systemd1.Unit", UNIT_PROPERTIES)?;
     let mut state = unit_state(unit, &unit_fields)?;
     if state.loaded {
         let service = properties(
-            uid,
-            path,
             "org.freedesktop.systemd1.Service",
             &[
                 "ExecMainStartTimestampMonotonic",
@@ -98,6 +101,13 @@ pub(super) fn query(uid: u32, unit: &str) -> Option<UnitState> {
             _ => None,
         };
         state.control_group = Some(data(&service[4], "s")?.as_str()?.to_owned());
+        // The interfaces are separate manager queries. A unit can start between
+        // them, yielding an old inactive state with a new live MainPID. Never
+        // pin or release startup from that mixed snapshot; retry under execute's
+        // existing startup deadline. Invocation replacement is likewise unknown.
+        if properties("org.freedesktop.systemd1.Unit", UNIT_PROPERTIES)? != unit_fields {
+            return None;
+        }
     }
     Some(state)
 }
@@ -202,6 +212,44 @@ mod tests {
             let mut changed = fields.clone();
             changed[index] = bad;
             assert!(unit_state(unit, &changed).is_none());
+        }
+    }
+
+    #[test]
+    fn startup_sampling_rejects_a_manager_transition_between_interfaces() {
+        let unit = "app-amc-host-runner-transition.service";
+        let unit_fields = |active: &str, invocation: u8| {
+            vec![
+                json!({"type":"s", "data":unit}),
+                json!({"type":"s", "data":"loaded"}),
+                json!({"type":"s", "data":active}),
+                json!({"type":"ay", "data":vec![invocation;16]}),
+            ]
+        };
+        let service = vec![
+            json!({"type":"t", "data":1000}),
+            json!({"type":"u", "data":123}),
+            json!({"type":"i", "data":0}),
+            json!({"type":"i", "data":0}),
+            json!({"type":"s", "data":format!("/app.slice/{unit}")}),
+        ];
+        for (before, after, stable) in [
+            (unit_fields("active", 1), unit_fields("active", 1), true),
+            (unit_fields("inactive", 1), unit_fields("active", 1), false),
+            (unit_fields("active", 1), unit_fields("active", 2), false),
+        ] {
+            let mut responses = [before, service.clone(), after].into_iter();
+            let state = snapshot(unit, |_, _| responses.next());
+            if stable {
+                let state = state.expect("a stable native snapshot remains observable");
+                assert!(state.started && !state.stopped);
+                assert_eq!(state.main_pid, Some(123));
+            } else {
+                assert!(
+                    state.is_none(),
+                    "mixed manager observations must be retried"
+                );
+            }
         }
     }
 }
