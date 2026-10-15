@@ -4,6 +4,8 @@
 
 ### Added
 
+- Opt-in protected small-call pools with pre-accounted backing, separate queues,
+  native resource/deadline bounds and ledger-safe restart and retirement.
 - Advance foreground preparation with durable drain barriers and once-only
   transfer into native scopes that preserve the caller's filesystem namespace.
 - Finite, up-front-backed completion lanes and per-operation root worker
