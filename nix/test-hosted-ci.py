@@ -175,6 +175,38 @@ class GuardCleanupTests(unittest.TestCase):
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_protected_pool_matrix_requires_every_native_case_and_rejects_failures(self):
+        installable = ".#nixosTests.x86_64-linux.protected-pool"
+        self.assertIn(installable, hosted.ALLOWED)
+        policy = hosted.tomllib.loads((hosted.ROOT / "simit.toml").read_text())
+        self.assertIn(installable, policy["ci"]["nix_builds"])
+        tree = ast.parse((hosted.ROOT / "nix/protected-pool-vm-test.py").read_text())
+        names = {
+            node.args[0].value for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "test_section"
+        }
+        self.assertEqual(len(names), 5)
+        self.assertEqual(names, hosted.PROTECTED_POOL_CASES)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "junit.xml"
+            report = ET.Element("testsuite")
+            for name in sorted(names):
+                ET.SubElement(report, "testcase", name=name)
+            ET.ElementTree(report).write(path)
+            hosted.verify_native_report(path, hosted.PROTECTED_POOL_CASES)
+            for tag in ("failure", "error", "skipped"):
+                with self.subTest(tag=tag):
+                    failure = ET.SubElement(report[0], tag)
+                    ET.ElementTree(report).write(path)
+                    with self.assertRaises(RuntimeError):
+                        hosted.verify_native_report(path, hosted.PROTECTED_POOL_CASES)
+                    report[0].remove(failure)
+            report.remove(report[0])
+            ET.ElementTree(report).write(path)
+            with self.assertRaises(RuntimeError):
+                hosted.verify_native_report(path, hosted.PROTECTED_POOL_CASES)
+
     def test_supervision_settlement_uses_one_coherent_status_snapshot(self):
         tree = ast.parse((hosted.ROOT / "nix/supervision-recovery-failures.py").read_text())
         settled = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "settled")
