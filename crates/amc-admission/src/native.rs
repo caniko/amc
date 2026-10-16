@@ -11,6 +11,9 @@ use std::{
 };
 
 pub trait Native {
+    fn protected_empty(&self, _slice: &str) -> Option<bool> {
+        None
+    }
     fn can_enter(&self) -> bool {
         true
     }
@@ -30,6 +33,9 @@ pub struct Supervised<N> {
     pub health_file: Option<PathBuf>,
 }
 impl<N: Native> Native for Supervised<N> {
+    fn protected_empty(&self, slice: &str) -> Option<bool> {
+        self.native.protected_empty(slice)
+    }
     fn can_enter(&self) -> bool {
         self.native.can_enter()
             && self
@@ -121,6 +127,14 @@ fn limit(directory: &Path, file: &str) -> Result<u64> {
 }
 
 impl Native for Systemd {
+    fn protected_empty(&self, slice: &str) -> Option<bool> {
+        let unit = self.show(slice).ok()?;
+        if field(&unit, "LoadState") == "not-found" {
+            return Some(true);
+        }
+        let directory = cgroup_directory(field(&unit, "ControlGroup")).ok()?;
+        crate::protected_pool::empty_directory(&directory)
+    }
     fn headroom(&self, contract: &Contract, reserve: u64) -> Result<Headroom> {
         let mut paused = false;
         if let Some(marker) = &contract.pause_file {
@@ -136,6 +150,12 @@ impl Native for Systemd {
             "workload slice unavailable"
         );
         let directory = cgroup_directory(field(&unit, "ControlGroup"))?;
+        if let Some(pool) = &contract.protected_pool {
+            ensure!(
+                crate::protected_pool::bounded(&directory, pool) == Some(true),
+                "protected aggregate enforcement unavailable"
+            );
+        }
         // Production admission requires an actual finite aggregate boundary.
         let memory_max = limit(&directory, "memory.max")?;
         let memory_swap_max = limit(&directory, "memory.swap.max")?;
@@ -184,7 +204,7 @@ impl Native for Systemd {
                 "native runtime deadline mismatch"
             );
         }
-        if entry.contract.burst {
+        if entry.contract.burst || entry.contract.protected_pool.is_some() {
             ensure!(
                 duration_us(field(&unit, "TimeoutStopUSec"))
                     .is_some_and(|timeout| timeout > 0 && timeout <= 1_000_000)

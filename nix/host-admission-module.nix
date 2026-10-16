@@ -56,6 +56,8 @@ in {
         TasksMax = 32;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
+        # Preparation callbacks use the authenticated origin's pinned root,
+        # never a visible user-runtime mount in the broker's namespace.
         ProtectHome = true;
         ProtectControlGroups = true;
         ProtectKernelTunables = true;

@@ -128,6 +128,7 @@ fn policy() -> HostPolicy {
                 io_pressure: IoPressure::Enforce,
                 min_available_bytes: 0,
                 continuation: None,
+                protected_pool: None,
                 burst: false,
             })
             .collect(),
@@ -306,6 +307,7 @@ fn independent_root_handlers_join_one_bounded_pool_without_releasing_each_other(
         io_pressure: IoPressure::Enforce,
         min_available_bytes: 0,
         continuation: None,
+        protected_pool: None,
         burst: false,
     });
     p.validate().unwrap();

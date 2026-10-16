@@ -49,6 +49,14 @@ pub fn serve_with_host(
 ) -> Result<()> {
     policy.validate()?;
     ensure!(
+        host_socket.is_some()
+            || policy
+                .contracts
+                .values()
+                .all(|c| c.protected_pool.is_none()),
+        "protected pools require the shared host broker"
+    );
+    ensure!(
         socket.is_absolute() && state.is_absolute(),
         "admission paths must be absolute"
     );
@@ -70,6 +78,7 @@ pub fn serve_with_host(
     // Unentered work has no permission to execute. Discard it on restart so
     // queued requests cannot inherit superseded policy; the helper fails closed.
     ledger.entries.retain(|entry| entry.phase == Phase::Running);
+    ledger.sync_protected_pools(&policy);
     // The durable-state lock is acquired first. A second server can never
     // unlink a live endpoint for this state directory.
     if socket.exists() {
@@ -119,6 +128,7 @@ pub fn serve_with_host(
                 cursor = cursor.wrapping_add(1);
             }
             let mut capacity = std::collections::BTreeMap::new();
+            ledger.reconcile_protected_pools(&policy, |slice| native.protected_empty(slice));
             waiting = ledger.advance(now_ms()?, &policy, |contract| {
                 // At most one bounded native observation per slice/marker per
                 // tick. Queued siblings cannot multiply manager requests.
@@ -215,6 +225,11 @@ fn handle(
             ref contract,
             wait_ms,
             ..
+        }
+        | Message::EnqueueBounded {
+            ref contract,
+            wait_ms,
+            ..
         } => {
             ensure!(
                 (1..=3_600_000).contains(&wait_ms),
@@ -227,17 +242,41 @@ fn handle(
                 host_socket.is_some() || !policy.contracts.get(contract).is_some_and(|c| c.burst),
                 "burst execution requires the shared host broker"
             );
-            let memory_max = match request.message {
-                Message::EnqueueSized { memory_max, .. } => Some(memory_max),
-                _ => None,
-            };
-            ledger.enqueue_sized(
-                id.clone(),
-                contract,
-                policy,
-                now_ms()?.saturating_add(wait_ms).saturating_add(30_000),
-                memory_max,
-            )?;
+            let now = now_ms()?;
+            let deadline = now.saturating_add(wait_ms).saturating_add(30_000);
+            match request.message {
+                Message::EnqueueBounded {
+                    memory_max,
+                    runtime_max_sec,
+                    ..
+                } => ledger.enqueue_bounded(
+                    id.clone(),
+                    contract,
+                    policy,
+                    deadline,
+                    memory_max,
+                    runtime_max_sec,
+                )?,
+                Message::EnqueueSized { memory_max, .. } => ledger.enqueue_sized(
+                    id.clone(),
+                    contract,
+                    policy,
+                    deadline,
+                    Some(memory_max),
+                )?,
+                _ => ledger.enqueue(id.clone(), contract, policy, deadline)?,
+            }
+            if let Some(seconds) = ledger
+                .get(&id)
+                .and_then(|e| e.contract.protected_pool.as_ref())
+                .map(|p| p.wait_max_sec)
+            {
+                ledger
+                    .entries
+                    .last_mut()
+                    .ok_or_else(|| anyhow::anyhow!("missing bounded call"))?
+                    .deadline_ms = now.saturating_add(wait_ms.min(seconds * 1000));
+            }
             ledger.set_client(&id, client)?;
             observations.entry_keys.insert(id.clone(), key.clone());
             response.entry_key = Some(key);
@@ -306,6 +345,7 @@ fn handle(
         }
         Message::Status => {
             response.status = Some(Status {
+                protected_pools: ledger.protected_pools.clone(),
                 budget_bytes: policy.budget_bytes,
                 reserve_bytes: policy.reserve_bytes,
                 committed_bytes: ledger.committed(),

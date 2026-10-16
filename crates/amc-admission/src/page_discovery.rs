@@ -160,7 +160,12 @@ fn placement_at(proc: &Path, pid: i32) -> Result<String> {
         .lines()
         .find_map(|s| s.strip_prefix("0::"))
         .context("missing native placement")?;
-    crate::native::cgroup_directory(group)?;
+    // Host-wide discovery encounters kernel threads at the hierarchy root.
+    // Observe that placement without admitting it as a workload: policy and
+    // cursor validation still require a non-root selected cgroup.
+    if group != "/" {
+        crate::native::cgroup_directory(group)?;
+    }
     Ok(group.into())
 }
 
@@ -510,6 +515,42 @@ mod tests {
             address: 0,
             maps_fingerprint: None,
         }
+    }
+    #[test]
+    fn root_placed_processes_do_not_abort_selected_workload_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-root-placement-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let proc = root.join("proc");
+        let groups = root.join("groups");
+        fs::create_dir_all(&proc).unwrap();
+        fs::create_dir_all(&groups).unwrap();
+        let policy = RecoveryPolicy {
+            cgroup: "/helper.service".into(),
+            helper_bytes: 1048576,
+            minimum_bytes: 1,
+            targets: vec![],
+            page_cgroups: vec!["/selected".into()],
+            batch_bytes: 4096,
+        };
+        let empty_frontier = frontier_at(&proc, &groups, &policy).unwrap();
+        // Kernel threads legitimately live at the hierarchy root. They have
+        // no selected address space and must not require stat/maps/pagemap.
+        fs::create_dir_all(proc.join("2")).unwrap();
+        fs::write(proc.join("2/cgroup"), "0::/\n").unwrap();
+        assert_eq!(placement_at(&proc, 2).unwrap(), "/");
+        assert!(!selected_group("/", &policy));
+        assert!(crate::native::cgroup_directory("/").is_err());
+        assert_eq!(
+            frontier_at(&proc, &groups, &policy).unwrap(),
+            empty_frontier
+        );
+        for malformed in ["", "relative", "/../selected", "/./selected"] {
+            fs::write(proc.join("2/cgroup"), format!("0::{malformed}\n")).unwrap();
+            assert!(frontier_at(&proc, &groups, &policy).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn selected_process_entering_behind_pid_frontier_prevents_completion() {

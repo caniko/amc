@@ -25,6 +25,9 @@ pub(crate) struct Observation {
 pub(crate) struct Snapshot(Vec<Observation>);
 
 impl Snapshot {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
     pub(crate) fn runtime(&self, identity: &Identity) -> Option<u64> {
         self.0
             .iter()
@@ -101,17 +104,35 @@ impl Cache {
     }
 
     pub(crate) fn refresh(&mut self, ledger: &HostLedger) -> Result<()> {
+        self.refresh_lane(ledger, false)
+    }
+
+    pub(crate) fn refresh_protected(&mut self, ledger: &HostLedger) -> Result<()> {
+        self.refresh_lane(ledger, true)
+    }
+
+    fn refresh_lane(&mut self, ledger: &HostLedger, protected: bool) -> Result<()> {
         self.entries.retain(|entry| {
             entry.requested.elapsed() < Duration::from_secs(60)
-                || ledger
-                    .reservations
-                    .iter()
-                    .any(|r| r.burst && r.identity == entry.identity)
+                || ledger.reservations.iter().any(|r| {
+                    (if protected {
+                        ledger.protected_owner(r).is_some()
+                    } else {
+                        r.burst
+                    }) && r.identity == entry.identity
+                })
         });
         for entry in &mut self.entries {
             entry.live = false;
         }
-        for r in ledger.reservations.iter().filter(|r| r.burst && r.granted) {
+        for r in ledger.reservations.iter().filter(|r| {
+            r.granted
+                && if protected {
+                    ledger.protected_owner(r).is_some()
+                } else {
+                    r.burst
+                }
+        }) {
             self.register_with(&r.identity, true)?;
         }
         self.poll_with(|identity| crate::host_native::burst_runtime(&identity).ok())

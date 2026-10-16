@@ -17,6 +17,7 @@ ALLOWED = {
     ".#packages.x86_64-linux.default",
     ".#checks.x86_64-linux.test",
     ".#checks.x86_64-linux.clippy",
+    ".#nixosTests.x86_64-linux.protected-pool",
     ".#nixosTests.x86_64-linux.shared-admission",
     ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",
     ".#nixosTests.x86_64-linux.supervision",
@@ -60,6 +61,13 @@ SUPERVISION_CASES = {
     "replacement during native recovery trips without signalling the replacement",
     "repeated native recoveries exhaust the domain budget without forgiving attempts",
     "different native domains exhaust the host budget without forgiving attempts",
+}
+PROTECTED_POOL_CASES = {
+    "idle protected backing survives broker restart",
+    "full ordinary budget and queues leave both protected users available",
+    "occupied protected restart preserves identity and native deadline without replay",
+    "widened protected aggregate limits deny payload entry",
+    "protected cancellation and memcg OOM retain bounded post-failure progress",
 }
 
 
@@ -541,6 +549,7 @@ def retain():
     shutil.copyfile(ROOT / "flake.lock", evidence / "flake.lock")
     if "nixosTests" in installable:
         required = (
+            PROTECTED_POOL_CASES if installable.endswith(".protected-pool") else
             SUPERVISION_CASES if installable.endswith(".supervision") else NATIVE_CASES
         )
         verify_native_report(output / "junit.xml", required)

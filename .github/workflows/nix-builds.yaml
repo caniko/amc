@@ -28,6 +28,7 @@ jobs:
           - ".#packages.x86_64-linux.default"
           - ".#checks.x86_64-linux.test"
           - ".#checks.x86_64-linux.clippy"
+          - ".#nixosTests.x86_64-linux.protected-pool"
           - ".#nixosTests.x86_64-linux.shared-admission"
           - ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"
           - ".#nixosTests.x86_64-linux.supervision"

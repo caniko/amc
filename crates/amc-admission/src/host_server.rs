@@ -117,6 +117,8 @@ pub struct Response {
     pub burst_budget_bytes: u64,
     #[serde(default)]
     pub burst_committed_bytes: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protected_pools: BTreeMap<String, crate::protected_pool::Backing>,
     pub reservations: Option<Vec<Reservation>>,
     pub error: Option<String>,
     #[serde(default)]
@@ -264,7 +266,7 @@ pub fn verify_entry(
                 && r.memory_bytes == contract.memory_max
                 && r.swap_bytes == contract.memory_swap_max
                 && r.burst == contract.burst
-                && (!r.burst
+                && (!(r.burst || contract.protected_pool.is_some())
                     || r.runtime_max_ms.is_some_and(|ms| contract
                         .runtime_max_sec
                         .is_some_and(|seconds| ms <= seconds * 1000))))),
@@ -301,7 +303,12 @@ pub fn serve_supervised(
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut ledger) = Store::open_snapshot::<HostLedger>(state, boot.trim())?;
     ledger.swap_return_bytes = None;
-    ledger.reconcile_continuation_policy(&policy);
+    reconcile_startup(
+        &mut ledger,
+        &policy,
+        host_native::empty_reservation,
+        crate::protected_pool::empty,
+    )?;
     crate::namespace_runner::discover(&mut ledger, &policy)?;
     crate::namespace_runner::reconcile(&mut ledger, &policy);
     reconcile_preparation_helpers(&mut ledger, &policy);
@@ -341,12 +348,17 @@ pub fn serve_supervised(
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
     let mut burst_manager = crate::burst_manager::Cache::default();
+    // Separate bounded queues/workers: bulk/burst probes cannot consume the
+    // protected lane's native deadline observations.
+    let mut protected_manager = crate::burst_manager::Cache::default();
     let mut recovery_manager = recovery_manager::Cache::default();
     let mut connections = transport::Connections::default();
     while !stopping() {
         burst_manager.refresh(&ledger)?;
+        protected_manager.refresh_protected(&ledger)?;
         recovery_manager.refresh(ledger.recovery.as_ref())?;
-        let burst_evidence = burst_manager.snapshot();
+        let mut burst_evidence = burst_manager.snapshot();
+        burst_evidence.extend(protected_manager.snapshot());
         if tick.elapsed() >= Duration::from_millis(250) {
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
@@ -530,9 +542,14 @@ pub fn serve_supervised(
                                     .iter()
                                     .find(|r| r.granted && r.identity == identity)
                             {
-                                if grant.burst {
-                                    burst_manager.register(&identity)?;
-                                    if burst_manager.runtime(&identity) != grant.runtime_max_ms {
+                                if grant.runtime_max_ms.is_some() {
+                                    let manager = if ledger.protected_owner(grant).is_some() {
+                                        &mut protected_manager
+                                    } else {
+                                        &mut burst_manager
+                                    };
+                                    manager.register(&identity)?;
+                                    if manager.runtime(&identity) != grant.runtime_max_ms {
                                         reply.waiting = Some(WaitReason::Unknown);
                                         return Ok(reply);
                                     }
@@ -546,9 +563,19 @@ pub fn serve_supervised(
                             }
                             let now = crate::clock::boot_ms()?;
                             let burst = policy.domains.iter().any(|d| d.name == domain && d.burst);
-                            let runtime_max_ms = if burst {
-                                burst_manager.register(&identity)?;
-                                let Some(runtime) = burst_manager.runtime(&identity) else {
+                            let short_call = burst
+                                || policy
+                                    .domains
+                                    .iter()
+                                    .any(|d| d.name == domain && d.protected_pool.is_some());
+                            let runtime_max_ms = if short_call {
+                                let manager = if burst {
+                                    &mut burst_manager
+                                } else {
+                                    &mut protected_manager
+                                };
+                                manager.register(&identity)?;
+                                let Some(runtime) = manager.runtime(&identity) else {
                                     reply.waiting = Some(WaitReason::Unknown);
                                     return Ok(reply);
                                 };
@@ -1079,6 +1106,12 @@ fn root_operation(request: &Request, uid: u32, preparations: bool) -> Result<Opt
 }
 
 fn populate_status(reply: &mut Response, ledger: &HostLedger, uid: u32) {
+    reply.protected_pools = ledger
+        .protected_pools
+        .iter()
+        .filter(|(_, backing)| uid == 0 || backing.uid == uid)
+        .map(|(name, backing)| (name.clone(), backing.clone()))
+        .collect();
     reply.reservations = Some(
         ledger
             .reservations
@@ -1140,6 +1173,17 @@ fn origin_continuation(
         .map(|c| c.capability.clone()))
 }
 
+fn reconcile_startup(
+    ledger: &mut HostLedger,
+    policy: &HostPolicy,
+    empty_reservation: impl FnMut(&Reservation) -> Option<bool>,
+    empty_pool: impl FnMut(&crate::protected_pool::Backing) -> Option<bool>,
+) -> Result<()> {
+    ledger.reconcile(empty_reservation);
+    ledger.reconcile_continuation_policy(policy);
+    ledger.sync_protected_pools(policy, empty_pool)
+}
+
 fn observe(
     ledger: &mut HostLedger,
     policy: &HostPolicy,
@@ -1155,6 +1199,9 @@ fn observe(
     ledger.reconcile_continuation_policy(policy);
     ledger.retain_pool_operations();
     crate::namespace_runner::reconcile(ledger, policy);
+    ledger
+        .sync_protected_pools(policy, crate::protected_pool::empty)
+        .ok()?;
     if ledger.recovery.is_none()
         && policy.swap_recovery.as_ref().is_some_and(|p| {
             p.targets
@@ -1168,6 +1215,7 @@ fn observe(
         ledger.swap_return_bytes = crate::swap::return_bytes(ledger).ok();
     }
     if crate::namespace_runner::enforcement(ledger, policy) == Some(true)
+        && crate::protected_pool::enforcement(ledger, policy) == Some(true)
         && ledger
             .reservations
             .iter()
@@ -1184,7 +1232,7 @@ fn observe(
 
 fn cached_enforcement(r: &Reservation, evidence: &crate::burst_manager::Snapshot) -> bool {
     host_native::memory_enforcement(r).is_some()
-        && (!r.burst
+        && (r.runtime_max_ms.is_none()
             || evidence
                 .runtime(&r.identity)
                 .is_some_and(|runtime| Some(runtime) == r.runtime_max_ms))
@@ -1894,6 +1942,42 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_reconciles_dead_children_before_reusing_a_pool_name() {
+        let mut policy: HostPolicy = serde_json::from_value(serde_json::json!({
+            "version": 1, "budget_bytes": 100, "reserve_bytes": 20,
+            "swap_reserve_bytes": 0, "max_memory_full_psi": 1.0, "max_io_full_psi": 20.0,
+            "resume_ms": 250, "aging_ms": 1000, "queue_limit": 1,
+            "domains": [{"name": "quick", "uid": 1000, "cgroup": "/quick", "ceiling_bytes": 10,
+              "swap_bytes": 0, "fair_share_bytes": 100,
+              "protected_pool": {"source_contract": "tool", "memory_bytes": 30, "max_job_bytes": 10,
+                "max_running": 2, "runtime_max_sec": 15, "queue_limit": 2, "wait_max_sec": 15,
+                "cpu_quota_usec": 50000, "tasks_max": 32}}]
+        }))
+        .unwrap();
+        let mut ledger = HostLedger::new("boot".into());
+        ledger
+            .sync_protected_pools(&policy, |_| Some(true))
+            .unwrap();
+        ledger.reservations.push(serde_json::from_value(serde_json::json!({
+            "id": "stale", "domain": "quick", "identity": {"uid": 1000, "cgroup": "/quick/old", "inode": 1, "pid": 1, "start_ticks": 1},
+            "memory_bytes": 10, "swap_bytes": 0, "requested_ms": 0, "deadline_ms": 15000, "granted": true, "runtime_max_ms": 15000
+        })).unwrap());
+        policy.domains[0].uid = 2000;
+        policy.domains[0].cgroup = "/replacement".into();
+        for cleanup in [None, Some(false)] {
+            let mut unknown = ledger.clone();
+            assert!(reconcile_startup(&mut unknown, &policy, |_| cleanup, |_| Some(true)).is_err());
+            assert_eq!(unknown.reservations.len(), 1);
+            assert_eq!(unknown.protected_pools["quick"].uid, 1000);
+        }
+        reconcile_startup(&mut ledger, &policy, |_| Some(true), |_| Some(true)).unwrap();
+        assert!(ledger.reservations.is_empty());
+        assert_eq!(ledger.protected_pools["quick"].uid, 2000);
+        assert_eq!(ledger.protected_pools["quick"].cgroup, "/replacement");
+        assert_eq!(ledger.committed(), 30);
+    }
 
     #[test]
     fn device_inventory_replay_requires_the_same_bound_native_object() {

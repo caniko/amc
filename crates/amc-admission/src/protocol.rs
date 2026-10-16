@@ -37,6 +37,13 @@ pub enum Message {
         wait_ms: u64,
         memory_max: u64,
     },
+    /// Select policy-owned short-call backing before native submission.
+    EnqueueBounded {
+        contract: String,
+        wait_ms: u64,
+        memory_max: u64,
+        runtime_max_sec: u64,
+    },
     Poll {
         id: String,
     },
@@ -66,6 +73,8 @@ pub struct Response {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Status {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub protected_pools: std::collections::BTreeMap<String, u64>,
     pub budget_bytes: u64,
     pub reserve_bytes: u64,
     pub committed_bytes: u64,
