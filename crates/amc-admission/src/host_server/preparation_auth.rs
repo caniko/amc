@@ -129,6 +129,17 @@ fn deliver(path: &Path, id: &str, authorization: &Authorization) -> Result<()> {
     };
     use std::io::Write;
     use std::os::fd::AsRawFd;
+    // ProtectHome=yes deliberately hides /run/user from the broker. Resolve the
+    // fixed rendezvous path in the nominated waiting process's filesystem view,
+    // pinning its root before connecting. Do not expose user runtime mounts in
+    // the broker namespace: late propagated mounts could become writable.
+    host_native::prepared_origin(&authorization.origin, authorization.uid)?;
+    let root = std::fs::File::open(format!("/proc/{}/root", authorization.origin.pid))?;
+    host_native::prepared_origin(&authorization.origin, authorization.uid)?;
+    let relative = path.strip_prefix("/")?;
+    let callback = Path::new("/proc/self/fd")
+        .join(root.as_raw_fd().to_string())
+        .join(relative);
     // A full caller-owned listen backlog or unread callback cannot occupy the
     // broker loop. No user-controlled response is read on this connection.
     let fd = socket(
@@ -137,7 +148,7 @@ fn deliver(path: &Path, id: &str, authorization: &Authorization) -> Result<()> {
         SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
         None,
     )?;
-    connect(fd.as_raw_fd(), &UnixAddr::new(path)?)?;
+    connect(fd.as_raw_fd(), &UnixAddr::new(&callback)?)?;
     let mut stream = UnixStream::from(fd);
     let peer = getsockopt(&stream, PeerCredentials)?;
     ensure!(

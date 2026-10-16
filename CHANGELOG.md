@@ -27,6 +27,10 @@
 
 ### Changed
 
+- Resolve preparation authorization callbacks through the authenticated waiting
+  process's pinned filesystem root. The broker retains `ProtectHome=yes` and
+  hidden user-runtime/home paths, including late user starts, while connecting
+  only to the kernel-authenticated peer's existing rendezvous socket.
 - Observation summaries now report per-field interval endpoints, attempted and
   persisted samples, storage durability, and collection timing.
 - Workstation delivery prioritizes foreground stability and bounded useful
@@ -34,6 +38,19 @@
 
 ### Fixed
 
+- Use all four CPUs of the public hosted runner and a bounded six-hour job
+  window for patched ThinLTO kernel qualification after both original kernel
+  builds exhausted four hours before VM startup.
+- Keep hosted root-observer rendezvous files in the broker's writable runtime
+  directory, preserving its read-only `/tmp` and hidden user-runtime/home paths.
+  Bound observer acknowledgements and require the native sandbox proof in hosted
+  admission evidence.
+- Preserve bounded native startup refusal reasons in host-runner errors,
+  distinguishing manager/cgroup identity loss from a socket-handshake failure.
+  The retained diagnostic does not change unknown cleanup or admission authority.
+
+- Retain host admission and preparation client/helper journals when concurrent
+  helper qualification times out, preserving the original phase assertions.
 - Require bounded source selection for protected calls, cap host queue waits,
   and preserve native-entry grace only after a protected slot is reserved.
 - Retain original protected swap, CPU and task enforcement through retirement;

@@ -7,7 +7,6 @@
   cfg = config.services.amc.hostAdmission;
   policy = pkgs.writeText "amc-host-policy.json" (builtins.toJSON cfg.policy);
   pagesEnabled = (cfg.policy.swap_recovery.page_cgroups or []) != [];
-  preparationsEnabled = (cfg.policy.preparations or []) != [];
   guardModule = import ./page-return-guard-module.nix {inherit config lib;};
 in {
   options.services.amc.hostAdmission = {
@@ -57,16 +56,9 @@ in {
         TasksMax = 32;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        # Preparation authorization connects back to the authenticated origin
-        # under /run/user/<uid>/amc-<id>/authorize. ProtectHome=true hides that
-        # socket too, causing ENOENT before the drain barrier can be installed.
-        # Unix socket connections work on a read-only mount; keep both home
-        # trees inaccessible and permit no runtime-file writes by the broker.
-        ProtectHome =
-          if preparationsEnabled
-          then "read-only"
-          else true;
-        InaccessiblePaths = lib.optionals preparationsEnabled ["/home" "/root"];
+        # Preparation callbacks use the authenticated origin's pinned root,
+        # never a visible user-runtime mount in the broker's namespace.
+        ProtectHome = true;
         ProtectControlGroups = true;
         ProtectKernelTunables = true;
         RestrictAddressFamilies = ["AF_UNIX"];
