@@ -34,6 +34,8 @@
 
 ### Fixed
 
+- Measure native quiet-window request age with the broker's boot clock, not the
+  wall clock, so the fixture waits for the real aging threshold before backfill.
 - Bind whole-device swap recovery to one broker-approved native object and retain
   its descriptor through deactivation and restoration, including failure recovery.
 - Keep native startup pending while its pinned cgroup is initially empty;
