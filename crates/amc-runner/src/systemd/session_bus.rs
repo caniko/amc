@@ -20,7 +20,7 @@ fn command(uid: u32) -> Command {
     command
 }
 
-fn capture_until(command: &mut Command, deadline: Option<Instant>) -> Option<String> {
+pub(super) fn capture_until(command: &mut Command, deadline: Option<Instant>) -> Option<String> {
     let timeout = deadline.map_or(QUERY_TIMEOUT, |end| {
         end.saturating_duration_since(Instant::now())
     });
@@ -79,8 +79,8 @@ fn data<'a>(property: &'a Value, kind: &str) -> Option<&'a Value> {
     (property.get("type")?.as_str()? == kind).then(|| property.get("data"))?
 }
 
-pub(super) fn query(uid: u32, unit: &str) -> Option<UnitState> {
-    match observe(uid, unit, None)? {
+pub(super) fn query(uid: u32, unit: &str, deadline: Option<Instant>) -> Option<UnitState> {
+    match observe(uid, unit, deadline)? {
         Snapshot::Coherent(state) => Some(state),
         Snapshot::Transition => None,
     }

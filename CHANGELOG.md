@@ -34,6 +34,8 @@
 
 ### Fixed
 
+- Clamp native startup observations to their remaining deadline, including each
+  serial session-bus query, and reject late startup samples.
 - Measure native quiet-window request age with the broker's boot clock, not the
   wall clock, so the fixture waits for the real aging threshold before backfill.
 - Bind whole-device swap recovery to one broker-approved native object and retain
