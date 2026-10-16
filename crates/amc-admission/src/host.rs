@@ -613,7 +613,7 @@ impl HostLedger {
     }
 
     /// Idempotent retries bind to the native identity, not the socket lifetime.
-    pub fn request(&mut self, reservation: Reservation, policy: &HostPolicy) -> Result<String> {
+    pub fn request(&mut self, mut reservation: Reservation, policy: &HostPolicy) -> Result<String> {
         ensure!(
             self.is_continuation(&reservation)
                 || self.may_join(&reservation.identity)
@@ -654,6 +654,11 @@ impl HostLedger {
             );
         }
         if let Some(pool) = &domain.protected_pool {
+            reservation.deadline_ms = reservation.deadline_ms.min(
+                reservation
+                    .requested_ms
+                    .saturating_add(pool.wait_max_sec * 1000),
+            );
             ensure!(
                 self.protected_owner(&reservation).is_some()
                     && reservation.swap_bytes == 0

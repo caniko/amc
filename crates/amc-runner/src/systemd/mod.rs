@@ -639,15 +639,23 @@ pub fn execute(
                         return Outcome::Completed(state.workload_code.unwrap_or(client_code));
                     }
                     _ => {
-                        return Outcome::Unknown {
-                            exit_code: client_code,
+                        let expired =
+                            startup_wait_required(detached, started) && Instant::now() >= deadline;
+                        let cleanup =
                             // A pinned invocation mismatch or failed final query
                             // must not be bypassed by stopping a replacement.
-                            cleanup: if observed.is_some() {
+                            if observed.is_some() {
                                 Cleanup::Unknown
                             } else {
                                 cleanup()
-                            },
+                            };
+                        return if expired {
+                            Outcome::TimedOut { started, cleanup }
+                        } else {
+                            Outcome::Unknown {
+                                exit_code: client_code,
+                                cleanup,
+                            }
                         };
                     }
                 }
@@ -896,6 +904,48 @@ esac
         }
         command.args(["--", "worker"]);
         command
+    }
+
+    #[test]
+    fn final_query_exhausting_startup_budget_is_a_timeout_not_launcher_success() {
+        let dir = crate::test_support::scratch_dir("amc-final-query-timeout");
+        let manager = crate::test_support::show_manager(
+            &dir,
+            r#"
+case " $* " in
+  *' show '*) exec sleep 10 ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let polls = std::cell::Cell::new(0);
+        let record = ClientRecord::default();
+        let outcome = execute(
+            &mut bound_command("app-amc-final-query.service", false),
+            &manager,
+            "app-amc-final-query.service",
+            false,
+            false,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() == 2 {
+                    // Let the successful launcher exit, then begin its final
+                    // observation near the real production startup deadline.
+                    thread::sleep(Duration::from_millis(29_750));
+                }
+                None
+            },
+            &record,
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::TimedOut {
+                started: false,
+                cleanup: Cleanup::Unknown
+            }
+        );
+        assert!(record.submitted() && record.settled());
     }
 
     #[test]

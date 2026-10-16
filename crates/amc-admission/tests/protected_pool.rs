@@ -36,14 +36,72 @@ fn protected_pool_policy_is_opt_in_bounded_and_zero_swap() {
 }
 
 #[test]
+fn protected_contracts_cannot_be_selected_directly() {
+    let p = policy();
+    let mut l = Ledger::new("boot".into());
+    assert!(l.enqueue("legacy".into(), "quick", &p, 30000).is_err());
+    assert!(
+        l.enqueue_sized("sized".into(), "quick", &p, 30000, Some(1))
+            .is_err()
+    );
+    assert!(
+        l.enqueue_bounded("direct".into(), "quick", &p, 30000, 1, 1)
+            .is_err()
+    );
+    assert!(l.entries.is_empty());
+    l.enqueue_bounded("bounded".into(), "tool", &p, 15000, 1, 1)
+        .unwrap();
+    assert_eq!(l.get("bounded").unwrap().name, "quick");
+}
+
+#[test]
+fn protected_queue_expiry_does_not_remove_reserved_entry_grace() {
+    use amc_admission::ledger::Headroom;
+    let p = policy();
+    let mut l = Ledger::new("boot".into());
+    l.enqueue_bounded("near".into(), "tool", &p, 15000, 1, 1)
+        .unwrap();
+    l.enqueue_bounded("expired".into(), "tool", &p, 14999, 1, 1)
+        .unwrap();
+    l.advance(14999, &p, |_| {
+        Some(Headroom {
+            shared_bytes: 0,
+            slice_bytes: 0,
+            memory_max: 30,
+            memory_swap_max: 0,
+            paused: false,
+        })
+    });
+    assert!(l.get("expired").is_none(), "queue wait remains bounded");
+    let entry = l.get("near").unwrap();
+    assert_eq!(entry.phase, Phase::Reserved);
+    assert_eq!(entry.deadline_ms, 45000, "native entry retains its grace");
+    l.advance(15001, &p, |_| {
+        panic!("reserved entries are not queued again")
+    });
+    assert_eq!(
+        l.get("near").unwrap().deadline_ms,
+        45000,
+        "grace is not renewed by polling"
+    );
+    l.advance(45000, &p, |_| panic!("expired entries cannot reserve"));
+    assert!(l.get("near").is_none());
+}
+
+#[test]
 fn full_bulk_queue_cannot_consume_the_protected_queue() {
     let p = policy();
     let mut l = Ledger::new("boot".into());
     l.enqueue("bulk".into(), "tool", &p, 30000).unwrap();
     assert!(l.enqueue("bulk-two".into(), "tool", &p, 30000).is_err());
-    l.enqueue("quick-one".into(), "quick", &p, 30000).unwrap();
-    l.enqueue("quick-two".into(), "quick", &p, 30000).unwrap();
-    assert!(l.enqueue("quick-three".into(), "quick", &p, 30000).is_err());
+    l.enqueue_bounded("quick-one".into(), "tool", &p, 30000, 10, 15)
+        .unwrap();
+    l.enqueue_bounded("quick-two".into(), "tool", &p, 30000, 10, 15)
+        .unwrap();
+    assert!(
+        l.enqueue_bounded("quick-three".into(), "tool", &p, 30000, 10, 15)
+            .is_err()
+    );
     assert!(l.entries.iter().all(|entry| entry.phase == Phase::Queued));
 }
 
@@ -61,6 +119,27 @@ fn host_policy() -> amc_admission::host::HostPolicy {
         ]
     }))
     .unwrap()
+}
+
+#[test]
+fn host_protected_wait_is_capped_once_without_extending_retries() {
+    use amc_admission::host::HostLedger;
+    let p = host_policy();
+    let mut l = HostLedger::new("boot".into());
+    l.sync_protected_pools(&p, |_| Some(true)).unwrap();
+    let mut r = job("bounded", true, 10);
+    r.requested_ms = 1000;
+    r.deadline_ms = 3_601_000;
+    l.request(r.clone(), &p).unwrap();
+    assert_eq!(l.reservations[0].deadline_ms, 16000);
+    r.requested_ms = 2000;
+    l.request(r, &p).unwrap();
+    assert_eq!(l.reservations[0].deadline_ms, 16000);
+    let mut short = job("short", true, 10);
+    short.identity.inode = 2;
+    short.deadline_ms = 10;
+    l.request(short, &p).unwrap();
+    assert_eq!(l.reservations[1].deadline_ms, 10);
 }
 
 fn job(id: &str, quick: bool, bytes: u64) -> amc_admission::host::Reservation {
@@ -312,4 +391,43 @@ fn occupied_pool_reductions_preserve_old_backing_and_native_claims() {
     assert_eq!(restored.committed(), 30);
     restored.sync_protected_pools(&p, |_| Some(true)).unwrap();
     assert_eq!(restored.committed(), 25);
+}
+
+#[test]
+fn original_controller_bounds_survive_policy_relaxation_and_legacy_snapshots() {
+    use amc_admission::host::HostLedger;
+    let mut p = host_policy();
+    let mut l = HostLedger::new("boot".into());
+    l.sync_protected_pools(&p, |_| Some(true)).unwrap();
+    l.request(job("survivor", true, 10), &p).unwrap();
+    l.reservations[0].granted = true;
+    let pool = p.domains[1].protected_pool.as_mut().unwrap();
+    pool.cpu_quota_usec = 75000;
+    pool.tasks_max = 64;
+    l.sync_protected_pools(&p, |_| Some(true)).unwrap();
+    let mut restored: HostLedger =
+        serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(
+        restored.protected_pools["quick"].cpu_quota_usec,
+        Some(50000)
+    );
+    assert_eq!(restored.protected_pools["quick"].tasks_max, Some(32));
+    restored.reconcile(|_| Some(true));
+    restored.sync_protected_pools(&p, |_| None).unwrap();
+    assert_eq!(
+        restored.protected_pools["quick"].cpu_quota_usec,
+        Some(50000)
+    );
+    let legacy = restored.protected_pools.get_mut("quick").unwrap();
+    legacy.cpu_quota_usec = None;
+    legacy.tasks_max = None;
+    restored.sync_protected_pools(&p, |_| None).unwrap();
+    assert_eq!(restored.protected_pools["quick"].cpu_quota_usec, None);
+    restored.sync_protected_pools(&p, |_| Some(true)).unwrap();
+    assert_eq!(
+        restored.protected_pools["quick"].cpu_quota_usec,
+        Some(75000)
+    );
+    assert_eq!(restored.protected_pools["quick"].tasks_max, Some(64));
 }

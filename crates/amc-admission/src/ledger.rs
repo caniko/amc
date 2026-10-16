@@ -382,6 +382,10 @@ impl Ledger {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown contract"))?;
         ensure!(
+            source.protected_pool.is_none(),
+            "protected contracts require bounded source selection"
+        );
+        ensure!(
             memory_max > 0 && memory_max <= source.memory_max,
             "requested memory exceeds contract"
         );
@@ -402,7 +406,7 @@ impl Ledger {
                 .is_none_or(|max| runtime_max_sec <= max),
             "requested runtime exceeds contract"
         );
-        self.enqueue_sized(id, selected, policy, deadline_ms, Some(memory_max))?;
+        self.enqueue_selected(id, selected, policy, deadline_ms, Some(memory_max))?;
         self.entries
             .last_mut()
             .ok_or_else(|| anyhow::anyhow!("missing enqueued call"))?
@@ -422,6 +426,24 @@ impl Ledger {
     }
 
     pub fn enqueue_sized(
+        &mut self,
+        id: String,
+        name: &str,
+        policy: &Policy,
+        deadline_ms: u64,
+        memory_max: Option<u64>,
+    ) -> Result<()> {
+        ensure!(
+            policy
+                .contracts
+                .get(name)
+                .is_none_or(|c| c.protected_pool.is_none()),
+            "protected contracts require bounded source selection"
+        );
+        self.enqueue_selected(id, name, policy, deadline_ms, memory_max)
+    }
+
+    fn enqueue_selected(
         &mut self,
         id: String,
         name: &str,
@@ -586,6 +608,12 @@ impl Ledger {
                     },
                 );
             } else {
+                if self.entries[index].contract.protected_pool.is_some() {
+                    // The queue deadline stays finite; only a reserved call
+                    // gains the existing native-submission grace, exactly once.
+                    self.entries[index].deadline_ms =
+                        self.entries[index].deadline_ms.saturating_add(30_000);
+                }
                 self.entries[index].phase = Phase::Reserved;
             }
         }

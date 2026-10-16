@@ -49,6 +49,10 @@ pub struct Backing {
     pub uid: u32,
     pub cgroup: String,
     pub memory_bytes: u64,
+    #[serde(default)]
+    pub cpu_quota_usec: Option<u64>,
+    #[serde(default)]
+    pub tasks_max: Option<u64>,
 }
 
 impl Backing {
@@ -91,7 +95,10 @@ pub(crate) fn validate_backing(ledger: &HostLedger) -> Result<()> {
             crate::ledger::valid_name(name)
                 && p.uid != 0
                 && p.memory_bytes > 0
-                && p.memory_bytes <= i64::MAX as u64,
+                && p.memory_bytes <= i64::MAX as u64
+                && p.cpu_quota_usec
+                    .is_none_or(|quota| (1..=100_000).contains(&quota))
+                && p.tasks_max.is_none_or(|tasks| (1..=256).contains(&tasks)),
             "invalid protected pool backing"
         );
         crate::native::cgroup_directory(&p.cgroup)?;
@@ -126,9 +133,13 @@ impl HostLedger {
                 d.name == *name
                     && d.uid == backing.uid
                     && d.cgroup == backing.cgroup
-                    && d.protected_pool
-                        .as_ref()
-                        .is_some_and(|p| p.memory_bytes >= backing.memory_bytes)
+                    && d.protected_pool.as_ref().is_some_and(|p| {
+                        p.memory_bytes >= backing.memory_bytes
+                            && backing
+                                .cpu_quota_usec
+                                .is_some_and(|quota| p.cpu_quota_usec <= quota)
+                            && backing.tasks_max.is_some_and(|tasks| p.tasks_max <= tasks)
+                    })
             });
             unchanged
                 || self.reservations.iter().any(|r| backing.contains(r))
@@ -143,12 +154,20 @@ impl HostLedger {
                     uid: d.uid,
                     cgroup: d.cgroup.clone(),
                     memory_bytes: p.memory_bytes,
+                    cpu_quota_usec: Some(p.cpu_quota_usec),
+                    tasks_max: Some(p.tasks_max),
                 });
             ensure!(
                 backing.uid == d.uid && backing.cgroup == d.cgroup,
                 "protected pool identity changed before native cleanup"
             );
             backing.memory_bytes = backing.memory_bytes.max(p.memory_bytes);
+            // Never relax a surviving aggregate's recorded controller bounds.
+            // Legacy snapshots with missing bounds stay unknown until cleanup.
+            backing.cpu_quota_usec = backing
+                .cpu_quota_usec
+                .map(|quota| quota.min(p.cpu_quota_usec));
+            backing.tasks_max = backing.tasks_max.map(|tasks| tasks.min(p.tasks_max));
         }
         validate_backing(self)
     }
@@ -234,6 +253,18 @@ pub(crate) fn empty_directory(directory: &Path) -> Option<bool> {
 
 /// Check the actual aggregate controller limits, not a client's declaration.
 pub(crate) fn bounded(directory: &Path, pool: &ProtectedPool) -> Option<bool> {
+    let memory: u64 = fs::read_to_string(directory.join("memory.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(
+        memory == pool.memory_bytes
+            && controllers_bounded(directory, pool.cpu_quota_usec, pool.tasks_max)?,
+    )
+}
+
+fn controllers_bounded(directory: &Path, cpu_quota_usec: u64, tasks_max: u64) -> Option<bool> {
     let number = |name: &str| {
         fs::read_to_string(directory.join(name))
             .ok()?
@@ -246,12 +277,11 @@ pub(crate) fn bounded(directory: &Path, pool: &ProtectedPool) -> Option<bool> {
     let quota: u64 = fields.next()?.parse().ok()?;
     let period: u64 = fields.next()?.parse().ok()?;
     Some(
-        number("memory.max")? == pool.memory_bytes
-            && number("memory.swap.max")? == 0
-            && number("pids.max")? <= pool.tasks_max
+        number("memory.swap.max")? == 0
+            && number("pids.max")? <= tasks_max
             && period > 0
             && quota > 0
-            && u128::from(quota) * 100_000 <= u128::from(pool.cpu_quota_usec) * u128::from(period)
+            && u128::from(quota) * 100_000 <= u128::from(cpu_quota_usec) * u128::from(period)
             && fields.next().is_none(),
     )
 }
@@ -266,34 +296,95 @@ pub(crate) fn enforcement(ledger: &HostLedger, policy: &HostPolicy) -> Option<bo
             Err(_) => return None,
             Ok(_) => (),
         }
+        if empty(backing) != Some(true) && retired_bounded(&directory, backing) != Some(true) {
+            return Some(false);
+        }
         if let Some(pool) = policy
             .domains
             .iter()
             .find(|d| d.name == *name && d.uid == backing.uid && d.cgroup == backing.cgroup)
             .and_then(|d| d.protected_pool.as_ref())
+            && bounded(&directory, pool) != Some(true)
         {
-            if bounded(&directory, pool) != Some(true) {
-                return Some(false);
-            }
-        } else if empty(backing) != Some(true) {
-            // Removed pools cannot acquire new children; their old boundary must
-            // remain finite while accounting is retained.
-            let bytes: u64 = fs::read_to_string(directory.join("memory.max"))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()?;
-            if bytes > backing.memory_bytes {
-                return Some(false);
-            }
+            return Some(false);
         }
     }
     Some(true)
 }
 
+fn retired_bounded(directory: &Path, backing: &Backing) -> Option<bool> {
+    let bytes: u64 = fs::read_to_string(directory.join("memory.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(
+        bytes <= backing.memory_bytes
+            && controllers_bounded(directory, backing.cpu_quota_usec?, backing.tasks_max?)?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_backing_requires_original_swap_cpu_and_task_bounds() {
+        let directory = std::env::temp_dir().join(format!(
+            "amc-retired-protected-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let backing = Backing {
+            uid: 1000,
+            cgroup: "/quick".into(),
+            memory_bytes: 30,
+            cpu_quota_usec: Some(50000),
+            tasks_max: Some(32),
+        };
+        for (file, value) in [
+            ("memory.max", "30"),
+            ("memory.swap.max", "0"),
+            ("pids.max", "32"),
+            ("cpu.max", "50000 100000"),
+        ] {
+            fs::write(directory.join(file), value).unwrap();
+        }
+        assert_eq!(retired_bounded(&directory, &backing), Some(true));
+        for (file, widened, original) in [
+            ("memory.max", "31", "30"),
+            ("memory.swap.max", "1", "0"),
+            ("pids.max", "33", "32"),
+            ("cpu.max", "50001 100000", "50000 100000"),
+        ] {
+            fs::write(directory.join(file), widened).unwrap();
+            assert_ne!(
+                retired_bounded(&directory, &backing),
+                Some(true),
+                "widened {file}"
+            );
+            fs::remove_file(directory.join(file)).unwrap();
+            assert_ne!(
+                retired_bounded(&directory, &backing),
+                Some(true),
+                "missing {file}"
+            );
+            fs::write(directory.join(file), original).unwrap();
+        }
+        let restored: Backing =
+            serde_json::from_slice(&serde_json::to_vec(&backing).unwrap()).unwrap();
+        assert_eq!(retired_bounded(&directory, &restored), Some(true));
+        let legacy: Backing = serde_json::from_value(
+            serde_json::json!({"uid": 1000, "cgroup": "/quick", "memory_bytes": 30}),
+        )
+        .unwrap();
+        assert_ne!(
+            retired_bounded(&directory, &legacy),
+            Some(true),
+            "unknown original limits cannot be invented"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn native_pool_needs_every_controller_and_cache_blocks_retirement() {

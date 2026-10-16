@@ -34,6 +34,12 @@
 
 ### Fixed
 
+- Require bounded source selection for protected calls, cap host queue waits,
+  and preserve native-entry grace only after a protected slot is reserved.
+- Retain original protected swap, CPU and task enforcement through retirement;
+  reconcile positively dead children before reusing a pool identity at startup.
+- Report startup-budget exhaustion during a final manager query as a timeout,
+  never as a successful launcher exit with an unknown workload outcome.
 - Clamp native startup observations to their remaining deadline, including each
   serial session-bus query, and reject late startup samples.
 - Measure native quiet-window request age with the broker's boot clock, not the

@@ -242,7 +242,8 @@ fn handle(
                 host_socket.is_some() || !policy.contracts.get(contract).is_some_and(|c| c.burst),
                 "burst execution requires the shared host broker"
             );
-            let deadline = now_ms()?.saturating_add(wait_ms).saturating_add(30_000);
+            let now = now_ms()?;
+            let deadline = now.saturating_add(wait_ms).saturating_add(30_000);
             match request.message {
                 Message::EnqueueBounded {
                     memory_max,
@@ -274,7 +275,7 @@ fn handle(
                     .entries
                     .last_mut()
                     .ok_or_else(|| anyhow::anyhow!("missing bounded call"))?
-                    .deadline_ms = now_ms()?.saturating_add(wait_ms.min(seconds * 1000));
+                    .deadline_ms = now.saturating_add(wait_ms.min(seconds * 1000));
             }
             ledger.set_client(&id, client)?;
             observations.entry_keys.insert(id.clone(), key.clone());
