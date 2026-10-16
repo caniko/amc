@@ -660,6 +660,7 @@ with test_section("an aged ordinary request receives a native burst quiet window
     # one-second polling plus a subsequent fixed sleep consumed most of the
     # first burst's five-second native lifetime before the late client enrolled.
     # Keep the same runtime and aging limits, and prove the age/charge overlap.
+    # requested_ms uses CLOCK_BOOTTIME, not the wall clock.
     machine.succeed("python3 - <<'PY'\n" + """
 import json
 from pathlib import Path
@@ -674,7 +675,7 @@ while time.monotonic() < deadline:
     assert state['burst_committed_bytes'] == 33554432, state
     ordinary = [r for r in state['reservations']
                 if not r['granted'] and r['memory_bytes'] == 100663296]
-    if ordinary and time.time_ns() // 1000000 - ordinary[0]['requested_ms'] >= aging_ms:
+    if ordinary and time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1000000 - ordinary[0]['requested_ms'] >= aging_ms:
         print(json.dumps({'agedOrdinary': ordinary[0], 'burstCommittedBytes': state['burst_committed_bytes']}))
         break
     time.sleep(min(.025, max(0, deadline - time.monotonic())))
