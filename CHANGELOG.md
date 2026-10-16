@@ -4,6 +4,8 @@
 
 ### Added
 
+- Opt-in protected small-call pools with pre-accounted backing, separate queues,
+  native resource/deadline bounds and ledger-safe restart and retirement.
 - Advance foreground preparation with durable drain barriers and once-only
   transfer into native scopes that preserve the caller's filesystem namespace.
 - Finite, up-front-backed completion lanes and per-operation root worker
@@ -32,6 +34,16 @@
 
 ### Fixed
 
+- Require bounded source selection for protected calls, cap host queue waits,
+  and preserve native-entry grace only after a protected slot is reserved.
+- Retain original protected swap, CPU and task enforcement through retirement;
+  reconcile positively dead children before reusing a pool identity at startup.
+- Report startup-budget exhaustion during a final manager query as a timeout,
+  never as a successful launcher exit with an unknown workload outcome.
+- Clamp native startup observations to their remaining deadline, including each
+  serial session-bus query, and reject late startup samples.
+- Measure native quiet-window request age with the broker's boot clock, not the
+  wall clock, so the fixture waits for the real aging threshold before backfill.
 - Bind whole-device swap recovery to one broker-approved native object and retain
   its descriptor through deactivation and restoration, including failure recovery.
 - Keep native startup pending while its pinned cgroup is initially empty;

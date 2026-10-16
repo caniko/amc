@@ -18,6 +18,7 @@ fn policy() -> Policy {
                 pause_file: None,
                 burst: false,
                 runtime_max_sec: None,
+                protected_pool: None,
             },
         )]),
     }
@@ -77,6 +78,7 @@ fn private_burst_allowance_never_becomes_normal_capacity() {
             pause_file: None,
             burst: true,
             runtime_max_sec: Some(5),
+            protected_pool: None,
         },
     );
     p.validate().unwrap();
@@ -181,6 +183,7 @@ fn long_lived_pool_does_not_block_disposable_pool() {
             pause_file: None,
             burst: false,
             runtime_max_sec: None,
+            protected_pool: None,
         },
     );
     let mut ledger = Ledger::new("boot".into());

@@ -146,22 +146,26 @@ fn state(manager: &Path, unit: &str) -> Option<UnitState> {
 }
 
 fn query_state(manager: &Path, unit: &str) -> Option<UnitState> {
-    routed_query_state(manager, unit, None)
+    routed_query_state(manager, unit, None, None)
 }
 
-fn routed_query_state(manager: &Path, unit: &str, session_uid: Option<u32>) -> Option<UnitState> {
+fn routed_query_state(
+    manager: &Path,
+    unit: &str,
+    session_uid: Option<u32>,
+    deadline: Option<Instant>,
+) -> Option<UnitState> {
     if let Some(uid) = session_uid {
-        return session_bus::query(uid, unit);
+        return session_bus::query(uid, unit, deadline);
     }
-    let text = capture(Command::new(manager).args([
+    let text = session_bus::capture_until(Command::new(manager).args([
         "--user",
         "show",
         "--no-pager",
         "--property=LoadState,ActiveState,InvocationID,MainPID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
         "--",
         unit,
-    ]))
-    .ok()?;
+    ]), deadline)?;
     let field = |name: &str| {
         text.lines()
             .filter_map(|line| line.split_once('='))
@@ -584,7 +588,7 @@ pub fn execute(
         Err(_) => return Outcome::NotSubmitted(NotSubmitted::SpawnFailed),
     };
     record.mark_submitted();
-    let query = || routed_query_state(manager, unit, record.manager_session_uid);
+    let query = |deadline| routed_query_state(manager, unit, record.manager_session_uid, deadline);
     let cleanup = || routed_cleanup(manager, unit, record.manager_session_uid);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut started = false;
@@ -622,9 +626,12 @@ pub fn execute(
                 // domain cannot be observed) is Unknown, not Completed.
                 // Workload status comes from the manager; the client code is
                 // only a fallback when the manager is silent.
-                match query() {
+                match query(startup_wait_required(detached, started).then_some(deadline)) {
                     Some(state)
-                        if startup_released && confirmed_exit(&state, observed.as_ref()) =>
+                        if (!startup_wait_required(detached, started)
+                            || Instant::now() < deadline)
+                            && startup_released
+                            && confirmed_exit(&state, observed.as_ref()) =>
                     {
                         if !retain {
                             let _ = cleanup();
@@ -632,15 +639,23 @@ pub fn execute(
                         return Outcome::Completed(state.workload_code.unwrap_or(client_code));
                     }
                     _ => {
-                        return Outcome::Unknown {
-                            exit_code: client_code,
+                        let expired =
+                            startup_wait_required(detached, started) && Instant::now() >= deadline;
+                        let cleanup =
                             // A pinned invocation mismatch or failed final query
                             // must not be bypassed by stopping a replacement.
-                            cleanup: if observed.is_some() {
+                            if observed.is_some() {
                                 Cleanup::Unknown
                             } else {
                                 cleanup()
-                            },
+                            };
+                        return if expired {
+                            Outcome::TimedOut { started, cleanup }
+                        } else {
+                            Outcome::Unknown {
+                                exit_code: client_code,
+                                cleanup,
+                            }
                         };
                     }
                 }
@@ -655,7 +670,10 @@ pub fn execute(
             }
         }
         if !started && Instant::now() >= next_query {
-            if let Some(state) = query().filter(|state| state.loaded) {
+            if let Some(state) = query(Some(deadline)).filter(|state| state.loaded) {
+                if Instant::now() >= deadline {
+                    continue;
+                }
                 if record.startup.is_none() {
                     started = state.started;
                 }
@@ -734,6 +752,130 @@ mod tests {
     }
 
     #[test]
+    fn startup_queries_use_the_remaining_budget_and_expired_queries_do_not_spawn() {
+        use crate::test_support::{scratch_dir, show_manager};
+        let dir = scratch_dir("amc-startup-query-budget");
+        let marker = dir.join("spawned");
+        let manager = show_manager(&dir, &format!("touch {}; exec sleep 10", marker.display()));
+        let started = Instant::now();
+        assert!(
+            routed_query_state(
+                &manager,
+                "app-amc-budget.service",
+                None,
+                Some(started + Duration::from_millis(250)),
+            )
+            .is_none()
+        );
+        let elapsed = started.elapsed();
+        if marker.exists() {
+            fs::remove_file(&marker).unwrap();
+        }
+        assert!(
+            routed_query_state(&manager, "app-amc-budget.service", None, Some(started)).is_none()
+        );
+        let respawned = marker.exists();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "query exceeded remaining startup budget: {elapsed:?}"
+        );
+        assert!(
+            !respawned,
+            "an expired startup query spawned a manager client"
+        );
+    }
+
+    #[test]
+    fn session_startup_queries_share_one_deadline() {
+        const DIRECTORY: &str = "AMC_TEST_SESSION_QUERY_DIRECTORY";
+        const STEP: &str = "AMC_TEST_SESSION_QUERY_STEP";
+        let unit = "app-amc-startup-budget.service";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let calls = PathBuf::from(directory).join("queries");
+            let started = Instant::now();
+            assert!(
+                routed_query_state(
+                    Path::new("/unused-session-manager"),
+                    unit,
+                    Some(1000),
+                    Some(started + Duration::from_millis(250)),
+                )
+                .is_none()
+            );
+            let elapsed = started.elapsed();
+            let recorded = fs::read_to_string(&calls).unwrap();
+            assert_eq!(
+                recorded.lines().count(),
+                std::env::var(STEP).unwrap().parse::<usize>().unwrap()
+            );
+            assert!(
+                routed_query_state(
+                    Path::new("/unused-session-manager"),
+                    unit,
+                    Some(1000),
+                    Some(started)
+                )
+                .is_none()
+            );
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap(),
+                recorded,
+                "expired session query spawned another client"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "session query exceeded remaining startup budget: {elapsed:?}"
+            );
+            return;
+        }
+        // Isolate PATH in a child test process; never redirect another test or a
+        // real manager. Stall each of LoadUnit/Unit/Service/Unit in turn.
+        let dir = crate::test_support::scratch_dir("amc-session-startup-budget");
+        let manager = crate::test_support::show_manager(
+            &dir,
+            r#"
+printf '%s\n' "$*" >> "$AMC_TEST_SESSION_QUERY_DIRECTORY/queries"
+step=$(wc -l < "$AMC_TEST_SESSION_QUERY_DIRECTORY/queries")
+if test "$step" -eq "$AMC_TEST_SESSION_QUERY_STEP"; then exec sleep 10; fi
+case "$*" in
+  *' LoadUnit '*) printf '%s\n' '{"type":"o","data":["/org/freedesktop/systemd1/unit/test"]}' ;;
+  *' org.freedesktop.systemd1.Unit '*) printf '%s\n' '{"type":"s","data":"app-amc-startup-budget.service"}' '{"type":"s","data":"loaded"}' '{"type":"s","data":"active"}' '{"type":"ay","data":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}' ;;
+  *' org.freedesktop.systemd1.Service '*) printf '%s\n' '{"type":"t","data":1}' '{"type":"u","data":123}' '{"type":"i","data":0}' '{"type":"i","data":0}' '{"type":"s","data":"/app.slice/app-amc-startup-budget.service"}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        fs::rename(manager, dir.join("busctl")).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(dir.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let passed = (1..=4).all(|step| {
+            let mut child = {
+                let _guard = crate::test_support::executable_fixture_guard();
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "systemd::tests::session_startup_queries_share_one_deadline",
+                        "--nocapture",
+                    ])
+                    .env(DIRECTORY, &dir)
+                    .env(STEP, step.to_string())
+                    .env("PATH", &path)
+                    .spawn()
+                    .unwrap()
+            };
+            let status = child.wait().unwrap();
+            fs::remove_file(dir.join("queries")).unwrap();
+            status.success()
+        });
+        fs::remove_dir_all(dir).unwrap();
+        assert!(passed, "session startup budget regression failed");
+    }
+
+    #[test]
     fn detached_acknowledgment_and_unknown_cleanup_retain_capacity() {
         assert!(!Outcome::Acknowledged.releases_reservation());
         assert!(
@@ -762,6 +904,48 @@ mod tests {
         }
         command.args(["--", "worker"]);
         command
+    }
+
+    #[test]
+    fn final_query_exhausting_startup_budget_is_a_timeout_not_launcher_success() {
+        let dir = crate::test_support::scratch_dir("amc-final-query-timeout");
+        let manager = crate::test_support::show_manager(
+            &dir,
+            r#"
+case " $* " in
+  *' show '*) exec sleep 10 ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let polls = std::cell::Cell::new(0);
+        let record = ClientRecord::default();
+        let outcome = execute(
+            &mut bound_command("app-amc-final-query.service", false),
+            &manager,
+            "app-amc-final-query.service",
+            false,
+            false,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() == 2 {
+                    // Let the successful launcher exit, then begin its final
+                    // observation near the real production startup deadline.
+                    thread::sleep(Duration::from_millis(29_750));
+                }
+                None
+            },
+            &record,
+        );
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::TimedOut {
+                started: false,
+                cleanup: Cleanup::Unknown
+            }
+        );
+        assert!(record.submitted() && record.settled());
     }
 
     #[test]

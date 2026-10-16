@@ -101,6 +101,7 @@
     nixosModules.host-admission = import ./nix/host-admission-module.nix;
     lib.hostDomainPressureVersion = 1;
     lib.admissionSizingVersion = 1;
+    lib.admissionProtectedPoolVersion = 1;
     lib.admissionBurstVersion = 1;
     lib.admissionPreparationVersion = 2;
     lib.admissionContinuationEnvelopesVersion = 1;
@@ -119,6 +120,10 @@
         pkgs = pkgsFor system;
       in
         {
+          protected-pool = import ./nix/protected-pool-vm-test.nix {
+            inherit pkgs;
+            package = self.packages.${system}.default;
+          };
           supervision = import ./nix/supervision-vm-test.nix {
             inherit pkgs;
             package = self.packages.${system}.default;

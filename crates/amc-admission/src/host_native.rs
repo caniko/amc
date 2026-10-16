@@ -298,7 +298,7 @@ pub fn empty_reservation(r: &crate::host::Reservation) -> Option<bool> {
 /// Any changed or unreadable granted boundary inhibits every new grant.
 pub fn enforcement(r: &crate::host::Reservation) -> Option<()> {
     memory_enforcement(r)?;
-    if r.burst && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
+    if r.runtime_max_ms.is_some() && burst_runtime(&r.identity).ok()? != r.runtime_max_ms? {
         return None;
     }
     Some(())
@@ -750,6 +750,7 @@ mod tests {
             io_pressure: crate::host::IoPressure::Enforce,
             min_available_bytes: 0,
             continuation: None,
+            protected_pool: None,
             burst: false,
         }];
         let expected = identify_entry_at(&proc, &groups, 42, 1000, &domains, false).unwrap();
@@ -819,6 +820,7 @@ mod tests {
             io_pressure: crate::host::IoPressure::Enforce,
             min_available_bytes: 0,
             continuation: None,
+            protected_pool: None,
             burst: false,
         }];
         assert!(identify_entry_at(&proc, &groups, 42, 1000, &reduced, false).is_err());

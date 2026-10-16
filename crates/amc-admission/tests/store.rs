@@ -19,6 +19,7 @@ fn running_ledger() -> Ledger {
             pause_file: None,
             burst: false,
             runtime_max_sec: None,
+            protected_pool: None,
         },
         phase: Phase::Running,
         deadline_ms: 0,

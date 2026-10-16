@@ -118,6 +118,53 @@ verified ceiling/class/runtime. The native shared-admission VM includes above-
 budget execution, restart, cross-user bursts, ignored-SIGTERM descendants and
 cooldown deferral. Passing Rust fixtures alone does not qualify native rollout.
 
+## Protected, policy-owned small-call backing
+
+Unlike bursts, an optional domain `protected_pool` reserves a fixed envelope
+inside `budget_bytes`, even with no live children. The matching private contract
+uses an exclusive sibling slice and the same `protected_pool` bounds:
+`source_contract`, `memory_bytes`, `max_job_bytes`, `max_running`,
+`runtime_max_sec`, `wait_max_sec`, `queue_limit`, `cpu_quota_usec` (per 100 ms),
+and `tasks_max`. The envelope must exceed concurrent per-call ceilings, leaving
+helper/cache headroom. Zero swap, finite aggregate CPU/PIDs and a native service
+deadline with one-second final-kill grace are required. Only one pool per UID is
+enrolled, with at most eight live protected calls host-wide.
+
+```sh
+amc admission exec --contract tool --protected-pool \
+  --max-ram-usage 128MiB --runtime-max-sec 15 -- command args
+```
+
+The new `enqueue_bounded` operation selects the policy's protected contract only
+when both declared limits fit; sizing alone and legacy requests do not opt in.
+Larger initial declarations keep their ordinary contract. A selected pool that
+is full never automatically promotes, resubmits or replays the command. The
+choice must be made before an outer tool shell waits for bulk admission.
+The package and flake export `admissionProtectedPoolVersion = 1`; consumers must
+gate both the new CLI flag and policy fields on that capability.
+
+Root and private accounting charge backing once, not each child again. Separate
+bounded queues and native deadline-observation workers keep bulk/burst traffic
+from consuming protected capacity. Native aggregate projections include residual
+cache in the full backing, reusing the existing full-envelope ancestry check.
+Pressure/unknown observations, supervision, foreground preparation/drain and
+swap-recovery barriers still inhibit execution. This is not availability under
+physical memory exhaustion or arbitrary uncooperative workloads.
+
+Backing persists across idle and occupied restarts. Native children retain slots
+until confirmed cleanup, not client disconnect or runtime expiry. Reductions and
+retirement retain old backing until the aggregate is positively empty with zero
+remaining charge (or absent). An offline user's absent slice stays pre-accounted
+without globally blocking admission; an existing but unbounded slice fails
+closed. Drain a pool before changing its domain identity. Retain ledgers when
+rolling policy back; an older binary cannot safely parse the new state.
+
+Offline tests cover queue/budget isolation, bounded selection, restart snapshots,
+unknown cleanup, reduced backing and native evidence/pressure waits. The separate
+`nixosTests.<system>.protected-pool` fixture exercises real user managers and
+hard failures; it must pass before enabling a deployment. Source support and
+passing Rust tests alone do not establish native qualification.
+
 ## Advance foreground preparation
 
 Optional `preparations` profiles specify a non-root slice domain, native

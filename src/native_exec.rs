@@ -37,6 +37,7 @@ pub struct ExecArgs {
 pub fn execute(arguments: ExecArgs) -> Result<i32> {
     let Some(slice) = arguments.slice else {
         return crate::admission::execute(crate::admission::AdmissionCommand::Exec {
+            protected_pool: false,
             socket: arguments.socket,
             contract: arguments.contract.unwrap_or_else(|| {
                 if arguments.burst {

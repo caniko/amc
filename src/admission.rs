@@ -84,6 +84,9 @@ pub enum AdmissionCommand {
         /// Explicit per-call hard ceiling, bounded by the selected contract.
         #[arg(long, value_parser = parse_memory)]
         max_ram_usage: Option<u64>,
+        /// Allow policy selection of protected backing for an explicitly bounded call.
+        #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"], conflicts_with = "burst")]
+        protected_pool: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -225,16 +228,36 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             runtime_max_sec,
             burst,
             max_ram_usage,
+            protected_pool,
             command,
-        } => run(
-            &socket_path(socket)?,
-            &contract,
-            timeout,
-            runtime_max_sec,
-            burst,
-            max_ram_usage,
-            &command,
-        ),
+        } => {
+            let request = match (max_ram_usage, protected_pool) {
+                (Some(memory_max), true) => Message::EnqueueBounded {
+                    contract,
+                    wait_ms: timeout * 1000,
+                    memory_max,
+                    runtime_max_sec: runtime_max_sec
+                        .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
+                },
+                (Some(memory_max), false) => Message::EnqueueSized {
+                    contract,
+                    wait_ms: timeout * 1000,
+                    memory_max,
+                },
+                (None, _) => Message::Enqueue {
+                    contract,
+                    wait_ms: timeout * 1000,
+                },
+            };
+            run(
+                &socket_path(socket)?,
+                timeout,
+                runtime_max_sec,
+                burst,
+                request,
+                &command,
+            )
+        }
         AdmissionCommand::Enter {
             socket,
             ticket,
@@ -293,30 +316,16 @@ fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
 
 fn run(
     socket: &Path,
-    contract: &str,
     timeout: u64,
     runtime_max_sec: Option<u64>,
     burst: bool,
-    max_ram_usage: Option<u64>,
+    request: Message,
     argv: &[OsString],
 ) -> Result<i32> {
     use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
-    let response = call(
-        socket,
-        match max_ram_usage {
-            Some(memory_max) => Message::EnqueueSized {
-                contract: contract.into(),
-                wait_ms: timeout * 1000,
-                memory_max,
-            },
-            None => Message::Enqueue {
-                contract: contract.into(),
-                wait_ms: timeout * 1000,
-            },
-        },
-    )?;
+    let response = call(socket, request)?;
     let host_socket = response.host_socket;
     if let Some(host_socket) = &host_socket
         && let Err(error) = crate::native_start::verify_host_runner(host_socket)
@@ -344,6 +353,7 @@ fn run(
             return Err(error);
         }
     };
+    let short_call = burst || entry.contract.protected_pool.is_some();
     while entry.phase == Phase::Queued {
         if signals.cancelled().is_some() || Instant::now() >= deadline {
             let _ = call(socket, Message::Cancel { id: entry.id });
@@ -383,7 +393,7 @@ fn run(
         "KillMode=control-group".into(),
         "Restart=no".into(),
         format!("TimeoutStartSec={}s", timeout + 30),
-        format!("TimeoutStopSec={}s", if burst { 1 } else { 15 }),
+        format!("TimeoutStopSec={}s", if short_call { 1 } else { 15 }),
     ] {
         client.arg(format!("--property={property}"));
     }
@@ -391,9 +401,11 @@ fn run(
         client.arg(format!("--property=RuntimeMaxSec={seconds}s"));
         client.arg("--property=RuntimeRandomizedExtraSec=0");
     }
-    if burst {
+    if short_call {
         client.arg("--property=SendSIGKILL=yes");
         client.arg("--property=FinalKillSignal=SIGKILL");
+    }
+    if burst {
         eprintln!(
             "AMC burst: {} bytes reserved, {}s native runtime ceiling",
             entry.contract.memory_max,
