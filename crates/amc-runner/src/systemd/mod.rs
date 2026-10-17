@@ -92,7 +92,7 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupFailure {
-    /// The manager's invocation or enrolled cgroup no longer matches the pin.
+    /// The manager's startup identity is missing or no longer matches the pin.
     ManagerIdentityChanged,
     /// The pinned native domain's identity or population could not be observed.
     NativeDomainUnobservable,
@@ -501,14 +501,13 @@ impl ClientRecord {
         &self,
         barrier: &StartupBarrier,
         domain: &ObservedDomain,
-        main_pid: u32,
-        group: &str,
+        main_pid: Option<u32>,
+        group: Option<&str>,
         identity_matches: bool,
     ) -> Result<bool, StartupFailure> {
-        let release = if identity_matches {
-            domain.release_startup(barrier, main_pid, group)
-        } else {
-            Err(StartupFailure::ManagerIdentityChanged)
+        let release = match (identity_matches, main_pid, group) {
+            (true, Some(main_pid), Some(group)) => domain.release_startup(barrier, main_pid, group),
+            _ => Err(StartupFailure::ManagerIdentityChanged),
         };
         if let Err(failure) = &release {
             self.startup_failure.replace(Some(failure.clone()));
@@ -740,12 +739,9 @@ pub fn execute(
                             ))
                         });
                 }
-                if let (Some(barrier), Some((invocation, domain)), Some(main_pid), Some(group)) = (
-                    record.startup.as_ref(),
-                    observed.as_ref(),
-                    state.main_pid,
-                    state.control_group.as_deref(),
-                ) {
+                if let (Some(barrier), Some((invocation, domain))) =
+                    (record.startup.as_ref(), observed.as_ref())
+                {
                     // Pinning precedes release. Recheck cancellation after the
                     // bounded manager query, so cancellation during that query
                     // cannot authorize the payload.
@@ -764,9 +760,14 @@ pub fn execute(
                     }
                     let identity_matches = !state.stopped
                         && state.invocation.as_ref() == Some(invocation)
-                        && domain.matches(Some(group));
-                    match record.release_startup(barrier, domain, main_pid, group, identity_matches)
-                    {
+                        && domain.matches(state.control_group.as_deref());
+                    match record.release_startup(
+                        barrier,
+                        domain,
+                        state.main_pid,
+                        state.control_group.as_deref(),
+                        identity_matches,
+                    ) {
                         Ok(true) => {
                             startup_released = true;
                             started = true;
@@ -1430,13 +1431,13 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
             .unwrap();
         assert!(
             !record
-                .release_startup(&barrier, &domain, pid, native_group, true)
+                .release_startup(&barrier, &domain, Some(pid), Some(native_group), true)
                 .unwrap()
         );
         assert_eq!(record.startup_failure(), None);
 
         assert_eq!(
-            record.release_startup(&barrier, &domain, pid, native_group, false),
+            record.release_startup(&barrier, &domain, Some(pid), Some(native_group), false),
             Err(StartupFailure::ManagerIdentityChanged)
         );
         assert_eq!(
@@ -1446,7 +1447,7 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
 
         fs::remove_file(group.join("cgroup.events")).unwrap();
         assert_eq!(
-            record.release_startup(&barrier, &domain, pid, native_group, true),
+            record.release_startup(&barrier, &domain, Some(pid), Some(native_group), true),
             Err(StartupFailure::NativeDomainUnobservable)
         );
         assert_eq!(
@@ -1455,12 +1456,24 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         );
 
         fs::write(group.join("cgroup.events"), "populated 1\n").unwrap();
+        for (main_pid, native_group) in [(None, Some(native_group)), (Some(pid), None)] {
+            let record = ClientRecord::default();
+            assert_eq!(
+                record.release_startup(&barrier, &domain, main_pid, native_group, true),
+                Err(StartupFailure::ManagerIdentityChanged)
+            );
+            assert_eq!(
+                record.startup_failure(),
+                Some(StartupFailure::ManagerIdentityChanged)
+            );
+            assert!(!record.submitted() && !record.settled());
+        }
         let helper =
             UnixStream::connect_addr(&SocketAddr::from_abstract_name(barrier.name()).unwrap())
                 .unwrap();
         drop(helper);
         assert!(matches!(
-            record.release_startup(&barrier, &domain, pid, native_group, true),
+            record.release_startup(&barrier, &domain, Some(pid), Some(native_group), true),
             Err(StartupFailure::Handshake { .. })
         ));
         let Some(StartupFailure::Handshake { detail }) = record.startup_failure() else {
