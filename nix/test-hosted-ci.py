@@ -123,6 +123,53 @@ class GuardNonresidentSetupTests(unittest.TestCase):
         self.assertEqual(writes[backed / "cgroup.procs"], "123")
 
 
+class ChargeOwnerSetupTests(unittest.TestCase):
+    def test_target_is_frozen_before_reclaim_and_during_migration(self):
+        tree = ast.parse((hosted.ROOT / "nix/charge-owner-proof.py").read_text())
+        proof = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "proof")
+        setup = next(node for node in proof.body if isinstance(node, ast.Try)).body
+        end = next(index for index, node in enumerate(setup)
+                   if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "policy")
+        root = Path("/sys/fs/cgroup/amc-charge-proof")
+        writes = {}
+        frozen = set()
+
+        def write(path, value):
+            if path.name == "memory.reclaim":
+                self.assertIn(root / "destination", frozen,
+                              "the executing target can refault original-owner pages")
+            if path == root / "moved" / "cgroup.procs":
+                self.assertIn(root / "destination", frozen)
+                self.assertEqual(writes.get(root / "moved" / "cgroup.freeze"), "1")
+            writes[path] = value
+
+        def read(path):
+            if path.name == "cgroup.events":
+                self.assertEqual(writes.get(path.parent / "cgroup.freeze"), "1")
+                frozen.add(path.parent)
+                return "populated 1\nfrozen 1\n"
+            self.assertEqual(str(path), "/proc/123/cgroup")
+            return "0::/amc-charge-proof/moved\n"
+
+        namespace = {
+            "ROOT": root, "MIB": 1048576, "Path": Path, "errno": errno,
+            "pid": 123, "read": 100,
+            "os": types.SimpleNamespace(read=lambda *_: b"ready"),
+            "wait": lambda predicate: self.assertTrue(predicate()),
+            "observe": lambda group: {"swap": 32 * 1048576 if group.name in ("a", "b") else 0,
+                                      "cached": 0},
+        }
+        with (
+            mock.patch.object(Path, "write_text", autospec=True, side_effect=write),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+        ):
+            exec(compile(ast.Module(body=setup[:end], type_ignores=[]), "charge-owner-setup", "exec"), namespace)
+        for name in ("a", "b"):
+            self.assertIn(root / name / "memory.reclaim", writes)
+        self.assertEqual(writes[root / "moved" / "cgroup.procs"], "123")
+        self.assertIn(root / "moved", frozen)
+
+
 class GuardCleanupTests(unittest.TestCase):
     def setUp(self):
         self.now = 0
