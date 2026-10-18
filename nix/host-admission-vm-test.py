@@ -13,6 +13,28 @@ for user, uid in [("alice", 1000), ("bob", 1001)]:
     )
     machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/admission.sock")
 
+with test_section("broker hides runtime and home paths even after late user starts"):
+    machine.succeed("touch /root/amc-private-marker /home/alice/amc-private-marker")
+    broker = machine.succeed(
+        "systemctl show amc-host-admission.service -p MainPID --value"
+    ).strip()
+    assert int(broker) > 0
+    namespace = f"nsenter --target {broker} --mount -- "
+    for uid in [1000, 1001]:
+        machine.fail(namespace + f"test -S /run/user/{uid}/amc/admission.sock")
+        machine.fail(namespace + f"touch /run/user/{uid}/amc/broker-write-forbidden")
+        machine.fail(f"test -e /run/user/{uid}/amc/broker-write-forbidden")
+    # Positive command in the actual namespace prevents a missing/broken nsenter
+    # from silently satisfying every expected failure.
+    machine.succeed(namespace + "test -d /proc/self")
+    machine.fail(namespace + "test -e /root/amc-private-marker")
+    machine.fail(namespace + "test -e /home/alice/amc-private-marker")
+    machine.fail(namespace + "touch /tmp/amc-broker-write-forbidden")
+    machine.fail("test -e /tmp/amc-broker-write-forbidden")
+    machine.succeed(namespace + "touch /run/amc-host/observer-write-probe")
+    machine.succeed("test -e /run/amc-host/observer-write-probe")
+    machine.succeed(namespace + "rm /run/amc-host/observer-write-probe")
+
 
 def write_file(path, text):
     machine.succeed("printf '%s' " + shlex.quote(text) + " > " + shlex.quote(path))
@@ -245,11 +267,25 @@ assert reply['error'] and not reply['granted'], reply
             "amc prepare --profile game -- /bin/sh -c "
             + shlex.quote(f"touch /tmp/helper-prepared-{number}-entered; sleep 120")
         )
-    machine.wait_until_succeeds(
-        "amc admission host-status | python3 -c " + shlex.quote(
-            'import sys,json; s=json.load(sys.stdin); assert len(s["preparations"]) == 2 and all(p["phase"] == "draining" for p in s["preparations"])'
+    try:
+        machine.wait_until_succeeds(
+            "amc admission host-status | python3 -c " + shlex.quote(
+                'import sys,json; s=json.load(sys.stdin); assert len(s["preparations"]) == 2 and all(p["phase"] == "draining" for p in s["preparations"])'
+            )
         )
-    )
+    except Exception as error:
+        queries = {
+            "host": "amc admission host-status",
+            "clients": "journalctl -b --no-pager -o cat -u helper-prepared-1 -u helper-prepared-2 -n 30",
+            "helpers": "journalctl -b --no-pager -o cat _UID=1000 -n 30",
+            "broker": "journalctl -b --no-pager -o cat -u amc-host-admission -n 12",
+        }
+        observations = {
+            key: machine.execute(command) for key, command in queries.items()
+        }
+        raise AssertionError(
+            json.dumps({"preparationHelpers": observations})
+        ) from error
     runner_group = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-amchostrunner.slice"
     machine.succeed(
         f'test "$(cat {runner_group}/memory.max)" = 67108864; '
@@ -466,7 +502,9 @@ with test_section(
     assert state["burst_committed_bytes"] == 32 * 1048576
     assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
     machine.succeed("touch /run/amc-host/amc-burst-observation-slow")
-    machine.wait_until_succeeds("test -e /run/amc-host/amc-burst-observation-entered", timeout=10)
+    machine.wait_until_succeeds(
+        "test -e /run/amc-host/amc-burst-observation-entered", timeout=10
+    )
     responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    status = json.loads(result.stdout)\n    assert status['version'] == 1 and status['error'] is None, status\n    assert status['budget_bytes'] == 160 * 1048576 and isinstance(status['reservations'], list), status\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
     assert responsive["elapsedSeconds"] < 1, responsive
     machine.succeed("rm /run/amc-host/amc-burst-observation-slow")
@@ -1159,7 +1197,9 @@ with open('/tmp/device-stale-demand-denied', 'w') as receipt:
     # Retain this short-lived fixture's result until the driver verifies it.
     # Otherwise successful exit can collect the unit before explicit cleanup.
     machine.succeed("touch /run/amc-host/amc-device-inventory-pause; systemd-run --unit=page-return --property=MemoryMax=128M --property=MemorySwapMax=0 --property=RemainAfterExit=yes -- python3 /tmp/device-stale-demand.py")
-    machine.wait_until_succeeds("test -e /run/amc-host/amc-device-inventory-observed")
+    machine.wait_until_succeeds(
+        "test -e /run/amc-host/amc-device-inventory-observed", timeout=10
+    )
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=32M")
     machine.wait_until_succeeds("test -e /tmp/device-stale-demand-denied")
     machine.succeed("systemctl set-property --runtime page-target MemoryMax=128M")

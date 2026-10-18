@@ -78,7 +78,7 @@ jobs:
           exec 3> >(tee "$SIMIT_NIX_BUILD_RESULTS/build.log" >&2)
           log_pid=$!
           status=0
-          nix build --no-link --no-update-lock-file --max-jobs 1 --cores 2 --json "$INSTALLABLE" 2>&3 | tee "$SIMIT_NIX_BUILD_RESULTS/result.json" || status=$?
+          nix build --no-link --no-update-lock-file --max-jobs 1 --cores 4 --json "$INSTALLABLE" 2>&3 | tee "$SIMIT_NIX_BUILD_RESULTS/result.json" || status=$?
           exec 3>&-
           wait "$log_pid"
           exit "$status"

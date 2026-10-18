@@ -306,9 +306,14 @@ that memcg is offline, the direct fault path can use the target mm, but
 memcg. For a remote `/proc/PID/mem` read, that is the finite recovery helper.
 A frozen cgroup can still be migrated. A swapped PTE does not expose its charge
 owner to this userspace API, and a single mm can contain mixed-origin pages.
-Consequently each batch conservatively checks every online cgroup with stable
-nonresident swap demand, plus both the current target and reader fallbacks, against their native
-ancestors and commitments. This can wait for an unrelated charged domain to
+Consequently each batch conservatively checks every online cgroup with occupied
+swap slots, plus both the current target and reader fallbacks, against their native
+ancestors and commitments. Each possible owner must either back the complete batch
+or prove through stable, exact cache accounting that all its slots are already in
+RAM. A fully backed owner needs no cache-residency credit; changing cache counters
+cannot invalidate that independent capacity proof. Tight owners still require the
+exact no-new-RAM exception, and malformed slot counts or unproven backing fail
+closed. This can wait for an unrelated charged domain to
 gain headroom; it cannot borrow the destination grant to cover another owner.
 The native VM requires separate proofs of online original charging, frozen
 migration, offlining fallback charge attribution and all headroom denials with zero OOM events. See Linux
@@ -335,6 +340,12 @@ fallback checks before persisting the same lease. Changed ownership or demand
 cannot be transferred from an abandoned scan.
 Inventory backing includes granted native obligations and Ready/continuation
 escrow, while ungranted queue churn cannot discard a valid scan.
+New page leases record slot occupancy without an optional aggregate cache delta:
+`before_return_bytes` and `return_demand_reduction_bytes` are null. Batch authority
+still requires all-swapped PTEs before admission and fully resident PTEs at
+settlement. Historical leases retain their exact cache-delta accounting. Whole-device
+feasibility, swap-return reservation and final zero-demand completion continue to
+require exact accounting; missing telemetry never establishes completion.
 Both page and whole-device replay verify the complete scanned cgroup frontier
 and recalculate headroom from live limits, resident bytes and uncovered swap
 demand, including groups with zero demand in the earlier scan. Page replay

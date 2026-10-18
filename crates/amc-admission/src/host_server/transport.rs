@@ -4,11 +4,12 @@ use crate::protocol::MAX_FRAME;
 use anyhow::{Result, ensure};
 use nix::{
     errno::Errno,
+    poll::{PollFd, PollFlags, poll},
     sys::socket::{MsgFlags, UnixCredentials, getsockopt, recv, send, sockopt::PeerCredentials},
 };
 use std::{
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd},
         unix::net::{UnixListener, UnixStream},
     },
     time::{Duration, Instant},
@@ -215,6 +216,27 @@ impl Connections {
     pub fn progress(&self) -> bool {
         self.progress
     }
+
+    pub fn wait(&self, listener: &UnixListener, inventory: Option<&UnixStream>) -> Result<()> {
+        let mut fds = vec![PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+        for peer in &self.peers {
+            let events = match &peer.frame {
+                Frame::Reading(_) => PollFlags::POLLIN,
+                Frame::Writing { .. } => PollFlags::POLLOUT,
+                Frame::Ready(_) => return Ok(()),
+            };
+            fds.push(PollFd::new(peer.stream.as_fd(), events));
+        }
+        if let Some(inventory) = inventory {
+            fds.push(PollFd::new(inventory.as_fd(), PollFlags::POLLIN));
+        }
+        // Keep the existing idle bound for stop/manager/deadline checks, but
+        // wake immediately for ready requests, replies or worker completion.
+        match poll(&mut fds, 20u16) {
+            Ok(_) | Err(Errno::EINTR) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +384,58 @@ mod tests {
             .expect("complete fragmented frame");
         assert!(matches!(incoming.request, Request::Status { version: 1 }));
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn ready_host_work_does_not_pay_the_idle_interval_for_each_turn() {
+        let directory = std::env::temp_dir().join(format!(
+            "amc-ready-host-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut connections = Connections::default();
+        let began = Instant::now();
+        for _ in 0..16 {
+            let mut client = UnixStream::connect(&socket).unwrap();
+            connections.wait(&listener, None).unwrap();
+            assert!(connections.next(&listener).unwrap().is_none());
+            client
+                .write_all(b"{\"op\":\"status\",\"version\":1}\n")
+                .unwrap();
+            connections.wait(&listener, None).unwrap();
+            let incoming = connections.next(&listener).unwrap().unwrap();
+            assert!(matches!(incoming.request, Request::Status { version: 1 }));
+            connections
+                .respond(
+                    incoming.stream,
+                    incoming.credentials.uid(),
+                    &Response {
+                        version: 1,
+                        committed_bytes: 17,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            connections.wait(&listener, None).unwrap();
+            assert!(connections.next(&listener).unwrap().is_none());
+            assert_eq!(
+                read_frame::<Response>(&mut client).unwrap().committed_bytes,
+                17
+            );
+
+            let (completion, worker) = UnixStream::pair().unwrap();
+            drop(worker);
+            connections.wait(&listener, Some(&completion)).unwrap();
+        }
+        let elapsed = began.elapsed();
+        std::fs::remove_dir_all(directory).unwrap();
+        eprintln!("64 ready broker waits: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "ready listener/frame/reply/inventory work paid idle sleeps: {elapsed:?}"
+        );
     }
 }

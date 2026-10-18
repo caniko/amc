@@ -4,7 +4,7 @@
 //! only after pinning the native invocation and execution domain. Abstract Unix
 //! sockets leave no pathname behind after crashes; both peers authenticate PIDs
 //! and UIDs, and the runner also verifies the helper's native cgroup placement.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use nix::{
     sys::socket::{getsockopt, sockopt::PeerCredentials},
     unistd::geteuid,
@@ -93,9 +93,13 @@ impl StartupBarrier {
                 );
                 stream.set_write_timeout(Some(Duration::from_millis(100)))?;
                 stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-                stream.write_all(format!("{main_pid}\n{group}\n").as_bytes())?;
+                stream
+                    .write_all(format!("{main_pid}\n{group}\n").as_bytes())
+                    .context("write host runner native identity challenge")?;
                 let mut response = [0];
-                stream.read_exact(&mut response)?;
+                stream
+                    .read_exact(&mut response)
+                    .context("read host runner native identity acknowledgement")?;
                 ensure!(
                     response == [1],
                     "host runner rejected native startup identity"
@@ -329,5 +333,50 @@ mod tests {
         let helper = UnixStream::connect_addr(&address(barrier.name()).unwrap()).unwrap();
         drop(helper);
         assert!(barrier.release(std::process::id(), group).is_err());
+    }
+
+    #[test]
+    fn host_handshake_rejection_retains_stage_and_socket_cause() {
+        let root = crate::test_support::scratch_dir("amc-host-handshake-error");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let placement = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let group = placement
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        for reject in [false, true] {
+            let path = root.join(format!("{reject}.socket"));
+            let barrier = StartupBarrier::host_runner(path.clone()).unwrap();
+            let mut stream = UnixStream::connect(&path).unwrap();
+            let helper = std::thread::spawn(move || {
+                let mut challenge = Vec::new();
+                let mut byte = [0];
+                while challenge.iter().filter(|b| **b == b'\n').count() < 2 {
+                    stream.read_exact(&mut byte).unwrap();
+                    challenge.push(byte[0]);
+                }
+                if reject {
+                    stream.write_all(&[0]).unwrap();
+                }
+            });
+            let error = format!(
+                "{:#}",
+                barrier.release(std::process::id(), group).unwrap_err()
+            );
+            helper.join().unwrap();
+            if reject {
+                assert!(
+                    error.contains("host runner rejected native startup identity"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains("read host runner native identity acknowledgement"),
+                    "{error}"
+                );
+                assert!(error.contains("failed to fill whole buffer"), "{error}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

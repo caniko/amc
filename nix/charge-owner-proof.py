@@ -220,6 +220,10 @@ def proof():
     os.close(write)
     try:
         assert os.read(read, 5) == b"ready"
+        # The target can still refault interpreter/stack pages charged to a/b.
+        # Freeze its current group before reclaim, and keep it frozen on migration.
+        (ROOT / "destination" / "cgroup.freeze").write_text("1")
+        wait(lambda: "frozen 1" in (ROOT / "destination" / "cgroup.events").read_text())
         for name in ("a", "b"):
             try:
                 (ROOT / name / "memory.reclaim").write_text(
@@ -237,8 +241,6 @@ def proof():
         before = {name: observe(ROOT / name) for name in ("a", "b", "destination")}
         assert before["destination"]["swap"] == 0, before
         # Freezing an mm does not prevent a privileged cgroup migration.
-        (ROOT / "destination" / "cgroup.freeze").write_text("1")
-        wait(lambda: "frozen 1" in (ROOT / "destination" / "cgroup.events").read_text())
         (ROOT / "moved" / "cgroup.freeze").write_text("1")
         (ROOT / "moved" / "cgroup.procs").write_text(str(pid))
         wait(lambda: "frozen 1" in (ROOT / "moved" / "cgroup.events").read_text())
