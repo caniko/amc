@@ -497,6 +497,16 @@ impl ClientRecord {
         self.startup_failure.borrow().clone()
     }
 
+    /// Preserve collection diagnostics before the startup loaded-state filter.
+    /// Collection alone still cannot release startup or establish cleanup.
+    fn startup_loaded(&self, state: &UnitState, observed: bool, startup_released: bool) -> bool {
+        if !state.loaded && self.startup.is_some() && observed && !startup_released {
+            self.startup_failure
+                .replace(Some(StartupFailure::ManagerIdentityChanged));
+        }
+        state.loaded
+    }
+
     fn release_startup(
         &self,
         barrier: &StartupBarrier,
@@ -673,7 +683,11 @@ pub fn execute(
                 // domain cannot be observed) is Unknown, not Completed.
                 // Workload status comes from the manager; the client code is
                 // only a fallback when the manager is silent.
-                match query(startup_wait_required(detached, started).then_some(deadline)) {
+                match query(startup_wait_required(detached, started).then_some(deadline)).inspect(
+                    |state| {
+                        record.startup_loaded(state, observed.is_some(), startup_released);
+                    },
+                ) {
                     Some(state)
                         if (!startup_wait_required(detached, started)
                             || Instant::now() < deadline)
@@ -717,7 +731,9 @@ pub fn execute(
             }
         }
         if !started && Instant::now() >= next_query {
-            if let Some(state) = query(Some(deadline)).filter(|state| state.loaded) {
+            if let Some(state) = query(Some(deadline))
+                .filter(|state| record.startup_loaded(state, observed.is_some(), startup_released))
+            {
                 if Instant::now() >= deadline {
                     continue;
                 }
@@ -1482,6 +1498,44 @@ printf 'LoadState=loaded\nExecMainStartTimestampMonotonic=1\nActiveState=inactiv
         assert!(!detail.is_empty() && detail.chars().count() <= 1024);
         assert!(detail.contains("Broken pipe"), "{detail}");
         assert!(!record.submitted() && !record.settled());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collected_startup_records_identity_loss_only_for_a_pinned_pending_barrier() {
+        use crate::test_support::{scratch_dir, show_manager};
+        let root = scratch_dir("amc-collected-startup-refusal");
+        let manager = show_manager(
+            &root,
+            "printf 'LoadState=not-found\nActiveState=inactive\n'",
+        );
+        let state = query_state(&manager, "app-amc-collected.service").unwrap();
+        assert!(!state.loaded && state.stopped);
+        for startup in [false, true] {
+            for observed in [false, true] {
+                for startup_released in [false, true] {
+                    let record = if startup {
+                        ClientRecord::with_startup(
+                            StartupBarrier::new(format!(
+                                "amc-start-collected-{}",
+                                std::process::id()
+                            ))
+                            .unwrap(),
+                        )
+                    } else {
+                        ClientRecord::default()
+                    };
+                    assert!(!record.startup_loaded(&state, observed, startup_released));
+                    assert_eq!(
+                        record.startup_failure(),
+                        (startup && observed && !startup_released)
+                            .then_some(StartupFailure::ManagerIdentityChanged),
+                        "startup={startup} observed={observed} released={startup_released}"
+                    );
+                    assert!(!record.submitted() && !record.settled());
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
