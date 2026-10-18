@@ -266,11 +266,25 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
     let deadline = started + Duration::from_secs(45);
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let (store, mut discovery) = amc_admission::store::Store::open_discovery(state, boot.trim())?;
+    let mut checkpoint_time = Duration::ZERO;
+    let mut checkpoint = |discovery: &page_discovery::Discovery| {
+        let saving = Instant::now();
+        let result = store.save_discovery(discovery);
+        checkpoint_time += saving.elapsed();
+        result
+    };
     discovery.select(&policy);
-    store.save_discovery(&discovery)?;
+    checkpoint(&discovery)?;
     let mut returned = 0u64;
     let mut unproven = false;
     let mut sweep_complete = false;
+    let mut discovery_time = Duration::ZERO;
+    let mut admission_time = Duration::ZERO;
+    let mut read_time = Duration::ZERO;
+    let mut settlement_time = Duration::ZERO;
+    let mut settled_batches = 0u32;
+    let mut identity_resets = 0u32;
+    let mut mapping_resets = 0u32;
     // Durable cursors are progress hints, not a residency proof for the prefix
     // that a previous (possibly interrupted or failed) campaign visited.
     let mut sweep = page_discovery::Sweep::new(&discovery);
@@ -288,7 +302,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
                 let complete = sweep.wrap(frontier, current);
                 frontier = current;
                 discovery.wrap();
-                store.save_discovery(&discovery)?;
+                checkpoint(&discovery)?;
                 if complete && amc_admission::page_return::selected_return_bytes(&policy)? == 0 {
                     sweep_complete = true;
                     break;
@@ -329,7 +343,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
                     }
                 }
             }
-            store.save_discovery(&discovery)?;
+            checkpoint(&discovery)?;
             if discovery.active.is_none() {
                 continue;
             }
@@ -339,10 +353,12 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
             .as_mut()
             .context("missing process cursor")?;
         let pid = cursor.target.pid;
+        let probing = Instant::now();
         let target = (|| -> Result<_> {
             let start = amc_admission::host_native::process_start(pid)?;
             let identity = amc_admission::page_return::identity(pid, start, &policy)?;
             let layout = page_discovery::layout(pid)?;
+            identity_resets += u32::from(cursor.target != identity || cursor.layout != layout);
             cursor.revalidate(identity.clone(), layout);
             let memory = amc_admission::page_return::open_memory(&identity)?;
             let pagemap = amc_admission::page_return::open_pagemap(&identity)?;
@@ -352,40 +368,46 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
             );
             Ok((memory, pagemap))
         })();
+        discovery_time += probing.elapsed();
         let (memory, pagemap) = match target {
             Ok(target) => target,
             Err(_) => {
                 eprintln!("page return: native target identity or mm is unproven");
                 unproven = true;
                 discovery.finish_process();
-                store.save_discovery(&discovery)?;
+                checkpoint(&discovery)?;
                 continue;
             }
         };
+        let scanning = Instant::now();
+        let mappings = cursor.maps_fingerprint;
         let range = page_discovery::scan(cursor, &pagemap, policy.batch_bytes);
+        discovery_time += scanning.elapsed();
+        mapping_resets += u32::from(mappings.is_some() && mappings != cursor.maps_fingerprint);
         let (address, bytes) = match range {
             Ok(Scan::Range { address, bytes }) => (address, bytes),
             Ok(Scan::More) => {
-                store.save_discovery(&discovery)?;
+                checkpoint(&discovery)?;
                 continue;
             }
             Ok(Scan::Complete) => {
                 discovery.finish_process();
-                store.save_discovery(&discovery)?;
+                checkpoint(&discovery)?;
                 continue;
             }
             Err(_) => {
                 eprintln!("page return: native mapping discovery is unproven");
                 unproven = true;
                 discovery.finish_process();
-                store.save_discovery(&discovery)?;
+                checkpoint(&discovery)?;
                 continue;
             }
         };
         let target = cursor.target.clone();
         // Persist the first unread page. A wait, interruption or lost reply
         // must revisit this range instead of dropping the return obligation.
-        store.save_discovery(&discovery)?;
+        checkpoint(&discovery)?;
+        let admitting = Instant::now();
         let reply = call(
             socket,
             &Request::AcquirePageReturn {
@@ -396,6 +418,7 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
                 bytes,
             },
         )?;
+        admission_time += admitting.elapsed();
         if !reply.granted {
             eprintln!("page return waiting: {:?}", reply.waiting);
             return Ok(75);
@@ -411,22 +434,27 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
                         .layout,
             "native target changed after page return admission"
         );
+        let reading = Instant::now();
         amc_admission::page_return::read_batch(&memory, address, bytes)?;
         let resident = amc_admission::page_return::range_resident(&pagemap, address, bytes)?;
+        read_time += reading.elapsed();
+        let settling = Instant::now();
         thread::sleep(Duration::from_millis(10));
         let reply = call(socket, &Request::FinishPageReturn { version: 1 })?;
+        settlement_time += settling.elapsed();
         if !resident || reply.resident_bytes != Some(bytes) {
             eprintln!("page return stalled: batch residency is unproven");
             return Ok(75);
         }
         drop(memory);
         returned = returned.saturating_add(bytes);
+        settled_batches += 1;
         discovery
             .active
             .as_mut()
             .context("missing settled cursor")?
             .address = address + bytes;
-        store.save_discovery(&discovery)?;
+        checkpoint(&discovery)?;
     }
     let remaining = amc_admission::page_return::selected_return_bytes(&policy)?;
     sweep_complete &= page_discovery::frontier(&policy)? == frontier;
@@ -440,6 +468,14 @@ fn return_pages(socket: &Path, state: &Path, policy: RecoveryPolicy) -> Result<i
         discovery.after_pid,
         discovery.active.as_ref().map(|cursor| cursor.target.pid),
         discovery.active.as_ref().map(|cursor| cursor.address),
+    );
+    eprintln!(
+        "page return costs: discovery_us={} checkpoint_us={} admission_us={} read_us={} settlement_us={} settled_batches={settled_batches} identity_resets={identity_resets} mapping_resets={mapping_resets}",
+        discovery_time.as_micros(),
+        checkpoint_time.as_micros(),
+        admission_time.as_micros(),
+        read_time.as_micros(),
+        settlement_time.as_micros(),
     );
     // Partial progress, unreadable/unsupported pages and campaign cutoffs remain
     // stalled. The next timer can resume, but this invocation did not complete.
