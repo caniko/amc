@@ -71,6 +71,22 @@ pub fn target_usage(target: &Identity) -> Result<crate::swap::SwapUsage> {
     Ok(usage)
 }
 
+/// Slot occupancy is independent of the conditionally flushed cache counters.
+/// It is diagnostic, not proof of the guarded range's ownership or residency.
+pub fn target_swap_bytes(target: &Identity) -> Result<u64> {
+    let directory = crate::native::cgroup_directory(&target.cgroup)?;
+    ensure!(
+        fs::metadata(&directory)?.ino() == target.inode,
+        "page return cgroup changed"
+    );
+    let bytes = crate::swap::cgroup_swap_bytes(&directory)?;
+    ensure!(
+        fs::metadata(&directory)?.ino() == target.inode,
+        "page return cgroup changed"
+    );
+    Ok(bytes)
+}
+
 pub fn native_headroom(target: &Identity, claims: &[Reservation], bytes: u64) -> Result<bool> {
     native_headroom_at(Path::new("/sys/fs/cgroup"), target, claims, bytes)
 }
@@ -148,22 +164,25 @@ fn charge_owner_headroom_with_budget_at(
             "native charge-owner inventory incomplete: group/time bound exceeded"
         );
         *remaining -= 1;
-        if directory != root && directory.join("memory.swap.current").exists() {
-            // Occupied slots already resident in swap cache need no new RAM.
-            // Require the same stable accounting proof as device recovery.
-            if crate::swap::cgroup_usage(directory)?.return_bytes() > 0 {
-                let owner = Identity {
-                    uid: 0,
-                    pid: 0,
-                    start_ticks: 0,
-                    inode: fs::metadata(directory)?.ino(),
-                    cgroup: format!("/{}", directory.strip_prefix(root)?.display()),
-                };
-                // Hierarchical charge observations may overlap, but every one
-                // gets an independent conservative feasibility check.
-                if !native_headroom_at(root, &owner, claims, bytes)? {
-                    return Ok(false);
-                }
+        if directory != root
+            && directory.join("memory.swap.current").exists()
+            && crate::swap::cgroup_swap_bytes(directory)? > 0
+        {
+            let owner = Identity {
+                uid: 0,
+                pid: 0,
+                start_ticks: 0,
+                inode: fs::metadata(directory)?.ino(),
+                cgroup: format!("/{}", directory.strip_prefix(root)?.display()),
+            };
+            // Hierarchical charge observations may overlap, but every one
+            // gets an independent conservative feasibility check.
+            // Back the complete batch first. Only a tight owner needs the
+            // strict accounting proof that all its slots are already RAM.
+            if !native_headroom_until(root, &owner, claims, bytes, deadline)?
+                && crate::swap::cgroup_usage(directory)?.return_bytes() > 0
+            {
+                return Ok(false);
             }
         }
         for entry in fs::read_dir(directory)? {
@@ -589,6 +608,35 @@ mod tests {
         fs::write(owner.join("memory.stat"), "swapcached 7\n").unwrap();
         assert!(!charge_owner_headroom_at(&root, &[], 2).unwrap());
         fs::write(owner.join("memory.stat"), "swapcached 9\n").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backed_page_owners_need_no_cache_credit_but_tight_owners_must_prove_it() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-backed-owner-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        let owner = root.join("owner");
+        fs::create_dir_all(&owner).unwrap();
+        for (name, value) in [
+            ("memory.max", "10"),
+            ("memory.current", "8"),
+            ("memory.swap.current", "8"),
+            ("memory.stat", "swapcached 9\n"),
+        ] {
+            fs::write(owner.join(name), value).unwrap();
+        }
+        assert!(crate::swap::cgroup_usage(&owner).is_err());
+        assert!(charge_owner_headroom_at(&root, &[], 2).unwrap());
+        fs::write(owner.join("memory.max"), "9").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 2).is_err());
+        fs::write(owner.join("memory.stat"), "swapcached 8\n").unwrap();
+        assert!(charge_owner_headroom_at(&root, &[], 2).unwrap());
+        fs::write(owner.join("memory.stat"), "swapcached 7\n").unwrap();
+        assert!(!charge_owner_headroom_at(&root, &[], 2).unwrap());
+        fs::write(owner.join("memory.swap.current"), "unknown").unwrap();
         assert!(charge_owner_headroom_at(&root, &[], 2).is_err());
         fs::remove_dir_all(root).unwrap();
     }
