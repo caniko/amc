@@ -27,6 +27,8 @@
 
 ### Changed
 
+- Wake the host broker on ready requests, replies and completed recovery
+  inventories instead of charging each turn an idle polling interval.
 - Resolve preparation authorization callbacks through the authenticated waiting
   process's pinned filesystem root. The broker retains `ProtectHome=yes` and
   hidden user-runtime/home paths, including late user starts, while connecting
@@ -47,7 +49,10 @@
   admission evidence.
 - Preserve bounded native startup refusal reasons in host-runner errors,
   distinguishing manager/cgroup identity loss from a socket-handshake failure.
+  Include missing manager identity fields and collection before startup release.
   The retained diagnostic does not change unknown cleanup or admission authority.
+- Back each possible page-return charge owner for the full batch before requiring
+  exact swap-cache accounting for the existing no-new-RAM exception.
 
 - Retain host admission and preparation client/helper journals when concurrent
   helper qualification times out, preserving the original phase assertions.
