@@ -763,7 +763,7 @@ pub fn serve_supervised(
             }
             None => {
                 if !connections.progress() {
-                    thread::sleep(Duration::from_millis(20));
+                    connections.wait(&listener, inventory.as_ref().map(|task| &task.completion))?;
                 }
             }
         }
@@ -777,6 +777,7 @@ pub fn serve_supervised(
 // live ledger; only the main loop may persist a freshly revalidated lease.
 struct PendingInventory {
     stream: UnixStream,
+    completion: UnixStream,
     request: Request,
     owner: crate::ledger::ClientIdentity,
     backing: Vec<u8>,
@@ -993,9 +994,13 @@ impl PendingInventory {
         let mut scan_ledger = ledger.clone();
         let health_file = health_file.map(Path::to_owned);
         let burst_evidence = burst_evidence.clone();
+        let (completion, notifier) = UnixStream::pair()?;
         let worker = thread::Builder::new()
             .name("amc-native-inventory".into())
             .spawn(move || {
+                // Closing this private peer wakes the broker even on error or
+                // panic. Readiness is notification, never grant evidence.
+                let _notifier = notifier;
                 let (inventory_proof, native_demand) =
                     if matches!(&scan_request, Request::AcquireRecovery { .. }) {
                         let spec = scan_policy
@@ -1076,6 +1081,7 @@ impl PendingInventory {
             })?;
         Ok(Self {
             stream,
+            completion,
             request,
             owner,
             backing,
@@ -2248,7 +2254,9 @@ mod tests {
         };
         let backing = inventory_backing(&ledger, &policy).unwrap();
         let (release, wait) = std::sync::mpsc::channel();
+        let (completion, notifier) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
+            let _notifier = notifier;
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
             Ok((
                 Response {
@@ -2262,6 +2270,7 @@ mod tests {
         });
         let mut pending = Some(PendingInventory {
             stream,
+            completion,
             request: Request::AcquireRecovery {
                 version: 1,
                 target: "swap".into(),
