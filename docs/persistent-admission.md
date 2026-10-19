@@ -139,6 +139,17 @@ An internal helper starts inside the native service and asks the coordinator to
 verify its peer PID, invocation, placement, and kernel limits **before exec**.
 Only a durably recorded entry acknowledgment permits the actual command to run.
 
+The native helper's host acquisition uses one two-second frame-exchange
+deadline, capped by the remaining resource wait. Stalled frame I/O checks
+cancellation every 50 ms; late grants cannot authorize execution after
+cancellation or wait expiry.
+The native helper retains signal handling through its private entry handshake
+and checks cancellation again before exec. Losing a grant reply never releases
+its reservation: native cleanup must still be verified. Socket connection itself
+is currently blocking, so cancellation under a full listen backlog is not yet
+bounded. This does not make host waits untimed or separate native startup from
+workload runtime; those remain independent qualification requirements.
+
 ## Failure and recovery
 
 - Queued and reserved tickets may expire or be cancelled. A late helper cannot

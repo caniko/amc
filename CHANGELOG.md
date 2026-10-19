@@ -34,6 +34,9 @@
 
 ### Fixed
 
+- Cancel stalled host-acquisition frames promptly, reject grants acknowledged
+  after the resource-wait deadline, and retain signal handling through native
+  entry so cancellation cannot be forgotten before payload execution.
 - Require bounded source selection for protected calls, cap host queue waits,
   and preserve native-entry grace only after a protected slot is reserved.
 - Retain original protected swap, CPU and task enforcement through retirement;
