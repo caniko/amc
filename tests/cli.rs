@@ -292,6 +292,7 @@ fn delayed_admission_grants_cannot_submit_after_the_client_deadline() {
                 deadline_ms: amc_admission::server::now_ms().unwrap() + 30_000,
                 identity: None,
                 client: None,
+                queue: None,
             };
             let (mut stream, _) = listener.accept().unwrap();
             stream
