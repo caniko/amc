@@ -61,6 +61,24 @@ amc admission exec --contract example --timeout 120 --runtime-max-sec 300 -- com
 survives client/coordinator death; native stop time is additional. It is omitted
 for long-lived servers unless explicitly requested.
 
+For bounded work, opt into a patient per-user resource queue:
+
+```sh
+amc exec --contract example --queue --max-ram-usage 64MiB --runtime-max-sec 300 -- command argument
+```
+
+`--queue` requires both ceilings. Without `--timeout`, resource waiting has no
+implicit expiry unless the selected protected pool caps it. Legacy calls still
+default to 120 seconds. A grant receives a fresh 30-second entry grace; native
+startup is bounded separately at 30 seconds. Full queues return typed
+backpressure with `retry_after_ms`, not an execution failure for accepted work.
+Status and cancellation remain available at the queue bound. Accepted tickets
+are not executable replay records: restart still discards unentered work.
+
+This does **not** complete host-wide queue patience or separate host admission
+from the native workload runtime clock. Those gates must pass before removing
+consumer lifetime slots or activating this as the default integration.
+
 ## Installation and removal
 
 The service is optional. The embeddable gates, `inspect`, `watch` and offline

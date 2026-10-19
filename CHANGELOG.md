@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in `amc exec --queue` and `amc admission exec --queue` for explicitly
+  memory- and runtime-bounded work, independent per-user queue/entry deadlines,
+  and typed queue backpressure with retry guidance.
 - Opt-in protected small-call pools with pre-accounted backing, separate queues,
   native resource/deadline bounds and ledger-safe restart and retirement.
 - Advance foreground preparation with durable drain barriers and once-only
