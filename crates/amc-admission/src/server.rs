@@ -1,7 +1,7 @@
 //! Single-writer coordinator. A native pre-exec handshake closes the late
 //! submission race: an expired reservation can never execute heavy work.
 use crate::{
-    ledger::{ClientIdentity, Decision, Ledger, Phase, Policy},
+    ledger::{Backpressure, ClientIdentity, Decision, Ledger, Phase, Policy},
     native::Native,
     protocol::{Message, Request, Response, Status, read_frame, write_frame},
     store::{Store, fresh_id, private_directory},
@@ -176,6 +176,7 @@ pub fn serve_with_host(
                     Ok(response) => response,
                     Err(error) => Response {
                         version: 1,
+                        backpressure: error.downcast_ref::<Backpressure>().cloned(),
                         error: Some(error.to_string()),
                         ..Response::default()
                     },
@@ -217,6 +218,20 @@ fn handle(
         ..Response::default()
     };
     match request.message {
+        Message::EnqueueWaiting { contract, request } => {
+            let id = fresh_id()?;
+            let client = client_identity(pid)?;
+            let key = fresh_id()?;
+            ensure!(
+                host_socket.is_some() || !policy.contracts.get(&contract).is_some_and(|c| c.burst),
+                "burst execution requires the shared host broker"
+            );
+            ledger.enqueue_waiting(id.clone(), &contract, policy, now_ms()?, request)?;
+            ledger.set_client(&id, client)?;
+            observations.entry_keys.insert(id.clone(), key.clone());
+            response.entry_key = Some(key);
+            response.entry = ledger.get(&id).cloned();
+        }
         Message::Enqueue {
             ref contract,
             wait_ms,
@@ -283,6 +298,7 @@ fn handle(
             response.entry = ledger.get(&id).cloned();
         }
         Message::Poll { id } => {
+            response.waiting = observations.waiting.get(&id).cloned();
             response.entry = Some(
                 ledger
                     .get(&id)

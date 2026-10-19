@@ -1,6 +1,6 @@
 //! Versioned, bounded local protocol. Entry carries a one-use capability;
 //! commands stay client-owned and capabilities are never included in status.
-use crate::ledger::{Decision, Entry};
+use crate::ledger::{Backpressure, Decision, Entry, QueueRequest};
 use anyhow::{Result, ensure};
 use nix::{
     errno::Errno,
@@ -27,6 +27,11 @@ pub struct Request {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
+    /// Resource waiting has no implicit expiry. Older coordinators fail closed.
+    EnqueueWaiting {
+        contract: String,
+        request: QueueRequest,
+    },
     Enqueue {
         contract: String,
         wait_ms: u64,
@@ -60,6 +65,10 @@ pub enum Message {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Response {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure: Option<Backpressure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<Decision>,
     /// Optional root broker; native helpers acquire host capacity before entry.
     #[serde(default)]
     pub host_socket: Option<std::path::PathBuf>,
@@ -234,6 +243,9 @@ pub fn call(socket: &Path, message: Message) -> Result<Response> {
         response.version == 1,
         "unsupported admission response version"
     );
+    if let Some(backpressure) = &response.backpressure {
+        return Err(backpressure.clone().into());
+    }
     if let Some(error) = &response.error {
         anyhow::bail!("{error}");
     }

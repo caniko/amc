@@ -1,6 +1,6 @@
 //! Production admission CLI. The native entry handshake gates execution.
 use amc_admission::{
-    ledger::{Phase, Policy},
+    ledger::{Phase, Policy, QueueRequest},
     native::Systemd,
     protocol::{Message, call},
     server,
@@ -72,9 +72,12 @@ pub enum AdmissionCommand {
         socket: Option<PathBuf>,
         #[arg(long)]
         contract: String,
-        /// Maximum admission wait; does not bound workload execution.
-        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout: u64,
+        /// Maximum admission wait; defaults to 120s unless --queue is selected.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+        /// Queue bounded work without an implicit resource-wait deadline.
+        #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"])]
+        queue: bool,
         /// Optional systemd execution deadline for a disposable job, in seconds.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
         runtime_max_sec: Option<u64>,
@@ -225,33 +228,48 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             socket,
             contract,
             timeout,
+            queue,
             runtime_max_sec,
             burst,
             max_ram_usage,
             protected_pool,
             command,
         } => {
-            let request = match (max_ram_usage, protected_pool) {
-                (Some(memory_max), true) => Message::EnqueueBounded {
+            let wait = timeout.or((!queue).then_some(120));
+            let wait_ms = timeout.unwrap_or(120) * 1000;
+            let request = if queue {
+                Message::EnqueueWaiting {
                     contract,
-                    wait_ms: timeout * 1000,
-                    memory_max,
-                    runtime_max_sec: runtime_max_sec
-                        .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
-                },
-                (Some(memory_max), false) => Message::EnqueueSized {
-                    contract,
-                    wait_ms: timeout * 1000,
-                    memory_max,
-                },
-                (None, _) => Message::Enqueue {
-                    contract,
-                    wait_ms: timeout * 1000,
-                },
+                    request: QueueRequest {
+                        memory_max: max_ram_usage.ok_or_else(|| {
+                            anyhow::anyhow!("queued work requires a memory ceiling")
+                        })?,
+                        runtime_max_sec: runtime_max_sec.ok_or_else(|| {
+                            anyhow::anyhow!("queued work requires an execution deadline")
+                        })?,
+                        wait_ms: wait.map(|seconds| seconds * 1000),
+                    },
+                }
+            } else {
+                match (max_ram_usage, protected_pool) {
+                    (Some(memory_max), true) => Message::EnqueueBounded {
+                        contract,
+                        wait_ms,
+                        memory_max,
+                        runtime_max_sec: runtime_max_sec
+                            .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
+                    },
+                    (Some(memory_max), false) => Message::EnqueueSized {
+                        contract,
+                        wait_ms,
+                        memory_max,
+                    },
+                    (None, _) => Message::Enqueue { contract, wait_ms },
+                }
             };
             run(
                 &socket_path(socket)?,
-                timeout,
+                wait.map(Duration::from_secs),
                 runtime_max_sec,
                 burst,
                 request,
@@ -329,7 +347,7 @@ fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
 
 fn run(
     socket: &Path,
-    timeout: u64,
+    wait: Option<Duration>,
     runtime_max_sec: Option<u64>,
     burst: bool,
     request: Message,
@@ -337,7 +355,7 @@ fn run(
 ) -> Result<i32> {
     use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let deadline = wait.map(|wait| Instant::now() + wait);
     let response = call(socket, request)?;
     let host_socket = response.host_socket;
     if let Some(host_socket) = &host_socket
@@ -368,7 +386,9 @@ fn run(
     };
     let short_call = burst || entry.contract.protected_pool.is_some();
     while entry.phase == Phase::Queued {
-        if signals.cancelled().is_some() || Instant::now() >= deadline {
+        if signals.cancelled().is_some()
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
             let _ = call(socket, Message::Cancel { id: entry.id });
             anyhow::bail!("admission cancelled or timed out before submission");
         }
@@ -405,7 +425,7 @@ fn run(
         "OOMPolicy=kill".into(),
         "KillMode=control-group".into(),
         "Restart=no".into(),
-        format!("TimeoutStartSec={}s", timeout + 30),
+        "TimeoutStartSec=30s".into(),
         format!("TimeoutStopSec={}s", if short_call { 1 } else { 15 }),
     ] {
         client.arg(format!("--property={property}"));
@@ -457,7 +477,8 @@ fn run(
     client.arg("--").args(argv);
     // A reservation reply can arrive after the client's wait has expired.
     // The coordinator's extra entry grace must not authorize a late submission.
-    if signals.cancelled().is_some() || Instant::now() >= deadline {
+    if signals.cancelled().is_some() || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
         let _ = call(
             socket,
             Message::Cancel {

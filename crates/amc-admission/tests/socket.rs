@@ -144,6 +144,72 @@ fn enqueue(socket: PathBuf) -> (Entry, String) {
 }
 
 #[test]
+fn waiting_submission_reports_backpressure_and_keeps_status_and_cancel_available() {
+    use amc_admission::ledger::{Backpressure, QueueRequest};
+    let root = std::env::temp_dir().join(format!("amc-waiting-{}", fresh_id().unwrap()));
+    let socket = root.join("run/admission.sock");
+    let done = Arc::new(AtomicBool::new(false));
+    let server = start(&root, done.clone(), Arc::new(AtomicBool::new(false)));
+    wait(|| call(&socket, Message::Status).is_ok());
+    let submit = || {
+        call(
+            &socket,
+            Message::EnqueueWaiting {
+                contract: "tool".into(),
+                request: QueueRequest {
+                    memory_max: 600,
+                    runtime_max_sec: 120,
+                    wait_ms: None,
+                },
+            },
+        )
+    };
+    let mut ids = Vec::new();
+    for _ in 0..policy().queue_limit {
+        let reply = submit().unwrap();
+        assert!(reply.entry_key.is_some());
+        let entry = reply.entry.unwrap();
+        assert_eq!(entry.queue.unwrap().deadline_ms, None);
+        ids.push(entry.id);
+    }
+    let refusal = submit().unwrap_err();
+    assert_eq!(
+        refusal
+            .downcast_ref::<Backpressure>()
+            .unwrap()
+            .retry_after_ms,
+        250
+    );
+    let start = Instant::now();
+    let status = call(&socket, Message::Status).unwrap().status.unwrap();
+    assert_eq!(status.entries.len(), policy().queue_limit);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    wait(|| {
+        call(&socket, Message::Poll { id: ids[1].clone() })
+            .unwrap()
+            .waiting
+            .is_some()
+    });
+    let reply = call(&socket, Message::Poll { id: ids[1].clone() }).unwrap();
+    assert!(reply.entry_key.is_none());
+    assert_eq!(reply.entry.unwrap().phase, Phase::Queued);
+    call(&socket, Message::Cancel { id: ids[1].clone() }).unwrap();
+    assert_eq!(
+        call(&socket, Message::Status)
+            .unwrap()
+            .status
+            .unwrap()
+            .entries
+            .len(),
+        ids.len() - 1
+    );
+    assert!(submit().is_ok());
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn independent_socket_clients_and_restart_keep_live_reservations() {
     let root = std::env::temp_dir().join(format!("amc-ipc-{}", fresh_id().unwrap()));
     let socket = root.join("run/admission.sock");
