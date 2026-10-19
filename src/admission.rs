@@ -267,9 +267,12 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
         } => {
             // Authorization is persisted before this reply. If the reply is
             // lost, nothing executes and native reconciliation retires us.
+            let signals = host_socket
+                .as_ref()
+                .map(|_| crate::control::Signals::install())
+                .transpose()?;
             let mut continuation = None;
             if let Some(host_socket) = host_socket {
-                let signals = crate::control::Signals::install()?;
                 let remaining = call(&socket, Message::Poll { id: ticket.clone() })?
                     .entry
                     .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
@@ -279,8 +282,15 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 continuation = amc_admission::host_server::acquire(
                     &host_socket,
                     Duration::from_millis(remaining),
-                    || signals.cancelled().is_some(),
+                    || {
+                        signals
+                            .as_ref()
+                            .is_some_and(|signals| signals.cancelled().is_some())
+                    },
                 )?;
+            }
+            if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
+                return Ok(128 + signal);
             }
             call(
                 &socket,
@@ -295,6 +305,9 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 payload.env("AMC_CONTINUATION", serde_json::to_string(&continuation)?);
             } else {
                 payload.env_remove("AMC_CONTINUATION");
+            }
+            if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
+                return Ok(128 + signal);
             }
             Err(payload.exec())
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))

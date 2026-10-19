@@ -2,7 +2,7 @@
 use crate::{
     host::{HostLedger, HostPolicy, Identity, Reservation, WaitReason},
     host_native,
-    protocol::{read_frame, write_frame},
+    protocol::{read_frame_cancellable, write_frame_cancellable},
     store::{Store, fresh_id, private_directory},
 };
 use anyhow::{Result, ensure};
@@ -151,6 +151,10 @@ pub struct Response {
 }
 
 pub fn call(socket: &Path, request: &Request) -> Result<Response> {
+    exchange(connect(socket)?, request)
+}
+
+fn connect(socket: &Path) -> Result<UnixStream> {
     let metadata = fs::symlink_metadata(socket)?;
     ensure!(
         metadata.uid() == 0,
@@ -161,10 +165,18 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response> {
         getsockopt(&stream, PeerCredentials)?.uid() == 0,
         "host admission peer must be root"
     );
-    exchange(stream, request)
+    Ok(stream)
 }
 
-fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
+fn exchange(stream: UnixStream, request: &Request) -> Result<Response> {
+    exchange_cancellable(stream, request, None)
+}
+
+fn exchange_cancellable(
+    mut stream: UnixStream,
+    request: &Request,
+    control: Option<(Instant, &dyn Fn() -> bool)>,
+) -> Result<Response> {
     let timeout = match request {
         Request::AcquirePageReturn { .. } | Request::AcquireRecovery { .. } => {
             Duration::from_secs(90)
@@ -173,8 +185,8 @@ fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
     };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    write_frame(&mut stream, request)?;
-    let response: Response = read_frame(&mut stream)?;
+    write_frame_cancellable(&mut stream, request, control)?;
+    let response: Response = read_frame_cancellable(&mut stream, control)?;
     ensure!(response.version == 1, "unsupported host admission response");
     if let Some(error) = &response.error {
         anyhow::bail!("{error}");
@@ -224,8 +236,11 @@ pub fn acquire(
             .saturating_duration_since(Instant::now())
             .as_millis()
             .min(3_600_000) as u64;
-        let reply = call(
-            socket,
+        // A resource wait cannot inherit a fresh transport budget for each frame.
+        // A grant whose acknowledgement is lost remains held until native cleanup.
+        let rpc_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        let reply = exchange_cancellable(
+            connect(socket)?,
             &Request::Acquire {
                 version: 1,
                 wait_ms: left.max(1),
@@ -234,7 +249,12 @@ pub fn acquire(
                     .map(|value| serde_json::from_str(&value))
                     .transpose()?,
             },
+            Some((rpc_deadline, &stopping)),
         )?;
+        ensure!(
+            !stopping() && Instant::now() < deadline,
+            "host admission cancelled or timed out"
+        );
         if reply.granted {
             return Ok(reply.continuation);
         }
@@ -1942,6 +1962,91 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{read_frame, write_frame};
+
+    #[test]
+    fn controlled_exchange_rejects_grants_after_a_wait_deadline_or_cancellation() {
+        for cancelled in [false, true] {
+            let (client, mut broker) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                let request: Request = read_frame(&mut broker).unwrap();
+                assert!(matches!(request, Request::Acquire { .. }));
+                thread::sleep(Duration::from_millis(400));
+                let _ = write_frame(
+                    &mut broker,
+                    &Response {
+                        version: 1,
+                        granted: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            let start = Instant::now();
+            let stopping = || cancelled && start.elapsed() >= Duration::from_millis(50);
+            let result = exchange_cancellable(
+                client,
+                &Request::Acquire {
+                    version: 1,
+                    wait_ms: 100,
+                    continuation: None,
+                },
+                Some((
+                    start + Duration::from_millis(if cancelled { 2000 } else { 100 }),
+                    &stopping,
+                )),
+            );
+            let elapsed = start.elapsed();
+            worker.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if cancelled {
+                    "cancelled"
+                } else {
+                    "deadline exceeded"
+                }),
+                "{error}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(250),
+                "{cancelled}: {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_exchange_still_validates_granted_responses() {
+        for (version, error) in [(1, None), (2, None), (1, Some("refused"))] {
+            let (client, mut broker) = UnixStream::pair().unwrap();
+            let valid = version == 1 && error.is_none();
+            let worker = thread::spawn(move || {
+                let _: Request = read_frame(&mut broker).unwrap();
+                write_frame(
+                    &mut broker,
+                    &Response {
+                        version,
+                        granted: true,
+                        error: error.map(str::to_owned),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            });
+            let result = exchange_cancellable(
+                client,
+                &Request::Acquire {
+                    version: 1,
+                    wait_ms: 1000,
+                    continuation: None,
+                },
+                Some((Instant::now() + Duration::from_secs(2), &|| false)),
+            );
+            worker.join().unwrap();
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if valid {
+                assert!(result.unwrap().granted);
+            }
+        }
+    }
 
     #[test]
     fn startup_reconciles_dead_children_before_reusing_a_pool_name() {
