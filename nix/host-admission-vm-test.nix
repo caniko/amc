@@ -238,7 +238,18 @@ in
         virtualisation.emptyDiskImages = [512];
         virtualisation.cores = 2;
       };
-      testScript = builtins.readFile ./host-admission-vm-test.py + "\n" + builtins.readFile ./charge-owner-vm-test.py + "\n" + builtins.readFile ./completion-vm-test.py;
+      testScript =
+        builtins.readFile ./host-admission-vm-test.py
+        + "\n"
+        + builtins.readFile ./charge-owner-vm-test.py
+        + "\n"
+        + builtins.readFile ./completion-vm-test.py
+        + ''
+
+          with subtest("private entry never executes a payload after cancellation during its acknowledgement"):
+              receipt = json.loads(machine.succeed("python3 ${../tests/admission-entry-cancellation.py} ${package}/bin/amc"))
+              assert receipt == {"success": 0, "SIGINT": 130, "SIGTERM": 143}, receipt
+        '';
     }).overrideTestDerivation (previous:
       assert pkgs.lib.hasInfix "-o $out" previous.buildCommand; {
         buildCommand = builtins.replaceStrings ["-o $out"] ["-o $out --junit-xml junit.xml"] previous.buildCommand;
