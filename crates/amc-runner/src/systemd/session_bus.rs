@@ -12,15 +12,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Whether `/proc/self/uid_map` is the identity map of the initial user namespace.
+fn initial_namespace(uid_map: &str) -> bool {
+    uid_map.split_whitespace().eq(["0", "0", "4294967295"])
+}
+
 /// A busctl command for `uid`'s session bus, with the runtime directory its
-/// address resolves beneath when the caller is root.
+/// address resolves beneath when the caller is the host root.
 fn command(uid: u32) -> Option<(Command, Option<File>)> {
     let mut command = Command::new("busctl");
     let mut address = format!("unix:path=/run/user/{uid}/bus");
     let mut runtime = None;
     // A user bus authenticates the connecting UID, not the socket's pathname.
     // Drop credentials in this child only; the broker retains its authority.
-    if geteuid().is_root() {
+    // A user-namespace root (a namespaced host-runner caller) already connects
+    // as its outer UID and can neither switch to it nor read init's root.
+    if geteuid().is_root()
+        && initial_namespace(&std::fs::read_to_string("/proc/self/uid_map").ok()?)
+    {
         let user = User::from_uid(Uid::from_raw(uid)).ok()??;
         command.gid(user.gid.as_raw()).uid(uid);
         // ProtectHome=yes hides /run/user from the host broker; exposing it
@@ -313,6 +322,14 @@ fn await_cleanup(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_the_initial_namespace_root_pins_the_owner_runtime() {
+        assert!(initial_namespace("         0          0 4294967295\n"));
+        // bwrap --unshare-user --uid 0 and unshare --map-root-user.
+        assert!(!initial_namespace("         0       1000          1\n"));
+        assert!(!initial_namespace(""));
+    }
 
     #[test]
     fn service_property_queries_reject_foreign_units_before_connecting() {
