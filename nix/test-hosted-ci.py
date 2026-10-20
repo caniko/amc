@@ -240,7 +240,7 @@ class NativeEvidenceTests(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "test_section"
         }
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         self.assertEqual(names, hosted.PROTECTED_POOL_CASES)
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "junit.xml"

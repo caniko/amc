@@ -62,6 +62,7 @@ SUPERVISION_CASES = {
     "different native domains exhaust the host budget without forgiving attempts",
 }
 PROTECTED_POOL_CASES = {
+    "native deadline observations see user buses but cannot read homes or write runtime files",
     "idle protected backing survives broker restart",
     "full ordinary budget and queues leave both protected users available",
     "occupied protected restart preserves identity and native deadline without replay",
