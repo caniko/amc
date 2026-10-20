@@ -229,6 +229,18 @@ class GuardCleanupTests(unittest.TestCase):
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_patient_queue_matrix_requires_every_native_case(self):
+        tree = ast.parse((hosted.ROOT / "nix/queued-admission-vm-test.py").read_text())
+        names = {
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "test_section"
+        }
+        self.assertTrue(names)
+        self.assertLessEqual(names, hosted.NATIVE_CASES)
+
     def test_protected_pool_matrix_requires_every_native_case_and_rejects_failures(self):
         installable = ".#nixosTests.x86_64-linux.protected-pool"
         self.assertIn(installable, hosted.ALLOWED)

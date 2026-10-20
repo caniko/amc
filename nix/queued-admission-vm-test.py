@@ -1,4 +1,16 @@
+import json
+import shlex
 import time
+
+# Appended after the shared driver; require its initialized native fixture.
+machine = globals()["machine"]
+test_section = globals()["test_section"]
+wait_committed = globals()["wait_committed"]
+launch = globals()["launch"]
+wait_entered = globals()["wait_entered"]
+status = globals()["status"]
+stop_scope = globals()["stop_scope"]
+evidence = globals()["evidence"]
 
 ready_token = "0123456789abcdef0123456789abcdef"
 
@@ -28,6 +40,51 @@ def launch_patient(name, timeout=None):
     entries = queued_status()["entries"]
     assert len(entries) == 1 and entries[0]["phase"] == "starting", entries
     return entries[0]
+
+
+with test_section("native patient queue overflow is typed and preserves every accepted ticket"):
+    wait_committed(0)
+    assert not queued_status()["entries"]
+    receipt = json.loads(machine.succeed("runuser -u bob -- python3 - <<'PY'\n" + """
+import json
+import socket
+from pathlib import Path
+
+def rpc(op, **fields):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        client.connect('/run/user/1001/amc/admission.sock')
+        client.sendall((json.dumps({'version': 1, 'message': {'op': op, **fields}}) + '\\n').encode())
+        with client.makefile('rb') as stream:
+            return json.loads(stream.readline(262145))
+
+policy = json.loads(Path('/etc/amc-test-user-policy.json').read_text())
+request = {'memory_max': 96 * 1048576, 'runtime_max_sec': 2, 'wait_ms': None}
+accepted = []
+try:
+    for _ in range(policy['queue_limit']):
+        response = rpc('enqueue_waiting', contract='tool', request=request)
+        assert response['error'] is None and response.get('entry_key'), response
+        accepted.append(response['entry']['id'])
+    for _ in range(3):
+        response = rpc('enqueue_waiting', contract='tool', request=request)
+        assert response.get('backpressure') == {'retry_after_ms': 250}, response
+        assert response.get('entry') is None and response.get('entry_key') is None, response
+        entries = rpc('status')['status']['entries']
+        assert {entry['id'] for entry in entries} == set(accepted), entries
+        assert all(entry['identity'] is None for entry in entries), entries
+    invalid = rpc('enqueue_waiting', contract='tool', request={**request, 'memory_max': 128 * 1048576})
+    assert invalid['error'] and invalid.get('backpressure') is None and invalid.get('entry') is None, invalid
+    print(json.dumps({'accepted': len(accepted), 'overflowAttempts': 3, 'retryAfterMs': 250}))
+finally:
+    for ticket in accepted:
+        response = rpc('cancel', id=ticket)
+        assert response['error'] is None, response
+""" + "\nPY"))
+    assert receipt == {"accepted": 16, "overflowAttempts": 3, "retryAfterMs": 250}, receipt
+    assert not queued_status()["entries"]
+    wait_committed(0)
+    evidence["patientQueueOverflow"] = receipt
 
 
 with test_section("patient host waiting exceeds 120 seconds without spending native execution time"):
