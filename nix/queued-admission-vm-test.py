@@ -1,5 +1,7 @@
 import time
 
+ready_token = "0123456789abcdef0123456789abcdef"
+
 
 def queued_status():
     return json.loads(machine.succeed(
@@ -10,8 +12,10 @@ def queued_status():
 def launch_patient(name, timeout=None):
     machine.succeed(
         f"systemd-run --unit={name}-client --uid=1001 "
+        f"--property=StandardError=file:/tmp/{name}-stderr "
         "--setenv=PATH=/run/current-system/sw/bin --setenv=XDG_RUNTIME_DIR=/run/user/1001 -- "
         "amc admission exec --contract tool --queue --max-ram-usage 96MiB --runtime-max-sec 2 "
+        f"--ready-token {ready_token} "
         + (f"--timeout {timeout} " if timeout else "")
         + "-- /bin/sh -c "
         + shlex.quote(f"touch /tmp/{name}-entered; sleep .25; touch /tmp/{name}-completed")
@@ -48,6 +52,7 @@ with test_section("patient host waiting exceeds 120 seconds without spending nat
     machine.sleep(125)
     assert queued_status()["entries"][0]["phase"] == "starting"
     machine.fail("test -e /tmp/patient-long-entered")
+    assert machine.succeed("cat /tmp/patient-long-stderr") == ""
     machine.succeed("touch /tmp/patient-blocker-finish")
     wait_entered("patient-long")
     machine.wait_until_succeeds("test -e /tmp/patient-long-completed", timeout=15)
@@ -56,6 +61,7 @@ with test_section("patient host waiting exceeds 120 seconds without spending nat
         '&& test "$(systemctl show patient-long-client --property=ActiveState --value)" = inactive', timeout=15,
     )
     wait_committed(0)
+    assert machine.succeed("cat /tmp/patient-long-stderr") == f"\x1e{ready_token}\x1f"
     evidence["patientQueue"] = {"waitSeconds": 125, "runtimeSeconds": 2,
         "controlP95Seconds": p95, "completed": True}
 
@@ -80,6 +86,7 @@ with test_section("finite host waiting, cancellation and private restart never r
             ), timeout=30,
         )
         machine.fail(f"test -e /tmp/{name}-entered")
+        assert ready_token not in machine.succeed(f"cat /tmp/{name}-stderr")
         machine.execute(f"systemctl stop {name}-client")
     machine.succeed("systemctl stop patient-cleanup-blocker-client")
     for grant in status()["reservations"]:

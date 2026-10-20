@@ -53,6 +53,7 @@ pub fn execute(arguments: ExecArgs) -> Result<i32> {
             }),
             timeout: arguments.timeout,
             queue: arguments.queue,
+            ready_token: None,
             runtime_max_sec: arguments.runtime_max_sec,
             burst: arguments.burst,
             max_ram_usage: arguments.max_ram_usage,

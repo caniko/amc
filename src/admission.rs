@@ -11,7 +11,7 @@ use clap::Subcommand;
 use std::{
     ffi::OsString,
     fs::File,
-    io::Read,
+    io::{Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
@@ -78,6 +78,9 @@ pub enum AdmissionCommand {
         /// Queue bounded work without an implicit resource-wait deadline.
         #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"])]
         queue: bool,
+        /// Emit RS/token/US on stderr after native entry, immediately before exec.
+        #[arg(long, value_parser = parse_ready_token)]
+        ready_token: Option<String>,
         /// Optional systemd execution deadline for a disposable job, in seconds.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
         runtime_max_sec: Option<u64>,
@@ -106,6 +109,8 @@ pub enum AdmissionCommand {
         /// Patient native startup uses notify readiness, not exec readiness.
         #[arg(long)]
         queue: bool,
+        #[arg(long, value_parser = parse_ready_token)]
+        ready_token: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -232,6 +237,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             contract,
             timeout,
             queue,
+            ready_token,
             runtime_max_sec,
             burst,
             max_ram_usage,
@@ -277,6 +283,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 burst,
                 request,
                 &command,
+                ready_token.as_deref(),
             )
         }
         AdmissionCommand::Enter {
@@ -285,6 +292,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             entry_key,
             host_socket,
             queue,
+            ready_token,
             command,
         } => {
             // Authorization is persisted before this reply. If the reply is
@@ -376,6 +384,12 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
                 return Ok(128 + signal);
             }
+            if let Some(token) = ready_token {
+                std::io::stderr()
+                    .lock()
+                    .write_all(format!("\x1e{token}\x1f").as_bytes())
+                    .context("notify caller of native entry")?;
+            }
             Err(payload.exec())
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
@@ -401,6 +415,7 @@ fn run(
     burst: bool,
     request: Message,
     argv: &[OsString],
+    ready_token: Option<&str>,
 ) -> Result<i32> {
     use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
@@ -530,6 +545,9 @@ fn run(
     if entry.queue.is_some() {
         client.arg("--queue");
     }
+    if let Some(token) = ready_token {
+        client.arg("--ready-token").arg(token);
+    }
     if let Some(host_socket) = host_socket {
         client.arg("--host-socket").arg(host_socket);
     }
@@ -564,6 +582,17 @@ fn run(
         },
     );
     outcome_exit(outcome, &entry.unit())
+}
+
+fn parse_ready_token(value: &str) -> std::result::Result<String, String> {
+    if !(32..=64).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("ready token must contain 32..=64 ASCII letters, digits or hyphens".into());
+    }
+    Ok(value.to_owned())
 }
 
 pub fn parse_memory(value: &str) -> std::result::Result<u64, String> {
@@ -638,6 +667,19 @@ fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32
 mod tests {
     use super::*;
     use amc_runner::systemd::{Cleanup, Outcome};
+
+    #[test]
+    fn native_ready_tokens_are_bounded_and_cannot_inject_framing() {
+        assert!(parse_ready_token("0123456789abcdef0123456789abcdef").is_ok());
+        for token in [
+            "short".to_owned(),
+            "a".repeat(65),
+            "\x1e".repeat(32),
+            "\n".repeat(32),
+        ] {
+            assert!(parse_ready_token(&token).is_err());
+        }
+    }
 
     #[test]
     fn declared_decimal_memory_is_rounded_down_and_burst_runtime_cannot_grow() {

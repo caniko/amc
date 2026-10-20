@@ -19,6 +19,16 @@ It sends `READY=1` only immediately before executing the admitted command; nativ
 before execution, and the payload does not inherit `NOTIFY_SOCKET`. These are
 the native [systemd service startup and runtime semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html).
 
+Callers with their own execution clocks can pass `--ready-token TOKEN`. After
+authenticated private entry and the final cancellation check, the native helper
+writes `RS TOKEN US` (bytes `0x1e`, token, `0x1f`) to stderr immediately before
+exec. Tokens contain 32–64 ASCII letters, digits or hyphens. A caller must generate
+a fresh unpredictable token per invocation, strip just that frame from captured
+output, and keep waiting/queued until it arrives. A shim that exits first has not
+confirmed execution. This is a start notification, not an execution acknowledgement
+or replay guarantee. The library/package advertise `admissionReadyVersion = 1`;
+older packages must not be opted into this protocol.
+
 The 30-second startup grace, resource wait, two-second broker exchange and native
 execution deadline remain separate. Explicit resource deadlines are checked
 again after native verification. Cancellation, expiry and lost acknowledgements

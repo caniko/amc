@@ -26,6 +26,7 @@ def request(listener):
 def main():
     assert os.geteuid() == 0, "fixture requires a root-owned broker socket"
     amc = str(Path(sys.argv[1]).resolve())
+    ready_token = "0123456789abcdef0123456789abcdef"
     results = {}
     for cancellation in [None, signal.SIGINT, signal.SIGTERM]:
         with tempfile.TemporaryDirectory(prefix="amc-entry-cancellation-") as temporary:
@@ -43,7 +44,8 @@ def main():
                 child = subprocess.Popen([
                     amc, "admission", "enter", "--socket", str(private_path),
                     "--ticket", "fixture-ticket", "--entry-key", "fixture-key",
-                    "--host-socket", str(host_path), "--", sys.executable, "-c",
+                    "--host-socket", str(host_path), "--ready-token", ready_token,
+                    "--", sys.executable, "-c",
                     "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(payload),
                 ], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
@@ -91,6 +93,7 @@ def main():
                     expected = 0 if cancellation is None else 128 + cancellation
                     assert child.returncode == expected, (cancellation, child.returncode, stdout, stderr)
                     assert payload.exists() == (cancellation is None), (cancellation, "payload executed")
+                    assert stderr == (f"\x1e{ready_token}\x1f".encode() if cancellation is None else b""), stderr
                     results["success" if cancellation is None else cancellation.name] = child.returncode
                 except Exception:
                     if child.poll() is not None:
