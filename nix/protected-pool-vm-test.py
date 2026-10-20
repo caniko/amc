@@ -1,5 +1,6 @@
 import json
 import shlex
+import time
 
 machine = globals()["machine"]
 test_section = globals()["subtest"]
@@ -54,6 +55,17 @@ with test_section("full ordinary budget and queues leave both protected users av
         machine.succeed(small(f"dd if=/dev/zero of=/tmp/quick-cache-{number} bs=1M count=4 status=none; exit 0"))
         wait_bytes(256 * 1048576)
     machine.succeed(small("printf bob", 1001))
+    # Measure admitted payloads, not just an unqueued status endpoint. The
+    # end-to-end ceiling includes entry, execution and confirmed cleanup.
+    latencies = []
+    for number in range(20):
+        before = time.monotonic()
+        assert machine.succeed(small("printf control", 1000 + number % 2)) == "control"
+        latencies.append(time.monotonic() - before)
+    p95 = sorted(latencies)[18]
+    assert p95 <= 1.0, latencies
+    print(json.dumps({"controlAdmission": {"samples": 20, "users": 2,
+        "ordinaryQueueSaturated": True, "p95Seconds": p95, "latenciesSeconds": latencies}}))
 
 # An occupied slot survives both brokers restarting without payload replay.
 with test_section("occupied protected restart preserves identity and native deadline without replay"):
