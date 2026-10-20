@@ -75,9 +75,12 @@ backpressure with `retry_after_ms`, not an execution failure for accepted work.
 Status and cancellation remain available at the queue bound. Accepted tickets
 are not executable replay records: restart still discards unentered work.
 
-This does **not** complete host-wide queue patience or separate host admission
-from the native workload runtime clock. Those gates must pass before removing
-consumer lifetime slots or activating this as the default integration.
+Queued helpers keep this patience across shared-host waits: each host
+reservation is finite (one hour) and the helper re-requests it after expiry.
+`Type=notify` defers native `RuntimeMaxSec` until `READY=1`, so host queue time
+does not spend the runtime bound. See [patient native execution](queued-execution.md)
+for the readiness/completion protocol, qualification gates and the consumer
+boundaries that remain before lifetime slots can be retired.
 
 ## Installation and removal
 
