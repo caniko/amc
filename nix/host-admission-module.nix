@@ -11,6 +11,9 @@
   userRuntimeNeeded =
     preparationsEnabled
     || lib.any (domain: (domain.burst or false) || (domain.protected_pool or null) != null) (cfg.policy.domains or []);
+  userRuntimeUnits = lib.optionals userRuntimeNeeded (map
+    (uid: "user-runtime-dir@${toString uid}.service")
+    (lib.unique (builtins.filter (uid: uid != 0) (map (domain: domain.uid) (cfg.policy.domains or [])))));
   guardModule = import ./page-return-guard-module.nix {inherit config lib;};
 in {
   options.services.amc.hostAdmission = {
@@ -44,6 +47,11 @@ in {
     systemd.services.amc-host-admission = {
       description = "AMC atomic host capacity reservations";
       wantedBy = ["multi-user.target"];
+      # ProtectHome's read-only view only covers mounts present at startup.
+      # Pin enrolled runtime directories before sandboxing; later user-manager
+      # startup must not propagate fresh writable tmpfs mounts into the broker.
+      requires = userRuntimeUnits;
+      after = userRuntimeUnits;
       serviceConfig = {
         ExecStart =
           "${lib.getExe cfg.package} admission host-serve --policy ${policy}"

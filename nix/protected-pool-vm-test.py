@@ -6,6 +6,11 @@ machine = globals()["machine"]
 test_section = globals()["subtest"]
 globals()["start_all"]()
 machine.wait_for_unit("amc-host-admission.service")
+for uid in [1000, 1001]:
+    machine.succeed(f"systemctl is-active --quiet user-runtime-dir@{uid}.service")
+    machine.succeed(f"findmnt --mountpoint /run/user/{uid}")
+    # Runtime-directory dependencies do not start a user's execution plane.
+    machine.fail(f"systemctl is-active --quiet user@{uid}.service")
 for user, uid in [("alice", 1000), ("bob", 1001)]:
     machine.succeed(f"loginctl enable-linger {user}; systemctl start user@{uid}.service")
     machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/admission.sock")
