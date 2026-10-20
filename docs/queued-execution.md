@@ -9,7 +9,9 @@ and installed package advertise `admissionQueueVersion = 1`.
 The private coordinator first reserves the declared byte ceiling. A finite
 30-second native startup window then pins the helper's invocation, cgroup inode,
 PID and enforcement. `starting` retains that reservation while the host broker
-queues the same native identity. This does not permit payload execution. A host
+queues the same native identity. Any enrolled user can reach the host socket, so
+each host reservation still expires after one hour; a patient helper then
+re-requests and joins the back of the host queue. This does not permit payload execution. A host
 grant followed by the authenticated private `Enter` transition is still required.
 
 Queued services use `Type=notify`, `NotifyAccess=main` and `TimeoutStartSec=30s`.

@@ -742,8 +742,10 @@ pub fn serve_supervised(
                                     memory_bytes,
                                     swap_bytes,
                                     requested_ms: now,
-                                    deadline_ms: wait_ms
-                                        .map_or(u64::MAX, |ms| now.saturating_add(ms)),
+                                    // Any enrolled user can reach this socket, so an
+                                    // omitted (patient) wait still expires after the
+                                    // legacy hour; the helper then re-requests.
+                                    deadline_ms: now.saturating_add(wait_ms.unwrap_or(3_600_000)),
                                     granted: false,
                                     owners: vec![],
                                     owners_finished: false,
