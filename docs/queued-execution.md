@@ -29,6 +29,14 @@ confirmed execution. This is a start notification, not an execution acknowledgem
 or replay guarantee. The library/package advertise `admissionReadyVersion = 1`;
 older packages must not be opted into this protocol.
 
+With `--queue --ready-token TOKEN`, explicit broker nonacceptance exits 75 and
+emits `RS TOKEN :backpressure: RETRY_AFTER_MS US` on stderr (without spaces).
+The delay is an integer from 1 to 60000. This frame means no request or native
+execution was accepted; an intent owner may retain its queued job and retry after
+the client has exited, without holding an overflow process. Exit 75 alone, a
+transport error, or a frame after native entry never authorizes replay.
+Consumers require `admissionBackpressureVersion = 1` on both library and package.
+
 The 30-second startup grace, resource wait, two-second broker exchange and native
 execution deadline remain separate. Explicit resource deadlines are checked
 again after native verification. Cancellation, expiry and lost acknowledgements

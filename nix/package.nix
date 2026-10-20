@@ -40,6 +40,7 @@ rustPlatform.buildRustPackage {
   passthru.admissionSizingVersion = 1;
   passthru.admissionQueueVersion = 1;
   passthru.admissionReadyVersion = 1;
+  passthru.admissionBackpressureVersion = 1;
   passthru.admissionProtectedPoolVersion = 1;
   passthru.admissionPreparationVersion = 2;
   passthru.admissionContinuationEnvelopesVersion = 1;

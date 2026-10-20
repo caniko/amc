@@ -263,6 +263,71 @@ fn admission_execution_deadline_rejects_invalid_values_before_contacting_server(
 }
 
 #[test]
+fn admission_backpressure_exits_without_native_submission_or_a_waiting_client() {
+    use amc_admission::{
+        ledger::Backpressure,
+        protocol::{Message, Request, Response, read_frame, write_frame},
+    };
+    use std::os::unix::net::UnixListener;
+    for (delay, key, retryable) in [
+        (None, None, false),
+        (Some(250), None, true),
+        (Some(0), None, false),
+        (Some(60001), None, false),
+        (Some(250), Some("accepted-entry"), false),
+    ] {
+        let f = Fixture::new();
+        let socket = f.0.join("backpressure.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Request = read_frame(&mut stream).unwrap();
+            assert!(matches!(request.message, Message::EnqueueWaiting { .. }));
+            write_frame(
+                &mut stream,
+                &Response {
+                    version: 1,
+                    backpressure: delay.map(|retry_after_ms| Backpressure { retry_after_ms }),
+                    entry_key: key.map(String::from),
+                    error: Some("submission capacity is full".into()),
+                    ..Response::default()
+                },
+            )
+            .unwrap();
+        });
+        let token = "12345678-1234-1234-1234-123456789abc";
+        let mut command = f.command("not-run");
+        command
+            .args(["admission", "exec", "--socket"])
+            .arg(&socket)
+            .args([
+                "--contract",
+                "tool",
+                "--queue",
+                "--max-ram-usage",
+                "1MiB",
+                "--runtime-max-sec",
+                "5",
+                "--ready-token",
+                token,
+                "--",
+                "true",
+            ]);
+        let output = bounded(command);
+        server.join().unwrap();
+        assert_eq!(output.status.code(), Some(if retryable { 75 } else { 1 }));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        if retryable {
+            assert_eq!(error, format!("\x1e{token}:backpressure:250\x1f"));
+        } else {
+            assert!(!error.contains(":backpressure:"));
+        }
+        assert!(!f.0.join("calls").exists());
+    }
+}
+
+#[test]
 fn admission_untimed_queue_is_explicit_cancellable_and_never_spawns_while_waiting() {
     use amc_admission::{
         ledger::{Contract, Entry, Phase, QueueWait},

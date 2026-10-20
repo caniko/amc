@@ -1,6 +1,6 @@
 //! Production admission CLI. The native entry handshake gates execution.
 use amc_admission::{
-    ledger::{Phase, Policy, QueueRequest},
+    ledger::{Backpressure, Phase, Policy, QueueRequest},
     native::Systemd,
     protocol::{Message, call},
     server,
@@ -78,7 +78,7 @@ pub enum AdmissionCommand {
         /// Queue bounded work without an implicit resource-wait deadline.
         #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"])]
         queue: bool,
-        /// Emit RS/token/US on stderr after native entry, immediately before exec.
+        /// Emit native-entry or nonacceptance control frames on stderr.
         #[arg(long, value_parser = parse_ready_token)]
         ready_token: Option<String>,
         /// Optional systemd execution deadline for a disposable job, in seconds.
@@ -420,7 +420,28 @@ fn run(
     use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
     let deadline = wait.map(|wait| Instant::now() + wait);
-    let response = call(socket, request)?;
+    let queued = matches!(request, Message::EnqueueWaiting { .. });
+    let response = match call(socket, request) {
+        Ok(response) => response,
+        Err(error) => {
+            if queued
+                && let Some(token) = ready_token
+                && let Some(backpressure) = error.downcast_ref::<Backpressure>()
+            {
+                // Only explicit nonacceptance permits the intent owner to try
+                // again. Exit, rather than retaining one process per overflow.
+                std::io::stderr().lock().write_all(
+                    format!(
+                        "\x1e{token}:backpressure:{}\x1f",
+                        backpressure.retry_after_ms
+                    )
+                    .as_bytes(),
+                )?;
+                return Ok(75);
+            }
+            return Err(error);
+        }
+    };
     let host_socket = response.host_socket;
     if let Some(host_socket) = &host_socket
         && let Err(error) = crate::native_start::verify_host_runner(host_socket)

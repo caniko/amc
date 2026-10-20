@@ -249,6 +249,14 @@ pub fn call(socket: &Path, message: Message) -> Result<Response> {
         "unsupported admission response version"
     );
     if let Some(backpressure) = &response.backpressure {
+        ensure!(
+            response.entry.is_none()
+                && response.entry_key.is_none()
+                && response.status.is_none()
+                && response.waiting.is_none()
+                && (1..=60_000).contains(&backpressure.retry_after_ms),
+            "invalid admission nonacceptance response"
+        );
         return Err(backpressure.clone().into());
     }
     if let Some(error) = &response.error {

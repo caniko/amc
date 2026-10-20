@@ -103,6 +103,7 @@
     lib.admissionSizingVersion = 1;
     lib.admissionQueueVersion = 1;
     lib.admissionReadyVersion = 1;
+    lib.admissionBackpressureVersion = 1;
     lib.admissionProtectedPoolVersion = 1;
     lib.admissionBurstVersion = 1;
     lib.admissionPreparationVersion = 2;
