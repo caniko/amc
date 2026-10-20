@@ -35,7 +35,10 @@ def wait_bytes(value):
 
 with test_section("native deadline observations see user buses but cannot read homes or write runtime files"):
     broker = "$(systemctl show --property=MainPID --value amc-host-admission)"
-    sandbox = f"nsenter --target {broker} --mount -- "
+    # Enter the target root as well: keeping the driver's root/cwd can bypass
+    # systemd's overmounted filesystem view despite joining its mount namespace.
+    sandbox = f"nsenter --target {broker} --mount --root --wd=/ -- "
+    machine.succeed(sandbox + "findmnt -T /run/user -o TARGET,VFS-OPTIONS,FS-OPTIONS")
     for uid in [1000, 1001]:
         # Run in the actual broker mount namespace, not the test driver's less
         # restrictive namespace. Like the broker's query child, authenticate as
