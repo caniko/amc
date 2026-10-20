@@ -93,6 +93,8 @@ pub fn serve_with_host(
     listener.set_nonblocking(true)?;
     store.save(&ledger)?;
     let mut tick = Instant::now();
+    // Advance a changed ledger on the next turn, not after the idle interval.
+    let mut due = false;
     let mut cursor = 0usize;
     let mut waiting = std::collections::BTreeMap::new();
     // Unentered tickets are discarded on restart, so their capabilities are
@@ -102,7 +104,8 @@ pub fn serve_with_host(
     let mut unreconciled: std::collections::BTreeSet<_> =
         ledger.entries.iter().map(|e| e.id.clone()).collect();
     while !stopping() {
-        if tick.elapsed() >= Duration::from_millis(250) {
+        if due || tick.elapsed() >= Duration::from_millis(250) {
+            due = false;
             let before = serde_json::to_vec(&ledger)?;
             // One running identity per tick bounds manager work independently
             // of queue length. All unverified entries remain fully accounted.
@@ -181,6 +184,7 @@ pub fn serve_with_host(
                 // failure terminates the server, leaving native limits in force.
                 if before != serde_json::to_vec(&ledger)? {
                     store.save(&ledger)?;
+                    due = true;
                 }
                 let mut response = match result {
                     Ok(response) => response,

@@ -43,6 +43,9 @@
 
 ### Fixed
 
+- Advance a changed host or private ledger on the next broker turn and poll
+  short waits every 25ms for their first second, instead of paying 250ms
+  polling quanta in each admission stage. Bound omitted host waits to one hour.
 - Resolve the host broker's direct session-bus queries beneath the owner's
   runtime directory pinned in init's root, so protected deadline checks keep
   `ProtectHome=yes` and no user-runtime mount is visible in the broker namespace.

@@ -228,6 +228,7 @@ pub fn acquire(
     stopping: impl Fn() -> bool,
     mut waiting: impl FnMut() -> Result<()>,
 ) -> Result<Option<crate::continuation::ContinuationCapability>> {
+    let began = Instant::now();
     let deadline = wait.map(|wait| Instant::now() + wait);
     let mut explained = false;
     loop {
@@ -271,8 +272,18 @@ pub fn acquire(
             eprintln!("waiting for host capacity: {:?}", reply.waiting);
             explained = true;
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(poll_interval(began));
     }
+}
+
+/// Short grants usually settle within one broker turn and a manager probe;
+/// poll those quickly, then fall back to the idle interval for long waits.
+pub fn poll_interval(began: Instant) -> Duration {
+    Duration::from_millis(if began.elapsed() < Duration::from_secs(1) {
+        25
+    } else {
+        250
+    })
 }
 
 pub fn verify_entry(
@@ -373,6 +384,9 @@ pub fn serve_supervised(
     listener.set_nonblocking(true)?;
     store.save_snapshot(&ledger)?;
     let mut tick = Instant::now();
+    // A request that changed the ledger is advanced on the next turn rather
+    // than after the idle interval, so a grantable request is not delayed.
+    let mut due = false;
     let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
@@ -388,7 +402,8 @@ pub fn serve_supervised(
         recovery_manager.refresh(ledger.recovery.as_ref())?;
         let mut burst_evidence = burst_manager.snapshot();
         burst_evidence.extend(protected_manager.snapshot());
-        if tick.elapsed() >= Duration::from_millis(250) {
+        if due || tick.elapsed() >= Duration::from_millis(250) {
+            due = false;
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
                 if r.identity.uid == 0 {
@@ -786,6 +801,7 @@ pub fn serve_supervised(
                 });
                 if before != serde_json::to_vec(&ledger)? {
                     store.save_snapshot(&ledger)?;
+                    due = true;
                 }
                 let reply = result.unwrap_or_else(|e| Response {
                     version: 1,

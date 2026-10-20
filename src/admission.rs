@@ -470,6 +470,7 @@ fn run(
         }
     };
     let short_call = burst || entry.contract.protected_pool.is_some();
+    let queued = Instant::now();
     while entry.phase == Phase::Queued {
         if signals.cancelled().is_some()
             || deadline.is_some_and(|deadline| Instant::now() >= deadline)
@@ -477,7 +478,7 @@ fn run(
             let _ = call(socket, Message::Cancel { id: entry.id });
             anyhow::bail!("admission cancelled or timed out before submission");
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(amc_admission::host_server::poll_interval(queued));
         entry = call(
             socket,
             Message::Poll {
