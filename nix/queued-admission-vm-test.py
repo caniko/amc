@@ -109,7 +109,9 @@ with test_section("patient host waiting exceeds 120 seconds without spending nat
     machine.sleep(125)
     assert queued_status()["entries"][0]["phase"] == "starting"
     machine.fail("test -e /tmp/patient-long-entered")
-    assert machine.succeed("cat /tmp/patient-long-stderr") == ""
+    # The helper explains its host wait once; no ready frame precedes entry.
+    waiting_stderr = machine.succeed("cat /tmp/patient-long-stderr")
+    assert "\x1e" not in waiting_stderr, waiting_stderr
     machine.succeed("touch /tmp/patient-blocker-finish")
     wait_entered("patient-long")
     machine.wait_until_succeeds("test -e /tmp/patient-long-completed", timeout=15)
@@ -118,7 +120,12 @@ with test_section("patient host waiting exceeds 120 seconds without spending nat
         '&& test "$(systemctl show patient-long-client --property=ActiveState --value)" = inactive', timeout=15,
     )
     wait_committed(0)
-    assert machine.succeed("cat /tmp/patient-long-stderr") == f"\x1e{ready_token}\x1f"
+    stderr = machine.succeed("cat /tmp/patient-long-stderr")
+    entered, completed = f"\x1e{ready_token}\x1f", f"\x1e{ready_token}:complete:0\x1f"
+    # Exactly one entry frame, then the token-bound completion proof.
+    assert stderr.count("\x1e") == 2 and stderr.index(entered) < stderr.index(completed), stderr
+    diagnostic = stderr.replace(entered, "", 1).replace(completed, "", 1)
+    assert all(line.startswith("waiting for host capacity: ") for line in diagnostic.splitlines()), stderr
     evidence["patientQueue"] = {"waitSeconds": 125, "runtimeSeconds": 2,
         "controlP95Seconds": p95, "completed": True}
 
