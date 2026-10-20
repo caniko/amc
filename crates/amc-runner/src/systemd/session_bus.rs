@@ -2,22 +2,30 @@
 //! Query only the required public properties through the exact host session bus.
 use super::control::{QUERY_TIMEOUT, capture_with_timeout};
 use super::{Cleanup, UnitState, safe_cgroup_path, terminated, valid_unit};
+use nix::unistd::{Uid, User, geteuid};
 use serde_json::Value;
 use std::{
+    os::unix::process::CommandExt,
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-fn command(uid: u32) -> Command {
+fn command(uid: u32) -> Option<Command> {
     let mut command = Command::new("busctl");
+    // A user bus authenticates the connecting UID, not the socket's pathname.
+    // Drop credentials in this child only; the broker retains its authority.
+    if geteuid().is_root() {
+        let user = User::from_uid(Uid::from_raw(uid)).ok()??;
+        command.gid(user.gid.as_raw()).uid(uid);
+    }
     command.args([
         format!("--address=unix:path=/run/user/{uid}/bus"),
         "--timeout=2s".into(),
         "--json=short".into(),
         "--".into(),
     ]);
-    command
+    Some(command)
 }
 
 pub(super) fn capture_until(command: &mut Command, deadline: Option<Instant>) -> Option<String> {
@@ -39,7 +47,7 @@ fn manager_call_until(
     deadline: Option<Instant>,
 ) -> Option<Value> {
     let text = capture_until(
-        command(uid)
+        command(uid)?
             .args([
                 "call",
                 "org.freedesktop.systemd1",
@@ -62,7 +70,7 @@ fn properties(
     deadline: Option<Instant>,
 ) -> Option<Vec<Value>> {
     let text = capture_until(
-        command(uid)
+        command(uid)?
             .args(["get-property", "org.freedesktop.systemd1", path, interface])
             .args(names),
         deadline,
