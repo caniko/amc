@@ -43,6 +43,9 @@
 
 ### Fixed
 
+- Resolve the host broker's direct session-bus queries beneath the owner's
+  runtime directory pinned in init's root, so protected deadline checks keep
+  `ProtectHome=yes` and no user-runtime mount is visible in the broker namespace.
 - Cancel stalled host-acquisition frames promptly, reject grants acknowledged
   after the resource-wait deadline, and retain signal handling through native
   entry so cancellation cannot be forgotten before payload execution.

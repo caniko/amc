@@ -182,7 +182,7 @@ fn routed_query_state(
         "--property=LoadState,ActiveState,InvocationID,MainPID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
         "--",
         unit,
-    ]), deadline)?;
+    ]), None, deadline)?;
     let field = |name: &str| {
         text.lines()
             .filter_map(|line| line.split_once('='))

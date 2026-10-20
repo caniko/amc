@@ -1,38 +1,53 @@
 //! Namespace callers cannot use systemctl's implicit private-manager transport.
 //! Query only the required public properties through the exact host session bus.
-use super::control::{QUERY_TIMEOUT, capture_with_timeout};
+use super::control::{QUERY_TIMEOUT, capture_from};
 use super::{Cleanup, UnitState, safe_cgroup_path, terminated, valid_unit};
 use nix::unistd::{Uid, User, geteuid};
 use serde_json::Value;
 use std::{
+    fs::File,
     os::unix::process::CommandExt,
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-fn command(uid: u32) -> Option<Command> {
+/// A busctl command for `uid`'s session bus, with the runtime directory its
+/// address resolves beneath when the caller is root.
+fn command(uid: u32) -> Option<(Command, Option<File>)> {
     let mut command = Command::new("busctl");
+    let mut address = format!("unix:path=/run/user/{uid}/bus");
+    let mut runtime = None;
     // A user bus authenticates the connecting UID, not the socket's pathname.
     // Drop credentials in this child only; the broker retains its authority.
     if geteuid().is_root() {
         let user = User::from_uid(Uid::from_raw(uid)).ok()??;
         command.gid(user.gid.as_raw()).uid(uid);
+        // ProtectHome=yes hides /run/user from the host broker; exposing it
+        // would admit late-propagated writable mounts. Pin the owner's runtime
+        // directory in init's root and pass only that directory as stdin, so
+        // the unprivileged child resolves `bus` beneath it. busctl never reads stdin.
+        runtime = Some(File::open(format!("/proc/1/root/run/user/{uid}")).ok()?);
+        address = "unix:path=/proc/self/fd/0/bus".into();
     }
     command.args([
-        format!("--address=unix:path=/run/user/{uid}/bus"),
+        format!("--address={address}"),
         "--timeout=2s".into(),
         "--json=short".into(),
         "--".into(),
     ]);
-    Some(command)
+    Some((command, runtime))
 }
 
-pub(super) fn capture_until(command: &mut Command, deadline: Option<Instant>) -> Option<String> {
+pub(super) fn capture_until(
+    command: &mut Command,
+    stdin: Option<&File>,
+    deadline: Option<Instant>,
+) -> Option<String> {
     let timeout = deadline.map_or(QUERY_TIMEOUT, |end| {
         end.saturating_duration_since(Instant::now())
     });
-    let text = capture_with_timeout(command, timeout).ok()?;
+    let text = capture_from(command, timeout, stdin).ok()?;
     if deadline.is_some_and(|end| Instant::now() >= end) {
         return None;
     }
@@ -46,8 +61,9 @@ fn manager_call_until(
     arguments: &[&str],
     deadline: Option<Instant>,
 ) -> Option<Value> {
+    let (mut command, runtime) = command(uid)?;
     let text = capture_until(
-        command(uid)?
+        command
             .args([
                 "call",
                 "org.freedesktop.systemd1",
@@ -57,6 +73,7 @@ fn manager_call_until(
                 signature,
             ])
             .args(arguments),
+        runtime.as_ref(),
         deadline,
     )?;
     serde_json::from_str(&text).ok()
@@ -69,10 +86,12 @@ fn properties(
     names: &[&str],
     deadline: Option<Instant>,
 ) -> Option<Vec<Value>> {
+    let (mut command, runtime) = command(uid)?;
     let text = capture_until(
-        command(uid)?
+        command
             .args(["get-property", "org.freedesktop.systemd1", path, interface])
             .args(names),
+        runtime.as_ref(),
         deadline,
     )?;
     let values = text
@@ -454,6 +473,7 @@ mod tests {
         assert!(
             capture_until(
                 Command::new("sh").args(["-c", "exec sleep 10"]),
+                None,
                 Some(started + Duration::from_millis(30)),
             )
             .is_none()
@@ -462,6 +482,7 @@ mod tests {
         assert!(
             capture_until(
                 &mut Command::new("must-not-spawn-after-deadline"),
+                None,
                 Some(started),
             )
             .is_none()

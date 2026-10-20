@@ -6,11 +6,6 @@ machine = globals()["machine"]
 test_section = globals()["subtest"]
 globals()["start_all"]()
 machine.wait_for_unit("amc-host-admission.service")
-for uid in [1000, 1001]:
-    machine.succeed(f"systemctl is-active --quiet user-runtime-dir@{uid}.service")
-    machine.succeed(f"findmnt --mountpoint /run/user/{uid}")
-    # Runtime-directory dependencies do not start a user's execution plane.
-    machine.fail(f"systemctl is-active --quiet user@{uid}.service")
 for user, uid in [("alice", 1000), ("bob", 1001)]:
     machine.succeed(f"loginctl enable-linger {user}; systemctl start user@{uid}.service")
     machine.wait_until_succeeds(f"test -S /run/user/{uid}/amc/admission.sock")
@@ -43,17 +38,20 @@ with test_section("native deadline observations see user buses but cannot read h
     # Enter the target root as well: keeping the driver's root/cwd can bypass
     # systemd's overmounted filesystem view despite joining its mount namespace.
     sandbox = f"nsenter --target {broker} --mount --root --wd=/ -- "
-    machine.succeed(sandbox + "findmnt -T /run/user -o TARGET,VFS-OPTIONS,FS-OPTIONS")
-    for uid in [1000, 1001]:
-        # Run in the actual broker mount namespace, not the test driver's less
-        # restrictive namespace. Like the broker's query child, authenticate as
-        # the bus owner; a root connection is not a user-session credential.
-        observed = json.loads(machine.succeed(sandbox + user(
-            f"busctl --address=unix:path=/run/user/{uid}/bus --timeout=2s --json=short call "
-            "org.freedesktop.systemd1 /org/freedesktop/systemd1 "
-            "org.freedesktop.systemd1.Manager GetUnit s amc-admission.service", uid)))
-        assert observed["type"] == "o", observed
+    for name, uid in [("alice", 1000), ("bob", 1001)]:
+        # ProtectHome=yes: the broker namespace has no user runtime view.
+        machine.fail(sandbox + f"test -e /run/user/{uid}/bus")
         machine.fail(sandbox + f"touch /run/user/{uid}/must-not-write")
+        # Like the broker's query child: root pins init's runtime directory as
+        # stdin, then the bus owner resolves only `bus` beneath that descriptor.
+        # A root connection is not a user-session credential.
+        observed = json.loads(machine.succeed(sandbox + "sh -c " + shlex.quote(
+            f"exec setpriv --reuid={name} --regid=users --init-groups "
+            "busctl --address=unix:path=/proc/self/fd/0/bus --timeout=2s --json=short call "
+            "org.freedesktop.systemd1 /org/freedesktop/systemd1 "
+            "org.freedesktop.systemd1.Manager GetUnit s amc-admission.service "
+            f"< /proc/1/root/run/user/{uid}")))
+        assert observed["type"] == "o", observed
     machine.succeed("touch /home/alice/broker-hidden-fixture /root/broker-hidden-fixture")
     for home in ["/home/alice", "/root"]:
         machine.succeed(sandbox + f"test ! -e {home}/broker-hidden-fixture")
