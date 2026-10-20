@@ -17,12 +17,12 @@ nix_builds = [
 only = true
 separate_events = true
 push_tags = ["**"]
-# Cold hosted LTO kernel realization exceeded four hours before the native VM.
-# Keep the two-core bound and allow the complete kernel/VM gate six hours.
+# Both original ThinLTO builds exhausted four hours before VM startup. Public
+# ubuntu-24.04 runners provide four CPUs; keep realization serial per runner.
 timeout_minutes = 360
 max_parallel = 2
 max_jobs = 1
-cores = 2
+cores = 4
 kvm = true
 capture_results = true
 artifact_retention_days = 30

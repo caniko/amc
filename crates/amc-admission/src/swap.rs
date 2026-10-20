@@ -53,12 +53,14 @@ fn stat_value(text: &str, key: &str) -> Result<u64> {
     Ok(value)
 }
 
+pub fn cgroup_swap_bytes(directory: &Path) -> Result<u64> {
+    Ok(fs::read_to_string(directory.join("memory.swap.current"))?
+        .trim()
+        .parse()?)
+}
+
 pub fn cgroup_usage(directory: &Path) -> Result<SwapUsage> {
-    let current = || -> Result<u64> {
-        Ok(fs::read_to_string(directory.join("memory.swap.current"))?
-            .trim()
-            .parse()?)
-    };
+    let current = || cgroup_swap_bytes(directory);
     let cached = || -> Result<u64> {
         stat_value(
             &fs::read_to_string(directory.join("memory.stat"))?,
@@ -347,9 +349,12 @@ pub(crate) fn page_return_inventory(
         .native_claims(policy, None)
         .context("native recovery claims are unproven")?;
     claims.push(crate::recovery::helper_claim(helper, helper_bytes));
-    let mut inventory =
-        NativeReturnInventory::scan_with_limit(Path::new("/sys/fs/cgroup"), &claims, 65_536)?;
-    inventory.pages = Some((target.clone(), helper.clone(), bytes));
+    let inventory = NativeReturnInventory::scan_with_limit(
+        Path::new("/sys/fs/cgroup"),
+        &claims,
+        65_536,
+        Some((target.clone(), helper.clone(), bytes)),
+    )?;
     Ok((inventory.safe()?, inventory))
 }
 
@@ -368,7 +373,7 @@ struct NativeDirectory {
 }
 
 impl NativeDirectory {
-    fn read(directory: &Path, root: &Path, deadline: Instant) -> Result<Self> {
+    fn read(directory: &Path, root: &Path, deadline: Instant, pages: bool) -> Result<Self> {
         let inode = fs::metadata(directory)?.ino();
         let mut children = Vec::new();
         for entry in fs::read_dir(directory)? {
@@ -397,7 +402,13 @@ impl NativeDirectory {
                 current: fs::read_to_string(directory.join("memory.current"))?
                     .trim()
                     .parse()?,
-                swap: cgroup_usage(directory)?,
+                // Page recovery can back the full batch for every occupied
+                // owner without claiming any swap-cache residency credit.
+                swap: if pages {
+                    SwapUsage::new(cgroup_swap_bytes(directory)?, 0)?
+                } else {
+                    cgroup_usage(directory)?
+                },
             })
         } else {
             None
@@ -426,13 +437,14 @@ const REPLAY_TIMEOUT: Duration = crate::page_return::INVENTORY_TIMEOUT;
 
 impl NativeReturnInventory {
     fn scan(root: &Path, claims: &[crate::host::Reservation]) -> Result<Self> {
-        Self::scan_with_limit(root, claims, 8192)
+        Self::scan_with_limit(root, claims, 8192, None)
     }
 
     fn scan_with_limit(
         root: &Path,
         claims: &[crate::host::Reservation],
         limit: usize,
+        pages: Option<(Identity, Identity, u64)>,
     ) -> Result<Self> {
         let deadline = Instant::now() + crate::page_return::INVENTORY_TIMEOUT;
         let mut pending = vec![root.to_owned()];
@@ -447,7 +459,7 @@ impl NativeReturnInventory {
                     && directory.strip_prefix(root)?.components().count() <= 256,
                 "swap feasibility scan exceeds bound"
             );
-            let observed = NativeDirectory::read(&directory, root, deadline)?;
+            let observed = NativeDirectory::read(&directory, root, deadline, pages.is_some())?;
             pending.extend(observed.children.iter().cloned());
             directories.insert(directory, observed);
         }
@@ -455,7 +467,7 @@ impl NativeReturnInventory {
             root: root.to_owned(),
             directories,
             claims: claims.to_owned(),
-            pages: None,
+            pages,
         })
     }
 
@@ -467,7 +479,9 @@ impl NativeReturnInventory {
     }
 
     fn current_until(&self, deadline: Instant) -> Result<bool> {
-        self.current_with(deadline, NativeDirectory::read)
+        self.current_with(deadline, |directory, root, deadline| {
+            NativeDirectory::read(directory, root, deadline, self.pages.is_some())
+        })
     }
 
     fn current_with(
@@ -629,7 +643,9 @@ impl NativeReturnInventory {
                     pid: 0,
                     start_ticks: 0,
                 };
-                if !headroom(&owner)? {
+                // Exact cache accounting is needed only for the no-new-RAM
+                // exception, never when the complete batch is already backed.
+                if !headroom(&owner)? && cgroup_usage(directory)?.return_bytes() > 0 {
                     return Ok(false);
                 }
             }
@@ -708,7 +724,7 @@ mod tests {
                             delayed = true;
                             std::thread::sleep(Duration::from_millis(300));
                         }
-                        NativeDirectory::read(directory, root, deadline)
+                        NativeDirectory::read(directory, root, deadline, false)
                     }
                 )
                 .unwrap(),
@@ -718,6 +734,59 @@ mod tests {
             proof.current_until(Instant::now()).is_err(),
             "incomplete replay must still deny"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn page_inventory_backs_slots_before_requiring_an_exact_cache_exception() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-page-owner-credit-{}",
+            crate::store::fresh_id().unwrap()
+        ));
+        for (name, current, slots, cached) in
+            [("target", 1, 0, 0), ("helper", 1, 0, 0), ("owner", 8, 8, 9)]
+        {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            for (file, value) in [
+                ("memory.max", 10),
+                ("memory.current", current),
+                ("memory.swap.current", slots),
+            ] {
+                fs::write(directory.join(file), value.to_string()).unwrap();
+            }
+            fs::write(
+                directory.join("memory.stat"),
+                format!("swapcached {cached}\n"),
+            )
+            .unwrap();
+        }
+        let identity = |name: &str| Identity {
+            cgroup: format!("/{name}"),
+            inode: fs::metadata(root.join(name)).unwrap().ino(),
+            uid: 0,
+            pid: 42,
+            start_ticks: 7,
+        };
+        assert!(cgroup_usage(&root.join("owner")).is_err());
+        assert!(NativeReturnInventory::scan(&root, &[]).is_err());
+        let proof = NativeReturnInventory::scan_with_limit(
+            &root,
+            &[],
+            65_536,
+            Some((identity("target"), identity("helper"), 2)),
+        )
+        .unwrap();
+        assert!(proof.safe().unwrap());
+        assert!(proof.current().unwrap());
+        fs::write(root.join("owner/memory.max"), "9").unwrap();
+        assert!(proof.current().is_err());
+        fs::write(root.join("owner/memory.stat"), "swapcached 8\n").unwrap();
+        assert!(proof.current().unwrap());
+        fs::write(root.join("owner/memory.stat"), "swapcached 7\n").unwrap();
+        assert!(!proof.current().unwrap());
+        fs::write(root.join("owner/memory.swap.current"), "unknown").unwrap();
+        assert!(proof.current().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,11 +1,15 @@
 import ast
+import contextlib
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import runpy
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from contextlib import nullcontext
 from pathlib import Path
@@ -117,6 +121,53 @@ class GuardNonresidentSetupTests(unittest.TestCase):
             guard.prove_path("cache")
         self.assertIn(original / "memory.reclaim", writes)
         self.assertEqual(writes[backed / "cgroup.procs"], "123")
+
+
+class ChargeOwnerSetupTests(unittest.TestCase):
+    def test_target_is_frozen_before_reclaim_and_during_migration(self):
+        tree = ast.parse((hosted.ROOT / "nix/charge-owner-proof.py").read_text())
+        proof = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "proof")
+        setup = next(node for node in proof.body if isinstance(node, ast.Try)).body
+        end = next(index for index, node in enumerate(setup)
+                   if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "policy")
+        root = Path("/sys/fs/cgroup/amc-charge-proof")
+        writes = {}
+        frozen = set()
+
+        def write(path, value):
+            if path.name == "memory.reclaim":
+                self.assertIn(root / "destination", frozen,
+                              "the executing target can refault original-owner pages")
+            if path == root / "moved" / "cgroup.procs":
+                self.assertIn(root / "destination", frozen)
+                self.assertEqual(writes.get(root / "moved" / "cgroup.freeze"), "1")
+            writes[path] = value
+
+        def read(path):
+            if path.name == "cgroup.events":
+                self.assertEqual(writes.get(path.parent / "cgroup.freeze"), "1")
+                frozen.add(path.parent)
+                return "populated 1\nfrozen 1\n"
+            self.assertEqual(str(path), "/proc/123/cgroup")
+            return "0::/amc-charge-proof/moved\n"
+
+        namespace = {
+            "ROOT": root, "MIB": 1048576, "Path": Path, "errno": errno,
+            "pid": 123, "read": 100,
+            "os": types.SimpleNamespace(read=lambda *_: b"ready"),
+            "wait": lambda predicate: self.assertTrue(predicate()),
+            "observe": lambda group: {"swap": 32 * 1048576 if group.name in ("a", "b") else 0,
+                                      "cached": 0},
+        }
+        with (
+            mock.patch.object(Path, "write_text", autospec=True, side_effect=write),
+            mock.patch.object(Path, "read_text", autospec=True, side_effect=read),
+        ):
+            exec(compile(ast.Module(body=setup[:end], type_ignores=[]), "charge-owner-setup", "exec"), namespace)
+        for name in ("a", "b"):
+            self.assertIn(root / name / "memory.reclaim", writes)
+        self.assertEqual(writes[root / "moved" / "cgroup.procs"], "123")
+        self.assertIn(root / "moved", frozen)
 
 
 class GuardCleanupTests(unittest.TestCase):
@@ -240,6 +291,28 @@ class NativeEvidenceTests(unittest.TestCase):
         }
         self.assertTrue(names)
         self.assertLessEqual(names, hosted.NATIVE_CASES)
+
+    def test_burst_responsiveness_uses_host_status_response_schema(self):
+        source = ast.parse((hosted.ROOT / "nix/host-admission-vm-test.py").read_text())
+        probes = [node.value for node in ast.walk(source)
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and "elapsedSeconds" in node.value and "subprocess.run" in node.value]
+        self.assertEqual(len(probes), 1)
+        probe = probes[0].removeprefix("python3 - <<'PY'\n").removesuffix("\nPY")
+        response = {"version": 1, "error": None, "budget_bytes": 160 * 1048576, "reservations": []}
+        with patch("subprocess.run", return_value=types.SimpleNamespace(stdout=json.dumps(response))) as run:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(probe, {})
+            self.assertEqual(json.loads(output.getvalue())["responses"], 3)
+            self.assertEqual(run.call_count, 3)
+            self.assertTrue(all(call.kwargs["timeout"] == 1 for call in run.call_args_list))
+        for invalid in [{**response, "version": 2}, {**response, "error": "denied"},
+                        {**response, "budget_bytes": 0},
+                        {**response, "reservations": None}, {}]:
+            with self.subTest(response=invalid), patch("subprocess.run", return_value=types.SimpleNamespace(stdout=json.dumps(invalid))):
+                with self.assertRaises((AssertionError, KeyError)):
+                    exec(probe, {})
 
     def test_protected_pool_matrix_requires_every_native_case_and_rejects_failures(self):
         installable = ".#nixosTests.x86_64-linux.protected-pool"

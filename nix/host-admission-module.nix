@@ -7,13 +7,6 @@
   cfg = config.services.amc.hostAdmission;
   policy = pkgs.writeText "amc-host-policy.json" (builtins.toJSON cfg.policy);
   pagesEnabled = (cfg.policy.swap_recovery.page_cgroups or []) != [];
-  preparationsEnabled = (cfg.policy.preparations or []) != [];
-  userRuntimeNeeded =
-    preparationsEnabled
-    || lib.any (domain: (domain.burst or false) || (domain.protected_pool or null) != null) (cfg.policy.domains or []);
-  userRuntimeUnits = lib.optionals userRuntimeNeeded (map
-    (uid: "user-runtime-dir@${toString uid}.service")
-    (lib.unique (builtins.filter (uid: uid != 0) (map (domain: domain.uid) (cfg.policy.domains or [])))));
   guardModule = import ./page-return-guard-module.nix {inherit config lib;};
 in {
   options.services.amc.hostAdmission = {
@@ -47,11 +40,6 @@ in {
     systemd.services.amc-host-admission = {
       description = "AMC atomic host capacity reservations";
       wantedBy = ["multi-user.target"];
-      # ProtectHome's read-only view only covers mounts present at startup.
-      # Pin enrolled runtime directories before sandboxing; later user-manager
-      # startup must not propagate fresh writable tmpfs mounts into the broker.
-      requires = userRuntimeUnits;
-      after = userRuntimeUnits;
       serviceConfig = {
         ExecStart =
           "${lib.getExe cfg.package} admission host-serve --policy ${policy}"
@@ -68,16 +56,9 @@ in {
         TasksMax = 32;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        # Preparation authorization and finite short-call verification connect
-        # to sockets under /run/user. ProtectHome=true hides the user bus too,
-        # making native deadline enforcement unknowable and denying every grant.
-        # Unix socket connections work on a read-only mount; keep both home
-        # trees inaccessible and permit no runtime-file writes by the broker.
-        ProtectHome =
-          if userRuntimeNeeded
-          then "read-only"
-          else true;
-        InaccessiblePaths = lib.optionals userRuntimeNeeded ["/home" "/root"];
+        # Preparation callbacks use the authenticated origin's pinned root,
+        # never a visible user-runtime mount in the broker's namespace.
+        ProtectHome = true;
         ProtectControlGroups = true;
         ProtectKernelTunables = true;
         RestrictAddressFamilies = ["AF_UNIX"];

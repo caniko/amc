@@ -794,7 +794,7 @@ pub fn serve_supervised(
             }
             None => {
                 if !connections.progress() {
-                    thread::sleep(Duration::from_millis(20));
+                    connections.wait(&listener, inventory.as_ref().map(|task| &task.completion))?;
                 }
             }
         }
@@ -808,6 +808,7 @@ pub fn serve_supervised(
 // live ledger; only the main loop may persist a freshly revalidated lease.
 struct PendingInventory {
     stream: UnixStream,
+    completion: UnixStream,
     request: Request,
     owner: crate::ledger::ClientIdentity,
     backing: Vec<u8>,
@@ -1024,9 +1025,13 @@ impl PendingInventory {
         let mut scan_ledger = ledger.clone();
         let health_file = health_file.map(Path::to_owned);
         let burst_evidence = burst_evidence.clone();
+        let (completion, notifier) = UnixStream::pair()?;
         let worker = thread::Builder::new()
             .name("amc-native-inventory".into())
             .spawn(move || {
+                // Closing this private peer wakes the broker even on error or
+                // panic. Readiness is notification, never grant evidence.
+                let _notifier = notifier;
                 let (inventory_proof, native_demand) =
                     if matches!(&scan_request, Request::AcquireRecovery { .. }) {
                         let spec = scan_policy
@@ -1107,6 +1112,7 @@ impl PendingInventory {
             })?;
         Ok(Self {
             stream,
+            completion,
             request,
             owner,
             backing,
@@ -1630,8 +1636,7 @@ fn handle_advance_request(
                     return Ok(());
                 }
             }
-            let usage = crate::page_return::target_usage(&target)?;
-            let before_swap_bytes = usage.used_bytes;
+            let before_swap_bytes = crate::page_return::target_swap_bytes(&target)?;
             // The mm may contain swapped pages charged to another (or now
             // offlined) memcg. Destination swap counters are not page ownership.
             if !crate::page_return::range_swapped(
@@ -1680,7 +1685,9 @@ fn handle_advance_request(
                         address,
                         bytes,
                         before_swap_bytes,
-                        before_return_bytes: Some(usage.return_bytes()),
+                        // Per-batch authority is the guarded PTE range and
+                        // complete native backing, not aggregate cache deltas.
+                        before_return_bytes: None,
                         guards: Some(guards),
                         settled: false,
                     },
@@ -1731,10 +1738,18 @@ fn handle_advance_request(
                     && crate::page_return::helper_holds_guards(pid, &target_guard, &helper_guard)?,
                 "page return protected mm changed before settlement"
             );
-            let after = crate::page_return::target_usage(target)?;
-            reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after.used_bytes));
-            reply.return_demand_reduction_bytes =
-                before_return_bytes.map(|before| before.saturating_sub(after.return_bytes()));
+            let (after_swap, after_return) = if before_return_bytes.is_some() {
+                // Retain exact accounting for historical leases that recorded
+                // that optional diagnostic; never invent a zero reduction.
+                let after = crate::page_return::target_usage(target)?;
+                (after.used_bytes, Some(after.return_bytes()))
+            } else {
+                (crate::page_return::target_swap_bytes(target)?, None)
+            };
+            reply.returned_bytes = Some(before_swap_bytes.saturating_sub(after_swap));
+            reply.return_demand_reduction_bytes = before_return_bytes
+                .zip(after_return)
+                .map(|(before, after)| before.saturating_sub(after));
             reply.resident_bytes = Some(
                 if crate::page_return::range_resident(
                     &crate::page_return::open_pagemap(target)?,
@@ -2369,7 +2384,9 @@ mod tests {
         };
         let backing = inventory_backing(&ledger, &policy).unwrap();
         let (release, wait) = std::sync::mpsc::channel();
+        let (completion, notifier) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
+            let _notifier = notifier;
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
             Ok((
                 Response {
@@ -2383,6 +2400,7 @@ mod tests {
         });
         let mut pending = Some(PendingInventory {
             stream,
+            completion,
             request: Request::AcquireRecovery {
                 version: 1,
                 target: "swap".into(),
@@ -2538,7 +2556,7 @@ mod tests {
     #[test]
     fn inventory_replay_keeps_exact_authority_with_fresh_native_counter_telemetry() {
         let scanned: crate::recovery::RecoveryLease = serde_json::from_value(serde_json::json!({
-            "identity":{"cgroup":"/helper","inode":1,"uid":0,"pid":42,"start_ticks":7},
+            "identity":{"cgroup":"/helper.service","inode":1,"uid":0,"pid":42,"start_ticks":7},
             "invocation_id":"11111111111111111111111111111111",
             "action":{"kind":"pages","target":{"cgroup":"/target","inode":2,"uid":0,"pid":43,"start_ticks":8},
                 "address":4096,"bytes":4096,"before_swap_bytes":8192,"before_return_bytes":8192,"settled":false,
@@ -2552,6 +2570,15 @@ mod tests {
         assert!(
             inventory_recovery_matches(&Some(fresh.clone()), &Some(scanned.clone())).unwrap(),
             "live counters are telemetry; grant identity and full batch demand did not change"
+        );
+        let mut unmeasured = serde_json::to_value(&fresh).unwrap();
+        unmeasured["action"]["before_return_bytes"] = serde_json::Value::Null;
+        let unmeasured: crate::recovery::RecoveryLease =
+            serde_json::from_value(unmeasured).unwrap();
+        unmeasured.validate().unwrap();
+        assert!(
+            inventory_recovery_matches(&Some(unmeasured), &Some(scanned.clone())).unwrap(),
+            "absent optional cache telemetry must not change guarded batch authority"
         );
         for (field, value) in [
             (

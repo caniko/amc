@@ -39,6 +39,7 @@
     };
   });
   observer = pkgs.writeShellScriptBin "systemctl" ''
+    set -eu
     # Simulate loss of manager observations without changing native enforcement.
     # ProtectSystem=strict makes /tmp read-only inside the host broker. Keep
     # fixture rendezvous in its existing writable RuntimeDirectory instead.
@@ -65,7 +66,7 @@
         fi
         ;;
       *RuntimeMaxUSec*)
-        if test -e /run/amc-host/amc-burst-observation-slow; then
+        if test "$EUID" -eq 0 && test -e /run/amc-host/amc-burst-observation-slow; then
           ${pkgs.coreutils}/bin/touch /run/amc-host/amc-burst-observation-entered
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
@@ -200,12 +201,12 @@ in
         systemd.services.amc-host-admission.after = ["builders.slice"];
         assertions = [
           {
-            assertion = config.systemd.services.amc-host-admission.serviceConfig.ProtectHome == "read-only";
-            message = "Preparation authorization requires readable runtime rendezvous sockets.";
+            assertion = config.systemd.services.amc-host-admission.serviceConfig.ProtectHome;
+            message = "Preparation callbacks must retain hidden home and user-runtime paths.";
           }
           {
-            assertion = builtins.all (path: builtins.elem path config.systemd.services.amc-host-admission.serviceConfig.InaccessiblePaths) ["/home" "/root"];
-            message = "Preparation runtime visibility must not expose home trees.";
+            assertion = config.systemd.services.amc-host-admission.serviceConfig.ProtectSystem == "strict";
+            message = "Observer rendezvous must not relax the broker's read-only filesystem.";
           }
         ];
         # The public launcher prepends real systemd to PATH. Inject the observer

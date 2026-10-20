@@ -107,6 +107,7 @@ pub fn host_execution() -> Result<Option<i32>> {
     )?;
     let signals = crate::control::Signals::install()?;
     let mut command = command;
+    let record = amc_runner::systemd::ClientRecord::with_host_startup(barrier, uid);
     let outcome = amc_runner::systemd::execute(
         &mut command,
         Path::new("systemctl"),
@@ -114,7 +115,7 @@ pub fn host_execution() -> Result<Option<i32>> {
         false,
         false,
         || signals.cancelled(),
-        &amc_runner::systemd::ClientRecord::with_host_startup(barrier, uid),
+        &record,
     );
     match outcome {
         amc_runner::systemd::Outcome::Completed(code) => Ok(Some(code)),
@@ -122,7 +123,14 @@ pub fn host_execution() -> Result<Option<i32>> {
         | amc_runner::systemd::Outcome::NotSubmitted(
             amc_runner::systemd::NotSubmitted::Cancelled(signal),
         ) => Ok(Some(128 + signal)),
-        outcome => anyhow::bail!("host-native runner {outcome:?} for {unit}"),
+        outcome => {
+            if let Some(failure) = record.startup_failure() {
+                anyhow::bail!(
+                    "host-native runner {outcome:?} for {unit}; startup refusal {failure:?}"
+                )
+            }
+            anyhow::bail!("host-native runner {outcome:?} for {unit}")
+        }
     }
 }
 
