@@ -602,6 +602,11 @@ fn run(
             id: entry.id.clone(),
         },
     );
+    if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token)) {
+        std::io::stderr()
+            .write_all(frame.as_bytes())
+            .context("notify caller of confirmed native completion")?;
+    }
     outcome_exit(outcome, &entry.unit())
 }
 
@@ -656,6 +661,15 @@ fn execution_runtime(
         ensure!(requested <= maximum, "requested runtime exceeds contract");
     }
     Ok(requested.or(contract.runtime_max_sec))
+}
+
+fn completion_frame(outcome: amc_runner::systemd::Outcome, token: &str) -> Option<String> {
+    match outcome {
+        amc_runner::systemd::Outcome::Completed(code) => {
+            Some(format!("\x1e{token}:complete:{code}\x1f"))
+        }
+        _ => None,
+    }
 }
 
 fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32> {
@@ -744,5 +758,39 @@ mod tests {
             outcome_exit(Outcome::Completed(42), "fixture.service").unwrap(),
             42
         );
+    }
+
+    #[test]
+    fn only_confirmed_workload_results_emit_token_bound_completion_proof() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for code in [0, 1, 42, 75, 255] {
+            assert_eq!(
+                completion_frame(Outcome::Completed(code), token),
+                Some(format!("\x1e{token}:complete:{code}\x1f"))
+            );
+        }
+        for cleanup in [Cleanup::Unknown, Cleanup::Running, Cleanup::Stopped] {
+            for outcome in [
+                Outcome::Unknown {
+                    exit_code: 0,
+                    cleanup,
+                },
+                Outcome::Unknown {
+                    exit_code: 1,
+                    cleanup,
+                },
+                Outcome::TimedOut {
+                    started: true,
+                    cleanup,
+                },
+                Outcome::Cancelled {
+                    signal: 15,
+                    started: true,
+                    cleanup,
+                },
+            ] {
+                assert_eq!(completion_frame(outcome, token), None);
+            }
+        }
     }
 }

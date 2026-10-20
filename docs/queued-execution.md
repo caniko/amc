@@ -26,7 +26,13 @@ exec. Tokens contain 32–64 ASCII letters, digits or hyphens. A caller must gen
 a fresh unpredictable token per invocation, strip just that frame from captured
 output, and keep waiting/queued until it arrives. A shim that exits first has not
 confirmed execution. This is a start notification, not an execution acknowledgement
-or replay guarantee. The library/package advertise `admissionReadyVersion = 1`;
+or replay guarantee. After a verified workload result the client emits
+`RS TOKEN :complete: EXIT_CODE US` on stderr and exits with that code (0–255).
+Callers must strip both frames and require the matching completion proof before
+settling the result. Missing, duplicate or mismatched proof means reconciliation,
+including after entry: a launcher's exit code is not workload evidence. Unknown
+outcomes never emit completion proof, even when cleanup confirmed termination.
+The library/package advertise `admissionReadyVersion = 2`;
 older packages must not be opted into this protocol.
 
 With `--queue --ready-token TOKEN`, explicit broker nonacceptance exits 75 and
