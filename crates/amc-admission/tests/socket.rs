@@ -144,6 +144,114 @@ fn enqueue(socket: PathBuf) -> (Entry, String) {
 }
 
 #[test]
+fn starting_helpers_cannot_skip_host_wait_or_reuse_rights_after_restart() {
+    use amc_admission::ledger::QueueRequest;
+    let root = std::env::temp_dir().join(format!("amc-starting-{}", fresh_id().unwrap()));
+    let socket = root.join("run/admission.sock");
+    let done = Arc::new(AtomicBool::new(false));
+    let terminated = Arc::new(AtomicBool::new(false));
+    let server = start(&root, done.clone(), terminated.clone());
+    wait(|| call(&socket, Message::Status).is_ok());
+    let response = call(
+        &socket,
+        Message::EnqueueWaiting {
+            contract: "tool".into(),
+            request: QueueRequest {
+                memory_max: 600,
+                runtime_max_sec: 1,
+                wait_ms: None,
+            },
+        },
+    )
+    .unwrap();
+    let id = response.entry.unwrap().id;
+    let key = response.entry_key.unwrap();
+    wait(|| {
+        call(&socket, Message::Poll { id: id.clone() })
+            .unwrap()
+            .entry
+            .unwrap()
+            .phase
+            == Phase::Reserved
+    });
+    assert!(
+        call(
+            &socket,
+            Message::Enter {
+                id: id.clone(),
+                key: key.clone()
+            }
+        )
+        .is_err()
+    );
+    let reply = call(
+        &socket,
+        Message::Start {
+            id: id.clone(),
+            key: key.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(reply.entry.unwrap().phase, Phase::Starting);
+    assert!(
+        call(
+            &socket,
+            Message::Start {
+                id: id.clone(),
+                key: key.clone()
+            }
+        )
+        .is_err()
+    );
+    call(&socket, Message::Cancel { id: id.clone() }).unwrap();
+    assert!(
+        call(
+            &socket,
+            Message::Enter {
+                id: id.clone(),
+                key: key.clone()
+            }
+        )
+        .is_err(),
+        "a cancellation must revoke execution rights before native stop finishes"
+    );
+    assert_eq!(
+        call(&socket, Message::Status)
+            .unwrap()
+            .status
+            .unwrap()
+            .committed_bytes,
+        600
+    );
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    done.store(false, Ordering::SeqCst);
+    let server = start(&root, done.clone(), terminated.clone());
+    wait(|| call(&socket, Message::Status).is_ok());
+    assert_eq!(
+        call(&socket, Message::Status)
+            .unwrap()
+            .status
+            .unwrap()
+            .committed_bytes,
+        600
+    );
+    assert!(call(&socket, Message::Enter { id, key }).is_err());
+    terminated.store(true, Ordering::SeqCst);
+    wait(|| {
+        call(&socket, Message::Status)
+            .unwrap()
+            .status
+            .unwrap()
+            .committed_bytes
+            == 0
+    });
+    done.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn waiting_submission_reports_backpressure_and_keeps_status_and_cancel_available() {
     use amc_admission::ledger::{Backpressure, QueueRequest};
     let root = std::env::temp_dir().join(format!("amc-waiting-{}", fresh_id().unwrap()));

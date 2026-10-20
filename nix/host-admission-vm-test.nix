@@ -241,6 +241,8 @@ in
       testScript =
         builtins.readFile ./host-admission-vm-test.py
         + "\n"
+        + builtins.readFile ./queued-admission-vm-test.py
+        + "\n"
         + builtins.readFile ./charge-owner-vm-test.py
         + "\n"
         + builtins.readFile ./completion-vm-test.py

@@ -52,6 +52,11 @@ pub enum Message {
     Poll {
         id: String,
     },
+    /// Pin a patient native helper; this is not payload permission.
+    Start {
+        id: String,
+        key: String,
+    },
     Enter {
         id: String,
         key: String,

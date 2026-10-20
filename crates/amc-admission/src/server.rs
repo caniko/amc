@@ -75,9 +75,9 @@ pub fn serve_with_host(
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(socket.with_extension("lock"))?;
     socket_lock.try_lock()?;
-    // Unentered work has no permission to execute. Discard it on restart so
-    // queued requests cannot inherit superseded policy; the helper fails closed.
-    ledger.entries.retain(|entry| entry.phase == Phase::Running);
+    // Discard work without a native identity. Starting helpers retain their
+    // accounting and are stopped below: volatile entry rights do not survive.
+    ledger.entries.retain(|entry| entry.identity.is_some());
     ledger.sync_protected_pools(&policy);
     // The durable-state lock is acquired first. A second server can never
     // unlink a live endpoint for this state directory.
@@ -109,11 +109,21 @@ pub fn serve_with_host(
             let running: Vec<_> = ledger
                 .entries
                 .iter()
-                .filter(|e| e.phase == Phase::Running)
+                .filter(|e| e.identity.is_some())
                 .cloned()
                 .collect();
             if !running.is_empty() {
                 let entry = &running[cursor % running.len()];
+                if entry.phase == Phase::Starting
+                    && (now_ms()? >= entry.deadline_ms
+                        || !entry_keys.contains_key(&entry.id)
+                        || entry
+                            .client
+                            .as_ref()
+                            .is_none_or(|c| client_identity(c.pid).ok().as_ref() != Some(c)))
+                {
+                    let _ = native.stop(entry);
+                }
                 match native.terminated(entry) {
                     Some(terminated) => {
                         unreconciled.remove(&entry.id);
@@ -217,6 +227,7 @@ fn handle(
         version: 1,
         ..Response::default()
     };
+    let starting = matches!(&request.message, Message::Start { .. });
     match request.message {
         Message::EnqueueWaiting { contract, request } => {
             let id = fresh_id()?;
@@ -306,7 +317,7 @@ fn handle(
                     .clone(),
             );
         }
-        Message::Enter { id, key } => {
+        Message::Start { id, key } | Message::Enter { id, key } => {
             ensure!(
                 native.can_enter(),
                 "host supervision inhibits new execution"
@@ -315,7 +326,8 @@ fn handle(
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
             ensure!(
-                entry.phase == Phase::Reserved && now_ms()? < entry.deadline_ms,
+                (entry.phase == Phase::Reserved || (!starting && entry.phase == Phase::Starting))
+                    && now_ms()? < entry.deadline_ms,
                 "ticket cannot enter"
             );
             ensure!(
@@ -329,7 +341,7 @@ fn handle(
             let identity = native
                 .identify(entry, pid)
                 .map_err(|_| anyhow::anyhow!("native workload identity or enforcement mismatch"))?;
-            if let Some(socket) = host_socket {
+            if !starting && let Some(socket) = host_socket {
                 crate::host_server::verify_entry(socket, pid, &identity, &entry.contract)?;
             }
             ensure!(
@@ -340,8 +352,12 @@ fn handle(
                 native.can_enter(),
                 "host supervision changed during entry verification"
             );
-            ledger.enter(&id, identity)?;
-            observations.entry_keys.remove(&id);
+            if starting {
+                ledger.start(&id, identity, now_ms()?)?;
+            } else {
+                ledger.enter(&id, identity)?;
+                observations.entry_keys.remove(&id);
+            }
             response.entry = ledger.get(&id).cloned();
         }
         Message::Cancel { id } => {
@@ -351,9 +367,12 @@ fn handle(
                     "only the submitting client may cancel this ticket"
                 );
             }
-            if ledger.cancel_pending(&id) {
-                observations.entry_keys.remove(&id);
-            } else if let Some(entry) = ledger.get(&id) {
+            // Revoke entry before requesting asynchronous native stop. A late
+            // host grant must not authorize a cancelled helper in the meantime.
+            observations.entry_keys.remove(&id);
+            if !ledger.cancel_pending(&id)
+                && let Some(entry) = ledger.get(&id)
+            {
                 native.stop(entry).map_err(|_| {
                     anyhow::anyhow!("native stop unconfirmed; reservation retained")
                 })?;

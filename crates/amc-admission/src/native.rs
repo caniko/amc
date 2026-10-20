@@ -107,7 +107,7 @@ impl Systemd {
     fn show(&self, unit: &str) -> Result<BTreeMap<String, String>> {
         let text = capture(Command::new(&self.systemctl).args([
             "--user", "show", "--no-pager",
-            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Slice,Restart,KillMode,OOMPolicy,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal",
+            "--property=LoadState,ActiveState,ControlGroup,InvocationID,MainPID,Slice,Restart,KillMode,OOMPolicy,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStartUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal,Type,NotifyAccess",
             "--", unit,
         ]))?;
         Ok(text
@@ -196,6 +196,15 @@ impl Native for Systemd {
                 && field(&unit, "OOMPolicy") == "kill",
             "wrong workload lifecycle"
         );
+        if entry.queue.is_some() {
+            ensure!(
+                field(&unit, "Type") == "notify"
+                    && field(&unit, "NotifyAccess") == "main"
+                    && field(&unit, "ActiveState") == "activating"
+                    && duration_us(field(&unit, "TimeoutStartUSec")) == Some(30_000_000),
+                "queued workload requires finite notify startup"
+            );
+        }
         if let Some(seconds) = entry.contract.runtime_max_sec {
             ensure!(
                 duration_us(field(&unit, "RuntimeMaxUSec"))

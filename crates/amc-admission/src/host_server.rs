@@ -33,7 +33,9 @@ pub enum Request {
     },
     Acquire {
         version: u32,
-        wait_ms: u64,
+        /// Omission means patient resource waiting; legacy peers reject it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation: Option<crate::continuation::ContinuationCapability>,
     },
@@ -222,28 +224,35 @@ pub fn transient_transport(e: &anyhow::Error) -> bool {
 /// Helper calls this before its private coordinator's native entry handshake.
 pub fn acquire(
     socket: &Path,
-    wait: Duration,
+    wait: Option<Duration>,
     stopping: impl Fn() -> bool,
+    mut waiting: impl FnMut() -> Result<()>,
 ) -> Result<Option<crate::continuation::ContinuationCapability>> {
-    let deadline = Instant::now() + wait;
+    let deadline = wait.map(|wait| Instant::now() + wait);
     let mut explained = false;
     loop {
         ensure!(
-            !stopping() && Instant::now() < deadline,
+            !stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline),
             "host admission cancelled or timed out"
         );
-        let left = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .min(3_600_000) as u64;
+        waiting()?;
+        let left = deadline.map(|deadline| {
+            (deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(3_600_000) as u64)
+                .max(1)
+        });
         // A resource wait cannot inherit a fresh transport budget for each frame.
         // A grant whose acknowledgement is lost remains held until native cleanup.
-        let rpc_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        let rpc_deadline = deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(2))
+            .min(Instant::now() + Duration::from_secs(2));
         let reply = exchange_cancellable(
             connect(socket)?,
             &Request::Acquire {
                 version: 1,
-                wait_ms: left.max(1),
+                wait_ms: left,
                 continuation: std::env::var("AMC_CONTINUATION")
                     .ok()
                     .map(|value| serde_json::from_str(&value))
@@ -252,7 +261,7 @@ pub fn acquire(
             Some((rpc_deadline, &stopping)),
         )?;
         ensure!(
-            !stopping() && Instant::now() < deadline,
+            !stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline),
             "host admission cancelled or timed out"
         );
         if reply.granted {
@@ -527,14 +536,15 @@ pub fn serve_supervised(
                             ensure!(version == 1, "unsupported host protocol");
                             populate_status(&mut reply, ledger, credentials.uid());
                         }
-                        Request::Acquire {
-                            version, wait_ms, ..
-                        }
-                        | Request::AcquirePool {
-                            version, wait_ms, ..
-                        } => {
+                        Request::Acquire { version, .. } | Request::AcquirePool { version, .. } => {
+                            let wait_ms = match &request {
+                                Request::Acquire { wait_ms, .. } => *wait_ms,
+                                Request::AcquirePool { wait_ms, .. } => Some(*wait_ms),
+                                _ => unreachable!(),
+                            };
                             ensure!(
-                                version == 1 && (1..=3_600_000).contains(&wait_ms),
+                                version == 1
+                                    && wait_ms.is_none_or(|ms| (1..=3_600_000).contains(&ms)),
                                 "invalid host request"
                             );
                             let (domain, identity, memory_bytes, swap_bytes) =
@@ -732,7 +742,8 @@ pub fn serve_supervised(
                                     memory_bytes,
                                     swap_bytes,
                                     requested_ms: now,
-                                    deadline_ms: now.saturating_add(wait_ms),
+                                    deadline_ms: wait_ms
+                                        .map_or(u64::MAX, |ms| now.saturating_add(ms)),
                                     granted: false,
                                     owners: vec![],
                                     owners_finished: false,
@@ -1965,6 +1976,20 @@ mod tests {
     use crate::protocol::{read_frame, write_frame};
 
     #[test]
+    fn host_wait_is_optional_without_changing_legacy_finite_requests() {
+        for wait in [None, Some(250u64)] {
+            let mut value = serde_json::json!({"op": "acquire", "version": 1});
+            if let Some(wait) = wait {
+                value["wait_ms"] = serde_json::json!(wait);
+            }
+            let request: Request = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded.get("wait_ms").and_then(|v| v.as_u64()), wait);
+            assert_eq!(encoded.get("wait_ms").is_none(), wait.is_none());
+        }
+    }
+
+    #[test]
     fn controlled_exchange_rejects_grants_after_a_wait_deadline_or_cancellation() {
         for cancelled in [false, true] {
             let (client, mut broker) = UnixStream::pair().unwrap();
@@ -1987,7 +2012,7 @@ mod tests {
                 client,
                 &Request::Acquire {
                     version: 1,
-                    wait_ms: 100,
+                    wait_ms: Some(100),
                     continuation: None,
                 },
                 Some((
@@ -2035,7 +2060,7 @@ mod tests {
                 client,
                 &Request::Acquire {
                     version: 1,
-                    wait_ms: 1000,
+                    wait_ms: Some(1000),
                     continuation: None,
                 },
                 Some((Instant::now() + Duration::from_secs(2), &|| false)),

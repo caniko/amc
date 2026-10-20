@@ -103,6 +103,9 @@ pub enum AdmissionCommand {
         entry_key: String,
         #[arg(long)]
         host_socket: Option<PathBuf>,
+        /// Patient native startup uses notify readiness, not exec readiness.
+        #[arg(long)]
+        queue: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -281,29 +284,71 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             ticket,
             entry_key,
             host_socket,
+            queue,
             command,
         } => {
             // Authorization is persisted before this reply. If the reply is
             // lost, nothing executes and native reconciliation retires us.
-            let signals = host_socket
-                .as_ref()
-                .map(|_| crate::control::Signals::install())
+            let signals = (host_socket.is_some() || queue)
+                .then(crate::control::Signals::install)
                 .transpose()?;
             let mut continuation = None;
-            if let Some(host_socket) = host_socket {
-                let remaining = call(&socket, Message::Poll { id: ticket.clone() })?
+            let starting = if queue {
+                Some(
+                    call(
+                        &socket,
+                        Message::Start {
+                            id: ticket.clone(),
+                            key: entry_key.clone(),
+                        },
+                    )?
                     .entry
-                    .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
-                    .deadline_ms
-                    .saturating_sub(server::now_ms()?)
-                    .saturating_sub(1000);
+                    .ok_or_else(|| anyhow::anyhow!("missing native startup ticket"))?,
+                )
+            } else {
+                None
+            };
+            if let Some(host_socket) = host_socket {
+                let entry = if let Some(entry) = starting.as_ref() {
+                    entry.clone()
+                } else {
+                    call(&socket, Message::Poll { id: ticket.clone() })?
+                        .entry
+                        .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
+                };
+                let deadline = if queue {
+                    entry
+                        .queue
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing resource-wait clock"))?
+                        .deadline_ms
+                } else {
+                    Some(entry.deadline_ms.saturating_sub(1000))
+                };
+                let now = server::now_ms()?;
+                let remaining =
+                    deadline.map(|deadline| Duration::from_millis(deadline.saturating_sub(now)));
+                let mut extension = None;
                 continuation = amc_admission::host_server::acquire(
                     &host_socket,
-                    Duration::from_millis(remaining),
+                    remaining,
                     || {
                         signals
                             .as_ref()
                             .is_some_and(|signals| signals.cancelled().is_some())
+                    },
+                    || {
+                        if queue
+                            && extension.is_none_or(|last: Instant| {
+                                last.elapsed() >= Duration::from_secs(5)
+                            })
+                        {
+                            crate::native_start::notify(
+                                "EXTEND_TIMEOUT_USEC=30000000\nSTATUS=Waiting for host capacity",
+                            )?;
+                            extension = Some(Instant::now());
+                        }
+                        Ok(())
                     },
                 )?;
             }
@@ -323,6 +368,10 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 payload.env("AMC_CONTINUATION", serde_json::to_string(&continuation)?);
             } else {
                 payload.env_remove("AMC_CONTINUATION");
+            }
+            if queue {
+                crate::native_start::notify("READY=1\nSTATUS=Executing admitted workload")?;
+                payload.env_remove("NOTIFY_SOCKET");
             }
             if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
                 return Ok(128 + signal);
@@ -414,8 +463,15 @@ fn run(
         "--pipe",
         "--same-dir",
         "--expand-environment=no",
-        "--service-type=exec",
     ]);
+    client.arg(if entry.queue.is_some() {
+        "--service-type=notify"
+    } else {
+        "--service-type=exec"
+    });
+    if entry.queue.is_some() {
+        client.arg("--property=NotifyAccess=main");
+    }
     client.arg(format!("--unit={}", entry.unit()));
     for property in [
         format!("Slice={}", entry.contract.slice),
@@ -471,6 +527,9 @@ fn run(
         .args(["admission", "enter", "--socket"])
         .arg(socket)
         .args(["--ticket", &entry.id, "--entry-key", &entry_key]);
+    if entry.queue.is_some() {
+        client.arg("--queue");
+    }
     if let Some(host_socket) = host_socket {
         client.arg("--host-socket").arg(host_socket);
     }
