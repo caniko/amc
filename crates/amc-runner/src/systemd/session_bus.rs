@@ -75,6 +75,28 @@ fn properties(
     (values.len() == names.len()).then_some(values)
 }
 
+/// Read an already-loaded AMC service through its owner's exact session bus.
+/// Returns busctl's typed property values in `names` order. Missing services,
+/// malformed replies and expired observations are unknown, never permission to run.
+pub fn user_service_properties(uid: u32, unit: &str, names: &[&str]) -> Option<Vec<Value>> {
+    if !valid_unit(unit) {
+        return None;
+    }
+    let deadline = Some(Instant::now() + QUERY_TIMEOUT);
+    let loaded = manager_call_until(uid, "GetUnit", "s", &[unit], deadline)?;
+    let path = data(&loaded, "o")?.as_array()?.first()?.as_str()?;
+    if !path.starts_with("/org/freedesktop/systemd1/unit/") {
+        return None;
+    }
+    properties(
+        uid,
+        path,
+        "org.freedesktop.systemd1.Service",
+        names,
+        deadline,
+    )
+}
+
 fn data<'a>(property: &'a Value, kind: &str) -> Option<&'a Value> {
     (property.get("type")?.as_str()? == kind).then(|| property.get("data"))?
 }
@@ -264,6 +286,17 @@ fn await_cleanup(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn service_property_queries_reject_foreign_units_before_connecting() {
+        for unit in [
+            "foreign.service",
+            "app-amc-invalid/entry.service",
+            "app-amc-job.scope",
+        ] {
+            assert!(user_service_properties(u32::MAX, unit, &["MainPID"]).is_none());
+        }
+    }
 
     #[test]
     fn session_bus_identity_and_unknown_states_cannot_prove_completion() {

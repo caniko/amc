@@ -12,6 +12,7 @@ mod session_bus;
 mod startup;
 pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
+pub use session_bus::user_service_properties;
 pub use startup::{StartupBarrier, wait_for_host_runner, wait_for_startup};
 
 use std::{
