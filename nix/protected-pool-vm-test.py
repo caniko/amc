@@ -33,6 +33,23 @@ def wait_bytes(value):
     ))
 
 
+with test_section("native deadline observations see user buses but cannot read homes or write runtime files"):
+    broker = "$(systemctl show --property=MainPID --value amc-host-admission)"
+    sandbox = f"nsenter --target {broker} --mount -- "
+    for uid in [1000, 1001]:
+        # Run in the actual broker mount namespace, not the test driver's less
+        # restrictive namespace. Root-to-user bus access must work there too.
+        observed = json.loads(machine.succeed(sandbox +
+            f"busctl --address=unix:path=/run/user/{uid}/bus --timeout=2s --json=short call "
+            "org.freedesktop.systemd1 /org/freedesktop/systemd1 "
+            "org.freedesktop.systemd1.Manager GetUnit s amc-admission.service"))
+        assert observed["type"] == "o", observed
+        machine.fail(sandbox + f"touch /run/user/{uid}/must-not-write")
+    machine.succeed("touch /home/alice/broker-hidden-fixture /root/broker-hidden-fixture")
+    for home in ["/home/alice", "/root"]:
+        machine.succeed(sandbox + f"test ! -e {home}/broker-hidden-fixture")
+
+
 backing = 128 * 1048576
 with test_section("idle protected backing survives broker restart"):
     wait_bytes(backing)
