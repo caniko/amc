@@ -1,5 +1,6 @@
 import json
 import shlex
+import time
 
 machine = globals()["machine"]
 test_section = globals()["subtest"]
@@ -32,6 +33,30 @@ def wait_bytes(value):
     ))
 
 
+with test_section("native deadline observations see user buses but cannot read homes or write runtime files"):
+    broker = "$(systemctl show --property=MainPID --value amc-host-admission)"
+    # Enter the target root as well: keeping the driver's root/cwd can bypass
+    # systemd's overmounted filesystem view despite joining its mount namespace.
+    sandbox = f"nsenter --target {broker} --mount --root --wd=/ -- "
+    for name, uid in [("alice", 1000), ("bob", 1001)]:
+        # ProtectHome=yes: the broker namespace has no user runtime view.
+        machine.fail(sandbox + f"test -e /run/user/{uid}/bus")
+        machine.fail(sandbox + f"touch /run/user/{uid}/must-not-write")
+        # Like the broker's query child: root pins init's runtime directory as
+        # stdin, then the bus owner resolves only `bus` beneath that descriptor.
+        # A root connection is not a user-session credential.
+        observed = json.loads(machine.succeed(sandbox + "sh -c " + shlex.quote(
+            f"exec setpriv --reuid={name} --regid=users --init-groups "
+            "busctl --address=unix:path=/proc/self/fd/0/bus --timeout=2s --json=short call "
+            "org.freedesktop.systemd1 /org/freedesktop/systemd1 "
+            "org.freedesktop.systemd1.Manager GetUnit s amc-admission.service "
+            f"< /proc/1/root/run/user/{uid}")))
+        assert observed["type"] == "o", observed
+    machine.succeed("touch /home/alice/broker-hidden-fixture /root/broker-hidden-fixture")
+    for home in ["/home/alice", "/root"]:
+        machine.succeed(sandbox + f"test ! -e {home}/broker-hidden-fixture")
+
+
 backing = 128 * 1048576
 with test_section("idle protected backing survives broker restart"):
     wait_bytes(backing)
@@ -54,6 +79,17 @@ with test_section("full ordinary budget and queues leave both protected users av
         machine.succeed(small(f"dd if=/dev/zero of=/tmp/quick-cache-{number} bs=1M count=4 status=none; exit 0"))
         wait_bytes(256 * 1048576)
     machine.succeed(small("printf bob", 1001))
+    # Measure admitted payloads, not just an unqueued status endpoint. The
+    # end-to-end ceiling includes entry, execution and confirmed cleanup.
+    latencies = []
+    for number in range(20):
+        before = time.monotonic()
+        assert machine.succeed(small("printf control", 1000 + number % 2)) == "control"
+        latencies.append(time.monotonic() - before)
+    p95 = sorted(latencies)[18]
+    assert p95 <= 1.0, latencies
+    print(json.dumps({"controlAdmission": {"samples": 20, "users": 2,
+        "ordinaryQueueSaturated": True, "p95Seconds": p95, "latenciesSeconds": latencies}}))
 
 # An occupied slot survives both brokers restarting without payload replay.
 with test_section("occupied protected restart preserves identity and native deadline without replay"):

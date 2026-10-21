@@ -263,6 +263,211 @@ fn admission_execution_deadline_rejects_invalid_values_before_contacting_server(
 }
 
 #[test]
+fn admission_backpressure_exits_without_native_submission_or_a_waiting_client() {
+    use amc_admission::{
+        ledger::Backpressure,
+        protocol::{Message, Request, Response, read_frame, write_frame},
+    };
+    use std::os::unix::net::UnixListener;
+    for (delay, key, retryable) in [
+        (None, None, false),
+        (Some(250), None, true),
+        (Some(0), None, false),
+        (Some(60001), None, false),
+        (Some(250), Some("accepted-entry"), false),
+    ] {
+        let f = Fixture::new();
+        let socket = f.0.join("backpressure.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Request = read_frame(&mut stream).unwrap();
+            assert!(matches!(request.message, Message::EnqueueWaiting { .. }));
+            write_frame(
+                &mut stream,
+                &Response {
+                    version: 1,
+                    backpressure: delay.map(|retry_after_ms| Backpressure { retry_after_ms }),
+                    entry_key: key.map(String::from),
+                    error: Some("submission capacity is full".into()),
+                    ..Response::default()
+                },
+            )
+            .unwrap();
+        });
+        let token = "12345678-1234-1234-1234-123456789abc";
+        let mut command = f.command("not-run");
+        command
+            .args(["admission", "exec", "--socket"])
+            .arg(&socket)
+            .args([
+                "--contract",
+                "tool",
+                "--queue",
+                "--max-ram-usage",
+                "1MiB",
+                "--runtime-max-sec",
+                "5",
+                "--ready-token",
+                token,
+                "--",
+                "true",
+            ]);
+        let output = bounded(command);
+        server.join().unwrap();
+        assert_eq!(output.status.code(), Some(if retryable { 75 } else { 1 }));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        if retryable {
+            assert_eq!(error, format!("\x1e{token}:backpressure:250\x1f"));
+        } else {
+            assert!(!error.contains(":backpressure:"));
+        }
+        assert!(!f.0.join("calls").exists());
+    }
+}
+
+#[test]
+fn admission_untimed_queue_is_explicit_cancellable_and_never_spawns_while_waiting() {
+    use amc_admission::{
+        ledger::{Contract, Entry, Phase, QueueWait},
+        protocol::{Message, Request, Response, read_frame, write_frame},
+    };
+    use std::os::unix::net::UnixListener;
+    for (prefix, wait_ms) in [
+        (&["admission", "exec"][..], None),
+        (&["exec"][..], None),
+        (&["admission", "exec"][..], Some(1_000)),
+    ] {
+        let f = Fixture::new();
+        let socket = f.0.join("waiting.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (observed, waiting) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let entry = Entry {
+                id: "queued-ticket".into(),
+                name: "test".into(),
+                contract: Contract {
+                    burst: false,
+                    runtime_max_sec: Some(7),
+                    protected_pool: None,
+                    slice: "app.slice".into(),
+                    memory_max: 4096,
+                    memory_swap_max: 0,
+                    max_running: 1,
+                    pause_file: None,
+                },
+                phase: Phase::Queued,
+                deadline_ms: u64::MAX,
+                identity: None,
+                client: None,
+                queue: Some(QueueWait {
+                    submitted_ms: 1,
+                    deadline_ms: None,
+                }),
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut submitted = false;
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let request: Request = read_frame(&mut stream).unwrap();
+                let mut reply = Response {
+                    version: 1,
+                    ..Default::default()
+                };
+                let cancelled = match request.message {
+                    Message::EnqueueWaiting { contract, request } => {
+                        assert_eq!(contract, "test");
+                        assert_eq!(request.memory_max, 4096);
+                        assert_eq!(request.runtime_max_sec, 7);
+                        assert_eq!(request.wait_ms, wait_ms);
+                        assert!(!submitted);
+                        submitted = true;
+                        reply.entry_key = Some("private-key".into());
+                        reply.entry = Some(entry.clone());
+                        false
+                    }
+                    Message::Poll { id } => {
+                        assert!(submitted);
+                        assert_eq!(id, entry.id);
+                        reply.entry = Some(entry.clone());
+                        let _ = observed.send(());
+                        false
+                    }
+                    Message::Cancel { id } => {
+                        assert_eq!(id, entry.id);
+                        true
+                    }
+                    message => panic!("unexpected operation: {message:?}"),
+                };
+                write_frame(&mut stream, &reply).unwrap();
+                if cancelled {
+                    return true;
+                }
+            }
+        });
+        let mut command = f.command("reject");
+        command.args(prefix).arg("--socket").arg(&socket).args([
+            "--contract",
+            "test",
+            "--queue",
+            "--max-ram-usage",
+            "4096B",
+            "--runtime-max-sec",
+            "7",
+        ]);
+        if wait_ms.is_some() {
+            command.args(["--timeout", "1"]);
+        }
+        command.args(["--", "true"]);
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let accepted = waiting.recv_timeout(Duration::from_secs(3)).is_ok();
+        if accepted {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+            .unwrap();
+        } else {
+            let _ = child.kill();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let cancelled = server.join().unwrap();
+        assert!(accepted, "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(cancelled);
+        assert!(!output.status.success());
+        assert!(!f.0.join("calls").exists());
+        assert!(!f.0.join("queries").exists());
+    }
+}
+
+#[test]
 fn delayed_admission_grants_cannot_submit_after_the_client_deadline() {
     use amc_admission::{
         ledger::{Contract, Entry, Phase},
@@ -292,6 +497,7 @@ fn delayed_admission_grants_cannot_submit_after_the_client_deadline() {
                 deadline_ms: amc_admission::server::now_ms().unwrap() + 30_000,
                 identity: None,
                 client: None,
+                queue: None,
             };
             let (mut stream, _) = listener.accept().unwrap();
             stream

@@ -30,6 +30,9 @@ NATIVE_CASES = {
     "durable root pool tracks every potential execution owner",
     "helper cannot omit host capacity before private entry",
     "simultaneous users, restart persistence, and automatic lending",
+    "native patient queue overflow is typed and preserves every accepted ticket",
+    "patient host waiting exceeds 120 seconds without spending native execution time",
+    "finite host waiting, cancellation and private restart never run a queued payload",
     "changed native enforcement inhibits a fitting smaller job",
     "cancelled pending work never executes after native cleanup",
     "short native bursts exceed the normal budget and retain restart accounting",
@@ -63,6 +66,7 @@ SUPERVISION_CASES = {
     "different native domains exhaust the host budget without forgiving attempts",
 }
 PROTECTED_POOL_CASES = {
+    "native deadline observations see user buses but cannot read homes or write runtime files",
     "idle protected backing survives broker restart",
     "full ordinary budget and queues leave both protected users available",
     "occupied protected restart preserves identity and native deadline without replay",

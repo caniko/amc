@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in `amc exec --queue` and `amc admission exec --queue` for explicitly
+  memory- and runtime-bounded work, independent per-user queue/entry deadlines,
+  and typed queue backpressure with retry guidance.
 - Opt-in protected small-call pools with pre-accounted backing, separate queues,
   native resource/deadline bounds and ledger-safe restart and retirement.
 - Advance foreground preparation with durable drain barriers and once-only
@@ -40,6 +43,15 @@
 
 ### Fixed
 
+- Advance a changed host or private ledger on the next broker turn and poll
+  short waits every 25ms for their first second, instead of paying 250ms
+  polling quanta in each admission stage. Bound omitted host waits to one hour.
+- Resolve the host broker's direct session-bus queries beneath the owner's
+  runtime directory pinned in init's root, so protected deadline checks keep
+  `ProtectHome=yes` and no user-runtime mount is visible in the broker namespace.
+- Cancel stalled host-acquisition frames promptly, reject grants acknowledged
+  after the resource-wait deadline, and retain signal handling through native
+  entry so cancellation cannot be forgotten before payload execution.
 - Use all four CPUs of the public hosted runner and a bounded six-hour job
   window for patched ThinLTO kernel qualification after both original kernel
   builds exhausted four hours before VM startup.

@@ -5,11 +5,47 @@ use nix::{
     unistd::geteuid,
 };
 use std::{
+    ffi::OsStr,
     ffi::OsString,
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::{
+        linux::net::SocketAddrExt,
+        unix::{
+            ffi::OsStrExt,
+            net::{SocketAddr, UnixDatagram, UnixStream},
+            process::CommandExt,
+        },
+    },
     path::{Path, PathBuf},
     process::Command,
 };
+
+/// Only the native main helper emits startup extensions and final readiness.
+/// RuntimeMaxSec starts after READY, so resource waiting never spends it.
+pub fn notify(message: &str) -> Result<()> {
+    notify_at(
+        &std::env::var_os("NOTIFY_SOCKET").context("missing native notify socket")?,
+        message,
+    )
+}
+
+fn notify_at(name: &OsStr, message: &str) -> Result<()> {
+    let address = if let Some(name) = name.as_bytes().strip_prefix(b"@") {
+        SocketAddr::from_abstract_name(name)?
+    } else {
+        ensure!(
+            Path::new(name).is_absolute(),
+            "invalid native notify socket"
+        );
+        SocketAddr::from_pathname(name)?
+    };
+    let socket = UnixDatagram::unbound()?;
+    socket.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    ensure!(
+        socket.send_to_addr(message.as_bytes(), &address)? == message.len(),
+        "incomplete native notification"
+    );
+    Ok(())
+}
 
 /// Native startup pinning needs the same PID/UID view as the user manager.
 /// A namespace-local caller retains its streams and waits for a bounded host
@@ -242,6 +278,42 @@ pub fn wrap(client: &mut Command) -> Result<amc_runner::systemd::ClientRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_notifications_support_path_and_abstract_manager_sockets() {
+        let directory = std::env::temp_dir().join(format!(
+            "amc-notify-{}",
+            amc_admission::store::fresh_id().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let pathname = directory.join("notify.sock");
+        let name = format!("amc-notify-{}", amc_admission::store::fresh_id().unwrap());
+        for abstract_socket in [false, true] {
+            let address = if abstract_socket {
+                SocketAddr::from_abstract_name(&name).unwrap()
+            } else {
+                SocketAddr::from_pathname(&pathname).unwrap()
+            };
+            let receiver = UnixDatagram::bind_addr(&address).unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let target = if abstract_socket {
+                OsString::from(format!("@{name}"))
+            } else {
+                pathname.clone().into_os_string()
+            };
+            for message in ["EXTEND_TIMEOUT_USEC=30000000", "READY=1"] {
+                notify_at(&target, message).unwrap();
+                let mut buffer = [0; 64];
+                let length = receiver.recv(&mut buffer).unwrap();
+                assert_eq!(&buffer[..length], message.as_bytes());
+            }
+        }
+        assert!(notify_at(OsStr::new("relative"), "READY=1").is_err());
+        std::fs::remove_file(pathname).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn host_runner_keeps_literal_command_streams_and_bounded_zero_swap_enforcement() {

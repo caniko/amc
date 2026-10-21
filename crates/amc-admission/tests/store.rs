@@ -29,6 +29,7 @@ fn running_ledger() -> Ledger {
             inode: 1,
         }),
         client: None,
+        queue: None,
     });
     ledger
 }

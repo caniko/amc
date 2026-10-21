@@ -61,6 +61,27 @@ amc admission exec --contract example --timeout 120 --runtime-max-sec 300 -- com
 survives client/coordinator death; native stop time is additional. It is omitted
 for long-lived servers unless explicitly requested.
 
+For bounded work, opt into a patient per-user resource queue:
+
+```sh
+amc exec --contract example --queue --max-ram-usage 64MiB --runtime-max-sec 300 -- command argument
+```
+
+`--queue` requires both ceilings. Without `--timeout`, resource waiting has no
+implicit expiry unless the selected protected pool caps it. Legacy calls still
+default to 120 seconds. A grant receives a fresh 30-second entry grace; native
+startup is bounded separately at 30 seconds. Full queues return typed
+backpressure with `retry_after_ms`, not an execution failure for accepted work.
+Status and cancellation remain available at the queue bound. Accepted tickets
+are not executable replay records: restart still discards unentered work.
+
+Queued helpers keep this patience across shared-host waits: each host
+reservation is finite (one hour) and the helper re-requests it after expiry.
+`Type=notify` defers native `RuntimeMaxSec` until `READY=1`, so host queue time
+does not spend the runtime bound. See [patient native execution](queued-execution.md)
+for the readiness/completion protocol, qualification gates and the consumer
+boundaries that remain before lifetime slots can be retired.
+
 ## Installation and removal
 
 The service is optional. The embeddable gates, `inspect`, `watch` and offline
@@ -138,6 +159,17 @@ with hard/swap limits, `Restart=no`, `OOMPolicy=kill`, and control-group cleanup
 An internal helper starts inside the native service and asks the coordinator to
 verify its peer PID, invocation, placement, and kernel limits **before exec**.
 Only a durably recorded entry acknowledgment permits the actual command to run.
+
+The native helper's host acquisition uses one two-second frame-exchange
+deadline, capped by the remaining resource wait. Stalled frame I/O checks
+cancellation every 50 ms; late grants cannot authorize execution after
+cancellation or wait expiry.
+The native helper retains signal handling through its private entry handshake
+and checks cancellation again before exec. Losing a grant reply never releases
+its reservation: native cleanup must still be verified. Socket connection itself
+is currently blocking, so cancellation under a full listen backlog is not yet
+bounded. This does not make host waits untimed or separate native startup from
+workload runtime; those remain independent qualification requirements.
 
 ## Failure and recovery
 

@@ -5,10 +5,7 @@ use crate::{
     policy::{Domain, Lifecycle, Mode, Policy},
     recovery::{FailedIdentity, Identity, RecoveryIdentity},
 };
-use amc_admission::{
-    ledger::{Ledger, Phase},
-    native::cgroup_directory,
-};
+use amc_admission::{ledger::Ledger, native::cgroup_directory};
 use amc_runner::systemd::capture;
 use amc_telemetry::{PinnedReader, Snapshot};
 use anyhow::{Result, ensure};
@@ -720,7 +717,7 @@ pub fn job_domains(policy: &Policy, boot: &str) -> Result<Vec<Domain>> {
         for entry in ledger
             .entries
             .iter()
-            .filter(|e| e.phase == Phase::Running && pool.contracts.contains(&e.name))
+            .filter(|e| e.identity.is_some() && pool.contracts.contains(&e.name))
         {
             let domain = Domain {
                 id: format!("{}-{}", pool.id, entry.id),
@@ -747,6 +744,65 @@ pub fn job_domains(policy: &Policy, boot: &str) -> Result<Vec<Domain>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn queued_native_helpers_remain_visible_to_supervision_before_payload_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "amc-wait-supervision-{}",
+            amc_admission::store::fresh_id().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let mut policy: Policy =
+            serde_json::from_str(include_str!("../../../examples/supervision.json")).unwrap();
+        policy.job_pools = vec![crate::policy::JobPool {
+            id: "jobs".into(),
+            uid: fs::metadata(&root).unwrap().uid(),
+            state: root.clone(),
+            contracts: vec!["tool".into()],
+            lifecycle: Lifecycle::Terminate,
+            priority: 0,
+        }];
+        let mut ledger: Ledger = serde_json::from_value(serde_json::json!({
+            "version": 1, "boot_id": "boot", "entries": [{"id": "job", "name": "tool",
+                "phase": "reserved", "deadline_ms": 30000, "identity": null,
+                "contract": {"slice": "work.slice", "memory_max": 600, "memory_swap_max": 0,
+                    "max_running": 1, "pause_file": null, "runtime_max_sec": 1},
+                "queue": {"submitted_ms": 0, "deadline_ms": null}}]
+        }))
+        .unwrap();
+        let identity = amc_admission::ledger::Identity {
+            invocation: "a".repeat(32),
+            cgroup: "/work/job".into(),
+            inode: 1,
+        };
+        fs::write(
+            root.join("ledger.json"),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        assert!(job_domains(&policy, "boot").unwrap().is_empty());
+        ledger.start("job", identity.clone(), 10).unwrap();
+        for running in [false, true] {
+            if running {
+                ledger.enter("job", identity.clone()).unwrap();
+            }
+            fs::write(
+                root.join("ledger.json"),
+                serde_json::to_vec(&ledger).unwrap(),
+            )
+            .unwrap();
+            let domains = job_domains(&policy, "boot").unwrap();
+            assert_eq!(
+                domains.len(),
+                1,
+                "starting and running helpers both require native supervision"
+            );
+            assert_eq!(domains[0].expected, Some(identity.clone()));
+            assert_eq!(domains[0].memory_max, 600);
+        }
+        fs::remove_file(root.join("ledger.json")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn restart_requires_fresh_native_authority_and_original_termination() {

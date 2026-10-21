@@ -320,12 +320,29 @@ pub(crate) fn memory_enforcement(r: &crate::host::Reservation) -> Option<()> {
 /// Query the execution owner's actual manager, rather than trusting an estimate
 /// or the submitting helper's argv. The root broker can address each user bus.
 pub fn burst_runtime(identity: &Identity) -> Result<u64> {
-    let text = amc_runner::systemd::capture(std::process::Command::new("systemctl").args([
-        "--user", &format!("--machine={}@.host", identity.uid), "show", "--no-pager",
-        "--property=ControlGroup,MainPID,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,TimeoutStopUSec,SendSIGKILL,FinalKillSignal,Restart,KillMode,OOMPolicy",
-        "--", Path::new(&identity.cgroup).file_name().and_then(|s| s.to_str()).context("missing burst unit")?,
-    ]))?;
-    let runtime = verified_burst_runtime(&text, identity)?;
+    // --machine starts a login/stdio bridge for every read. The existing direct
+    // bus transport avoids that cost without caching or weakening native checks.
+    let properties = amc_runner::systemd::user_service_properties(
+        identity.uid,
+        Path::new(&identity.cgroup)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("missing burst unit")?,
+        &[
+            "ControlGroup",
+            "MainPID",
+            "RuntimeMaxUSec",
+            "RuntimeRandomizedExtraUSec",
+            "TimeoutStopUSec",
+            "SendSIGKILL",
+            "FinalKillSignal",
+            "Restart",
+            "KillMode",
+            "OOMPolicy",
+        ],
+    )
+    .context("burst manager properties unavailable")?;
+    let runtime = verified_burst_runtime(&properties, identity)?;
     ensure!(
         process_start(identity.pid)? == identity.start_ticks,
         "burst process identity changed"
@@ -333,25 +350,32 @@ pub fn burst_runtime(identity: &Identity) -> Result<u64> {
     Ok(runtime)
 }
 
-fn verified_burst_runtime(text: &str, identity: &Identity) -> Result<u64> {
-    let fields: std::collections::BTreeMap<_, _> =
-        text.lines().filter_map(|l| l.split_once('=')).collect();
-    let get = |name| fields.get(name).copied().unwrap_or("");
+fn verified_burst_runtime(fields: &[serde_json::Value], identity: &Identity) -> Result<u64> {
+    let kinds = ["s", "u", "t", "t", "t", "b", "i", "s", "s", "s"];
     ensure!(
-        get("ControlGroup") == identity.cgroup
-            && get("MainPID").parse::<i32>()? == identity.pid
-            && get("Restart") == "no"
-            && get("KillMode") == "control-group"
-            && get("OOMPolicy") == "kill"
-            && get("SendSIGKILL") == "yes"
-            && get("FinalKillSignal") == "9"
-            && crate::native::duration_us(get("RuntimeRandomizedExtraUSec")) == Some(0)
-            && crate::native::duration_us(get("TimeoutStopUSec"))
+        fields.len() == kinds.len()
+            && fields
+                .iter()
+                .zip(kinds)
+                .all(|(field, kind)| field["type"] == kind),
+        "invalid burst manager property types"
+    );
+    let get = |index: usize| &fields[index]["data"];
+    ensure!(
+        get(0).as_str() == Some(identity.cgroup.as_str())
+            && get(1).as_i64() == Some(i64::from(identity.pid))
+            && get(7).as_str() == Some("no")
+            && get(8).as_str() == Some("control-group")
+            && get(9).as_str() == Some("kill")
+            && get(5).as_bool() == Some(true)
+            && get(6).as_i64() == Some(9)
+            && get(3).as_u64() == Some(0)
+            && get(4)
+                .as_u64()
                 .is_some_and(|timeout| timeout > 0 && timeout <= 1_000_000),
         "burst native identity or cleanup enforcement mismatch"
     );
-    let micros = crate::native::duration_us(get("RuntimeMaxUSec"))
-        .context("missing finite native runtime")?;
+    let micros = get(2).as_u64().context("missing finite native runtime")?;
     ensure!(
         micros > 0 && micros <= 30_000_000 && micros.is_multiple_of(1000),
         "burst requires a finite short native deadline"
@@ -924,26 +948,50 @@ mod tests {
             pid: 42,
             start_ticks: 1,
         };
-        let valid = "ControlGroup=/burst/job.service\nMainPID=42\nRestart=no\nKillMode=control-group\nOOMPolicy=kill\nSendSIGKILL=yes\nFinalKillSignal=9\nRuntimeMaxUSec=5s\nRuntimeRandomizedExtraUSec=0\nTimeoutStopUSec=1s\n";
-        assert_eq!(verified_burst_runtime(valid, &identity).unwrap(), 5000);
-        for (before, after) in [
-            ("MainPID=42", "MainPID=43"),
-            ("Restart=no", "Restart=always"),
-            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=infinity"),
-            ("RuntimeMaxUSec=5s", "RuntimeMaxUSec=30s 1us"),
-            (
-                "RuntimeRandomizedExtraUSec=0",
-                "RuntimeRandomizedExtraUSec=1s",
-            ),
-            ("TimeoutStopUSec=1s", "TimeoutStopUSec=15s"),
-            ("TimeoutStopUSec=1s", "TimeoutStopUSec=0"),
-            ("SendSIGKILL=yes", "SendSIGKILL=no"),
-            ("FinalKillSignal=9", "FinalKillSignal=19"),
+        let valid = vec![
+            serde_json::json!({"type":"s", "data":"/burst/job.service"}),
+            serde_json::json!({"type":"u", "data":42}),
+            serde_json::json!({"type":"t", "data":5_000_000}),
+            serde_json::json!({"type":"t", "data":0}),
+            serde_json::json!({"type":"t", "data":1_000_000}),
+            serde_json::json!({"type":"b", "data":true}),
+            serde_json::json!({"type":"i", "data":9}),
+            serde_json::json!({"type":"s", "data":"no"}),
+            serde_json::json!({"type":"s", "data":"control-group"}),
+            serde_json::json!({"type":"s", "data":"kill"}),
+        ];
+        assert_eq!(verified_burst_runtime(&valid, &identity).unwrap(), 5000);
+        for (index, value) in [
+            (0, serde_json::json!("/foreign/job.service")),
+            (1, serde_json::json!(43)),
+            (1, serde_json::json!("42")),
+            (2, serde_json::json!(u64::MAX)),
+            (2, serde_json::json!(30_000_001)),
+            (2, serde_json::json!(5_000_001)),
+            (3, serde_json::json!(1_000_000)),
+            (4, serde_json::json!(15_000_000)),
+            (4, serde_json::json!(0)),
+            (5, serde_json::json!(false)),
+            (6, serde_json::json!(19)),
+            (7, serde_json::json!("always")),
+            (8, serde_json::json!("process")),
+            (9, serde_json::json!("continue")),
         ] {
+            let mut changed = valid.clone();
+            changed[index]["data"] = value;
             assert!(
-                verified_burst_runtime(&valid.replace(before, after), &identity).is_err(),
-                "{before}"
+                verified_burst_runtime(&changed, &identity).is_err(),
+                "{index}"
             );
+        }
+        for index in 0..valid.len() {
+            let mut changed = valid.clone();
+            changed[index]["type"] = serde_json::json!("v");
+            assert!(
+                verified_burst_runtime(&changed, &identity).is_err(),
+                "{index}"
+            );
+            assert!(verified_burst_runtime(&valid[..index], &identity).is_err());
         }
     }
 

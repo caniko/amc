@@ -1,6 +1,6 @@
 //! Production admission CLI. The native entry handshake gates execution.
 use amc_admission::{
-    ledger::{Phase, Policy},
+    ledger::{Backpressure, Phase, Policy, QueueRequest},
     native::Systemd,
     protocol::{Message, call},
     server,
@@ -11,7 +11,7 @@ use clap::Subcommand;
 use std::{
     ffi::OsString,
     fs::File,
-    io::Read,
+    io::{Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
@@ -72,9 +72,15 @@ pub enum AdmissionCommand {
         socket: Option<PathBuf>,
         #[arg(long)]
         contract: String,
-        /// Maximum admission wait; does not bound workload execution.
-        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout: u64,
+        /// Maximum admission wait; defaults to 120s unless --queue is selected.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+        /// Queue bounded work without an implicit resource-wait deadline.
+        #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"])]
+        queue: bool,
+        /// Emit native-entry or nonacceptance control frames on stderr.
+        #[arg(long, value_parser = parse_ready_token)]
+        ready_token: Option<String>,
         /// Optional systemd execution deadline for a disposable job, in seconds.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
         runtime_max_sec: Option<u64>,
@@ -100,6 +106,11 @@ pub enum AdmissionCommand {
         entry_key: String,
         #[arg(long)]
         host_socket: Option<PathBuf>,
+        /// Patient native startup uses notify readiness, not exec readiness.
+        #[arg(long)]
+        queue: bool,
+        #[arg(long, value_parser = parse_ready_token)]
+        ready_token: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -225,37 +236,54 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             socket,
             contract,
             timeout,
+            queue,
+            ready_token,
             runtime_max_sec,
             burst,
             max_ram_usage,
             protected_pool,
             command,
         } => {
-            let request = match (max_ram_usage, protected_pool) {
-                (Some(memory_max), true) => Message::EnqueueBounded {
+            let wait = timeout.or((!queue).then_some(120));
+            let wait_ms = timeout.unwrap_or(120) * 1000;
+            let request = if queue {
+                Message::EnqueueWaiting {
                     contract,
-                    wait_ms: timeout * 1000,
-                    memory_max,
-                    runtime_max_sec: runtime_max_sec
-                        .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
-                },
-                (Some(memory_max), false) => Message::EnqueueSized {
-                    contract,
-                    wait_ms: timeout * 1000,
-                    memory_max,
-                },
-                (None, _) => Message::Enqueue {
-                    contract,
-                    wait_ms: timeout * 1000,
-                },
+                    request: QueueRequest {
+                        memory_max: max_ram_usage.ok_or_else(|| {
+                            anyhow::anyhow!("queued work requires a memory ceiling")
+                        })?,
+                        runtime_max_sec: runtime_max_sec.ok_or_else(|| {
+                            anyhow::anyhow!("queued work requires an execution deadline")
+                        })?,
+                        wait_ms: wait.map(|seconds| seconds * 1000),
+                    },
+                }
+            } else {
+                match (max_ram_usage, protected_pool) {
+                    (Some(memory_max), true) => Message::EnqueueBounded {
+                        contract,
+                        wait_ms,
+                        memory_max,
+                        runtime_max_sec: runtime_max_sec
+                            .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
+                    },
+                    (Some(memory_max), false) => Message::EnqueueSized {
+                        contract,
+                        wait_ms,
+                        memory_max,
+                    },
+                    (None, _) => Message::Enqueue { contract, wait_ms },
+                }
             };
             run(
                 &socket_path(socket)?,
-                timeout,
+                wait.map(Duration::from_secs),
                 runtime_max_sec,
                 burst,
                 request,
                 &command,
+                ready_token.as_deref(),
             )
         }
         AdmissionCommand::Enter {
@@ -263,24 +291,77 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             ticket,
             entry_key,
             host_socket,
+            queue,
+            ready_token,
             command,
         } => {
             // Authorization is persisted before this reply. If the reply is
             // lost, nothing executes and native reconciliation retires us.
+            let signals = (host_socket.is_some() || queue)
+                .then(crate::control::Signals::install)
+                .transpose()?;
             let mut continuation = None;
-            if let Some(host_socket) = host_socket {
-                let signals = crate::control::Signals::install()?;
-                let remaining = call(&socket, Message::Poll { id: ticket.clone() })?
+            let starting = if queue {
+                Some(
+                    call(
+                        &socket,
+                        Message::Start {
+                            id: ticket.clone(),
+                            key: entry_key.clone(),
+                        },
+                    )?
                     .entry
-                    .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
-                    .deadline_ms
-                    .saturating_sub(server::now_ms()?)
-                    .saturating_sub(1000);
+                    .ok_or_else(|| anyhow::anyhow!("missing native startup ticket"))?,
+                )
+            } else {
+                None
+            };
+            if let Some(host_socket) = host_socket {
+                let entry = if let Some(entry) = starting.as_ref() {
+                    entry.clone()
+                } else {
+                    call(&socket, Message::Poll { id: ticket.clone() })?
+                        .entry
+                        .ok_or_else(|| anyhow::anyhow!("missing entry ticket"))?
+                };
+                let deadline = if queue {
+                    entry
+                        .queue
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing resource-wait clock"))?
+                        .deadline_ms
+                } else {
+                    Some(entry.deadline_ms.saturating_sub(1000))
+                };
+                let now = server::now_ms()?;
+                let remaining =
+                    deadline.map(|deadline| Duration::from_millis(deadline.saturating_sub(now)));
+                let mut extension = None;
                 continuation = amc_admission::host_server::acquire(
                     &host_socket,
-                    Duration::from_millis(remaining),
-                    || signals.cancelled().is_some(),
+                    remaining,
+                    || {
+                        signals
+                            .as_ref()
+                            .is_some_and(|signals| signals.cancelled().is_some())
+                    },
+                    || {
+                        if queue
+                            && extension.is_none_or(|last: Instant| {
+                                last.elapsed() >= Duration::from_secs(5)
+                            })
+                        {
+                            crate::native_start::notify(
+                                "EXTEND_TIMEOUT_USEC=30000000\nSTATUS=Waiting for host capacity",
+                            )?;
+                            extension = Some(Instant::now());
+                        }
+                        Ok(())
+                    },
                 )?;
+            }
+            if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
+                return Ok(128 + signal);
             }
             call(
                 &socket,
@@ -295,6 +376,19 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 payload.env("AMC_CONTINUATION", serde_json::to_string(&continuation)?);
             } else {
                 payload.env_remove("AMC_CONTINUATION");
+            }
+            if queue {
+                crate::native_start::notify("READY=1\nSTATUS=Executing admitted workload")?;
+                payload.env_remove("NOTIFY_SOCKET");
+            }
+            if let Some(signal) = signals.as_ref().and_then(|signals| signals.cancelled()) {
+                return Ok(128 + signal);
+            }
+            if let Some(token) = ready_token {
+                std::io::stderr()
+                    .lock()
+                    .write_all(format!("\x1e{token}\x1f").as_bytes())
+                    .context("notify caller of native entry")?;
             }
             Err(payload.exec())
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
@@ -316,16 +410,38 @@ fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
 
 fn run(
     socket: &Path,
-    timeout: u64,
+    wait: Option<Duration>,
     runtime_max_sec: Option<u64>,
     burst: bool,
     request: Message,
     argv: &[OsString],
+    ready_token: Option<&str>,
 ) -> Result<i32> {
     use amc_runner::systemd::execute;
     let signals = crate::control::Signals::install()?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    let response = call(socket, request)?;
+    let deadline = wait.map(|wait| Instant::now() + wait);
+    let queued = matches!(request, Message::EnqueueWaiting { .. });
+    let response = match call(socket, request) {
+        Ok(response) => response,
+        Err(error) => {
+            if queued
+                && let Some(token) = ready_token
+                && let Some(backpressure) = error.downcast_ref::<Backpressure>()
+            {
+                // Only explicit nonacceptance permits the intent owner to try
+                // again. Exit, rather than retaining one process per overflow.
+                std::io::stderr().lock().write_all(
+                    format!(
+                        "\x1e{token}:backpressure:{}\x1f",
+                        backpressure.retry_after_ms
+                    )
+                    .as_bytes(),
+                )?;
+                return Ok(75);
+            }
+            return Err(error);
+        }
+    };
     let host_socket = response.host_socket;
     if let Some(host_socket) = &host_socket
         && let Err(error) = crate::native_start::verify_host_runner(host_socket)
@@ -354,12 +470,15 @@ fn run(
         }
     };
     let short_call = burst || entry.contract.protected_pool.is_some();
+    let queued = Instant::now();
     while entry.phase == Phase::Queued {
-        if signals.cancelled().is_some() || Instant::now() >= deadline {
+        if signals.cancelled().is_some()
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
             let _ = call(socket, Message::Cancel { id: entry.id });
             anyhow::bail!("admission cancelled or timed out before submission");
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(amc_admission::host_server::poll_interval(queued));
         entry = call(
             socket,
             Message::Poll {
@@ -381,8 +500,15 @@ fn run(
         "--pipe",
         "--same-dir",
         "--expand-environment=no",
-        "--service-type=exec",
     ]);
+    client.arg(if entry.queue.is_some() {
+        "--service-type=notify"
+    } else {
+        "--service-type=exec"
+    });
+    if entry.queue.is_some() {
+        client.arg("--property=NotifyAccess=main");
+    }
     client.arg(format!("--unit={}", entry.unit()));
     for property in [
         format!("Slice={}", entry.contract.slice),
@@ -392,7 +518,7 @@ fn run(
         "OOMPolicy=kill".into(),
         "KillMode=control-group".into(),
         "Restart=no".into(),
-        format!("TimeoutStartSec={}s", timeout + 30),
+        "TimeoutStartSec=30s".into(),
         format!("TimeoutStopSec={}s", if short_call { 1 } else { 15 }),
     ] {
         client.arg(format!("--property={property}"));
@@ -438,13 +564,20 @@ fn run(
         .args(["admission", "enter", "--socket"])
         .arg(socket)
         .args(["--ticket", &entry.id, "--entry-key", &entry_key]);
+    if entry.queue.is_some() {
+        client.arg("--queue");
+    }
+    if let Some(token) = ready_token {
+        client.arg("--ready-token").arg(token);
+    }
     if let Some(host_socket) = host_socket {
         client.arg("--host-socket").arg(host_socket);
     }
     client.arg("--").args(argv);
     // A reservation reply can arrive after the client's wait has expired.
     // The coordinator's extra entry grace must not authorize a late submission.
-    if signals.cancelled().is_some() || Instant::now() >= deadline {
+    if signals.cancelled().is_some() || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    {
         let _ = call(
             socket,
             Message::Cancel {
@@ -453,6 +586,19 @@ fn run(
         );
         anyhow::bail!("admission cancelled or timed out before submission");
     }
+    // A helper that fails before entry also completes natively. Relay its
+    // stderr so only an observed entry frame authorizes completion proof.
+    let entered = match ready_token {
+        Some(token) => {
+            let (reader, writer) = std::io::pipe()?;
+            client.stderr(writer);
+            Some(relay_entry(
+                reader,
+                format!("\x1e{token}\x1f").into_bytes(),
+            )?)
+        }
+        None => None,
+    };
     let outcome = execute(
         &mut client,
         Path::new("systemctl"),
@@ -462,6 +608,8 @@ fn run(
         || signals.cancelled(),
         &record,
     );
+    // Drop this process's relay writer so the relay sees EOF.
+    client.stderr(std::process::Stdio::inherit());
     // Cancel only this owned attempt. The server retains an entered workload's
     // reservation until native termination, including on ambiguous outcomes.
     let _ = call(
@@ -470,7 +618,56 @@ fn run(
             id: entry.id.clone(),
         },
     );
+    // Completion confirmed native cleanup, so the relay reaches EOF promptly.
+    if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token))
+        && entered.is_some_and(|seen| seen.recv_timeout(Duration::from_secs(1)) == Ok(true))
+    {
+        std::io::stderr()
+            .write_all(frame.as_bytes())
+            .context("notify caller of confirmed native completion")?;
+    }
     outcome_exit(outcome, &entry.unit())
+}
+
+/// Forward `reader` to stderr and report, at EOF, whether `frame` passed through.
+fn relay_entry(
+    mut reader: impl Read + Send + 'static,
+    frame: Vec<u8>,
+) -> Result<std::sync::mpsc::Receiver<bool>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::Builder::new()
+        .name("amc-stderr-relay".into())
+        .spawn(move || {
+            let (mut seen, mut window, mut buffer) = (false, Vec::new(), [0; 4096]);
+            loop {
+                let n = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                // Keep draining even if the caller closed stderr.
+                let _ = std::io::stderr().write_all(&buffer[..n]);
+                if !seen {
+                    window.extend_from_slice(&buffer[..n]);
+                    seen = window.windows(frame.len()).any(|bytes| bytes == frame);
+                    window.drain(..window.len().saturating_sub(frame.len() - 1));
+                }
+            }
+            let _ = sender.send(seen);
+        })?;
+    Ok(receiver)
+}
+
+fn parse_ready_token(value: &str) -> std::result::Result<String, String> {
+    if !(32..=64).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("ready token must contain 32..=64 ASCII letters, digits or hyphens".into());
+    }
+    Ok(value.to_owned())
 }
 
 pub fn parse_memory(value: &str) -> std::result::Result<u64, String> {
@@ -515,6 +712,15 @@ fn execution_runtime(
     Ok(requested.or(contract.runtime_max_sec))
 }
 
+fn completion_frame(outcome: amc_runner::systemd::Outcome, token: &str) -> Option<String> {
+    match outcome {
+        amc_runner::systemd::Outcome::Completed(code) => {
+            Some(format!("\x1e{token}:complete:{code}\x1f"))
+        }
+        _ => None,
+    }
+}
+
 fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32> {
     use amc_runner::systemd::Outcome;
     match outcome {
@@ -545,6 +751,46 @@ fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32
 mod tests {
     use super::*;
     use amc_runner::systemd::{Cleanup, Outcome};
+
+    #[test]
+    fn only_a_relayed_entry_frame_authorizes_completion_proof() {
+        let frame = b"\x1e0123456789abcdef0123456789abcdef\x1f".to_vec();
+        for (chunks, expected) in [
+            (
+                vec![
+                    &b"waiting\n\x1e0123456789abcdef"[..],
+                    &b"0123456789abcdef\x1fout"[..],
+                ],
+                true,
+            ),
+            (vec![&b"waiting for host capacity: None\n"[..]], false),
+            (
+                vec![&b"\x1e0123456789abcdef0123456789abcdef:complete:1\x1f"[..]],
+                false,
+            ),
+        ] {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            let seen = relay_entry(reader, frame.clone()).unwrap();
+            for chunk in chunks {
+                writer.write_all(chunk).unwrap();
+            }
+            drop(writer);
+            assert_eq!(seen.recv_timeout(Duration::from_secs(5)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn native_ready_tokens_are_bounded_and_cannot_inject_framing() {
+        assert!(parse_ready_token("0123456789abcdef0123456789abcdef").is_ok());
+        for token in [
+            "short".to_owned(),
+            "a".repeat(65),
+            "\x1e".repeat(32),
+            "\n".repeat(32),
+        ] {
+            assert!(parse_ready_token(&token).is_err());
+        }
+    }
 
     #[test]
     fn declared_decimal_memory_is_rounded_down_and_burst_runtime_cannot_grow() {
@@ -588,5 +834,39 @@ mod tests {
             outcome_exit(Outcome::Completed(42), "fixture.service").unwrap(),
             42
         );
+    }
+
+    #[test]
+    fn only_confirmed_workload_results_emit_token_bound_completion_proof() {
+        let token = "0123456789abcdef0123456789abcdef";
+        for code in [0, 1, 42, 75, 255] {
+            assert_eq!(
+                completion_frame(Outcome::Completed(code), token),
+                Some(format!("\x1e{token}:complete:{code}\x1f"))
+            );
+        }
+        for cleanup in [Cleanup::Unknown, Cleanup::Running, Cleanup::Stopped] {
+            for outcome in [
+                Outcome::Unknown {
+                    exit_code: 0,
+                    cleanup,
+                },
+                Outcome::Unknown {
+                    exit_code: 1,
+                    cleanup,
+                },
+                Outcome::TimedOut {
+                    started: true,
+                    cleanup,
+                },
+                Outcome::Cancelled {
+                    signal: 15,
+                    started: true,
+                    cleanup,
+                },
+            ] {
+                assert_eq!(completion_frame(outcome, token), None);
+            }
+        }
     }
 }

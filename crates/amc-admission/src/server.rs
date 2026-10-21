@@ -1,7 +1,7 @@
 //! Single-writer coordinator. A native pre-exec handshake closes the late
 //! submission race: an expired reservation can never execute heavy work.
 use crate::{
-    ledger::{ClientIdentity, Decision, Ledger, Phase, Policy},
+    ledger::{Backpressure, ClientIdentity, Decision, Ledger, Phase, Policy},
     native::Native,
     protocol::{Message, Request, Response, Status, read_frame, write_frame},
     store::{Store, fresh_id, private_directory},
@@ -75,9 +75,9 @@ pub fn serve_with_host(
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(socket.with_extension("lock"))?;
     socket_lock.try_lock()?;
-    // Unentered work has no permission to execute. Discard it on restart so
-    // queued requests cannot inherit superseded policy; the helper fails closed.
-    ledger.entries.retain(|entry| entry.phase == Phase::Running);
+    // Discard work without a native identity. Starting helpers retain their
+    // accounting and are stopped below: volatile entry rights do not survive.
+    ledger.entries.retain(|entry| entry.identity.is_some());
     ledger.sync_protected_pools(&policy);
     // The durable-state lock is acquired first. A second server can never
     // unlink a live endpoint for this state directory.
@@ -93,6 +93,8 @@ pub fn serve_with_host(
     listener.set_nonblocking(true)?;
     store.save(&ledger)?;
     let mut tick = Instant::now();
+    // Advance a changed ledger on the next turn, not after the idle interval.
+    let mut due = false;
     let mut cursor = 0usize;
     let mut waiting = std::collections::BTreeMap::new();
     // Unentered tickets are discarded on restart, so their capabilities are
@@ -102,18 +104,29 @@ pub fn serve_with_host(
     let mut unreconciled: std::collections::BTreeSet<_> =
         ledger.entries.iter().map(|e| e.id.clone()).collect();
     while !stopping() {
-        if tick.elapsed() >= Duration::from_millis(250) {
+        if due || tick.elapsed() >= Duration::from_millis(250) {
+            due = false;
             let before = serde_json::to_vec(&ledger)?;
             // One running identity per tick bounds manager work independently
             // of queue length. All unverified entries remain fully accounted.
             let running: Vec<_> = ledger
                 .entries
                 .iter()
-                .filter(|e| e.phase == Phase::Running)
+                .filter(|e| e.identity.is_some())
                 .cloned()
                 .collect();
             if !running.is_empty() {
                 let entry = &running[cursor % running.len()];
+                if entry.phase == Phase::Starting
+                    && (now_ms()? >= entry.deadline_ms
+                        || !entry_keys.contains_key(&entry.id)
+                        || entry
+                            .client
+                            .as_ref()
+                            .is_none_or(|c| client_identity(c.pid).ok().as_ref() != Some(c)))
+                {
+                    let _ = native.stop(entry);
+                }
                 match native.terminated(entry) {
                     Some(terminated) => {
                         unreconciled.remove(&entry.id);
@@ -171,11 +184,13 @@ pub fn serve_with_host(
                 // failure terminates the server, leaving native limits in force.
                 if before != serde_json::to_vec(&ledger)? {
                     store.save(&ledger)?;
+                    due = true;
                 }
                 let mut response = match result {
                     Ok(response) => response,
                     Err(error) => Response {
                         version: 1,
+                        backpressure: error.downcast_ref::<Backpressure>().cloned(),
                         error: Some(error.to_string()),
                         ..Response::default()
                     },
@@ -216,7 +231,22 @@ fn handle(
         version: 1,
         ..Response::default()
     };
+    let starting = matches!(&request.message, Message::Start { .. });
     match request.message {
+        Message::EnqueueWaiting { contract, request } => {
+            let id = fresh_id()?;
+            let client = client_identity(pid)?;
+            let key = fresh_id()?;
+            ensure!(
+                host_socket.is_some() || !policy.contracts.get(&contract).is_some_and(|c| c.burst),
+                "burst execution requires the shared host broker"
+            );
+            ledger.enqueue_waiting(id.clone(), &contract, policy, now_ms()?, request)?;
+            ledger.set_client(&id, client)?;
+            observations.entry_keys.insert(id.clone(), key.clone());
+            response.entry_key = Some(key);
+            response.entry = ledger.get(&id).cloned();
+        }
         Message::Enqueue {
             ref contract,
             wait_ms,
@@ -283,6 +313,7 @@ fn handle(
             response.entry = ledger.get(&id).cloned();
         }
         Message::Poll { id } => {
+            response.waiting = observations.waiting.get(&id).cloned();
             response.entry = Some(
                 ledger
                     .get(&id)
@@ -290,7 +321,7 @@ fn handle(
                     .clone(),
             );
         }
-        Message::Enter { id, key } => {
+        Message::Start { id, key } | Message::Enter { id, key } => {
             ensure!(
                 native.can_enter(),
                 "host supervision inhibits new execution"
@@ -299,7 +330,8 @@ fn handle(
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
             ensure!(
-                entry.phase == Phase::Reserved && now_ms()? < entry.deadline_ms,
+                (entry.phase == Phase::Reserved || (!starting && entry.phase == Phase::Starting))
+                    && now_ms()? < entry.deadline_ms,
                 "ticket cannot enter"
             );
             ensure!(
@@ -313,7 +345,7 @@ fn handle(
             let identity = native
                 .identify(entry, pid)
                 .map_err(|_| anyhow::anyhow!("native workload identity or enforcement mismatch"))?;
-            if let Some(socket) = host_socket {
+            if !starting && let Some(socket) = host_socket {
                 crate::host_server::verify_entry(socket, pid, &identity, &entry.contract)?;
             }
             ensure!(
@@ -324,8 +356,12 @@ fn handle(
                 native.can_enter(),
                 "host supervision changed during entry verification"
             );
-            ledger.enter(&id, identity)?;
-            observations.entry_keys.remove(&id);
+            if starting {
+                ledger.start(&id, identity, now_ms()?)?;
+            } else {
+                ledger.enter(&id, identity)?;
+                observations.entry_keys.remove(&id);
+            }
             response.entry = ledger.get(&id).cloned();
         }
         Message::Cancel { id } => {
@@ -335,9 +371,12 @@ fn handle(
                     "only the submitting client may cancel this ticket"
                 );
             }
-            if ledger.cancel_pending(&id) {
-                observations.entry_keys.remove(&id);
-            } else if let Some(entry) = ledger.get(&id) {
+            // Revoke entry before requesting asynchronous native stop. A late
+            // host grant must not authorize a cancelled helper in the meantime.
+            observations.entry_keys.remove(&id);
+            if !ledger.cancel_pending(&id)
+                && let Some(entry) = ledger.get(&id)
+            {
                 native.stop(entry).map_err(|_| {
                     anyhow::anyhow!("native stop unconfirmed; reservation retained")
                 })?;

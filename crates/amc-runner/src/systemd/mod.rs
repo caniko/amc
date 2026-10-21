@@ -12,6 +12,7 @@ mod session_bus;
 mod startup;
 pub use control::{QUERY_TIMEOUT, capture, capture_with_timeout};
 pub use managed::{LaunchRequest, RunError, Runner};
+pub use session_bus::user_service_properties;
 pub use startup::{StartupBarrier, wait_for_host_runner, wait_for_startup};
 
 use std::{
@@ -181,7 +182,7 @@ fn routed_query_state(
         "--property=LoadState,ActiveState,InvocationID,MainPID,ExecMainCode,ExecMainStatus,ExecMainStartTimestampMonotonic,ControlGroup",
         "--",
         unit,
-    ]), deadline)?;
+    ]), None, deadline)?;
     let field = |name: &str| {
         text.lines()
             .filter_map(|line| line.split_once('='))
