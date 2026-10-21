@@ -250,11 +250,16 @@ pub struct Inspection {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerMetadata {
-    unit: String,
-    context: &'static str,
-    observed_unix_ms: Option<u128>,
-    properties: Option<BTreeMap<String, String>>,
-    unknown: Option<&'static str>,
+    /// The ancestor unit or slice name.
+    pub unit: String,
+    /// `user` or `system`.
+    pub context: &'static str,
+    /// Observation time in Unix milliseconds.
+    pub observed_unix_ms: Option<u128>,
+    /// Manager-reported properties, when the query succeeded.
+    pub properties: Option<BTreeMap<String, String>>,
+    /// Why the properties are unknown, when the query failed.
+    pub unknown: Option<&'static str>,
 }
 
 const MANAGER_PROPERTIES: &[&str] = &[

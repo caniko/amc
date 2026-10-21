@@ -396,13 +396,7 @@ fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
 }
 
 fn parse_ready_token(value: &str) -> std::result::Result<String, String> {
-    if !(32..=64).contains(&value.len())
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return Err("ready token must contain 32..=64 ASCII letters, digits or hyphens".into());
-    }
+    amc_admission::client::validate_ready_token(value).map_err(|error| error.to_string())?;
     Ok(value.to_owned())
 }
 

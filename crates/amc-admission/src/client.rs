@@ -59,6 +59,19 @@ pub enum Mode {
     Plain,
 }
 
+/// Ready tokens are interpolated into stderr control frames, so they must be
+/// 32..=64 ASCII letters, digits or hyphens: never framing bytes.
+pub fn validate_ready_token(token: &str) -> Result<()> {
+    ensure!(
+        (32..=64).contains(&token.len())
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "ready token must contain 32..=64 ASCII letters, digits or hyphens"
+    );
+    Ok(())
+}
+
 /// One admission request, equivalent to the `amc admission exec` flags.
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -103,6 +116,15 @@ impl ExecRequest {
     /// Enforce the bounds the CLI parser applies: positive ceilings and
     /// runtimes within 1..=86400 seconds.
     pub fn validate(&self) -> Result<()> {
+        if let Some(wait) = self.wait {
+            ensure!(
+                (Duration::from_secs(1)..=Duration::from_secs(3600)).contains(&wait),
+                "admission wait must be within 1..=3600 seconds"
+            );
+        }
+        if let Some(token) = &self.ready_token {
+            validate_ready_token(token)?;
+        }
         let runtime = |seconds: u64| {
             ensure!(
                 (1..=86400).contains(&seconds),
@@ -557,7 +579,15 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
     if let Some(dir) = &current_dir {
         client.current_dir(dir);
     }
-    let record = wrap(&mut client, &request.helper)?;
+    let cancel_reservation = || {
+        let _ = call(
+            socket,
+            Message::Cancel {
+                id: entry.id.clone(),
+            },
+        );
+    };
+    let record = wrap(&mut client, &request.helper).inspect_err(|_| cancel_reservation())?;
     client
         .arg(&request.helper)
         .args(["admission", "enter", "--socket"])
@@ -594,14 +624,15 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
     // stderr so only an observed entry frame authorizes completion proof.
     let entered = match ready_token {
         Some(token) => {
-            let (reader, writer) = std::io::pipe()?;
+            let (reader, writer) = std::io::pipe().inspect_err(|_| cancel_reservation())?;
             client.stderr(writer);
             let stop = Arc::new(AtomicBool::new(false));
             let (seen, relay) = relay_entry(
                 reader,
                 format!("\x1e{token}\x1f").into_bytes(),
                 stop.clone(),
-            )?;
+            )
+            .inspect_err(|_| cancel_reservation())?;
             Some((seen, relay, stop))
         }
         None => {
@@ -954,6 +985,14 @@ mod tests {
         sized.runtime_max_sec = Some(0);
         assert!(sized.validate().is_err());
         sized.runtime_max_sec = Some(30);
+        assert!(sized.validate().is_ok());
+        sized.wait = Some(Duration::from_secs(u64::MAX));
+        assert!(sized.validate().is_err());
+        sized.wait = Some(Duration::from_secs(3600));
+        assert!(sized.validate().is_ok());
+        sized.ready_token = Some(format!("{}\x1fforged", "a".repeat(32)));
+        assert!(sized.validate().is_err());
+        sized.ready_token = Some("0123456789abcdef-0123456789abcdef".into());
         assert!(sized.validate().is_ok());
     }
 
