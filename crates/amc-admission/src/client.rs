@@ -14,10 +14,18 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::{Read, Write},
-    os::unix::process::ExitStatusExt,
+    fs::File,
+    io::{PipeReader, PipeWriter, Read, Write},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -137,6 +145,76 @@ impl ExecRequest {
     }
 }
 
+/// A standard stream for [`Exec`]. Pipes created by the spawn are not offered:
+/// the call supervises the unit until it ends, so nobody could service them.
+/// Pass a file, a pipe end you drain yourself, or use [`Exec::output`].
+#[derive(Debug)]
+pub enum Io {
+    Inherit,
+    Null,
+    Fd(OwnedFd),
+}
+
+impl Io {
+    fn stdio(self) -> Stdio {
+        match self {
+            Io::Inherit => Stdio::inherit(),
+            Io::Null => Stdio::null(),
+            Io::Fd(fd) => Stdio::from(fd),
+        }
+    }
+}
+
+impl From<File> for Io {
+    fn from(file: File) -> Self {
+        Io::Fd(file.into())
+    }
+}
+
+impl From<OwnedFd> for Io {
+    fn from(fd: OwnedFd) -> Self {
+        Io::Fd(fd)
+    }
+}
+
+impl From<PipeReader> for Io {
+    fn from(reader: PipeReader) -> Self {
+        Io::Fd(reader.into())
+    }
+}
+
+impl From<PipeWriter> for Io {
+    fn from(writer: PipeWriter) -> Self {
+        Io::Fd(writer.into())
+    }
+}
+
+/// How an admitted workload ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// The workload (or nonacceptance, 75) exited with this code.
+    Code(i32),
+    /// The workload was cancelled by this signal.
+    Signal(i32),
+}
+
+impl Exit {
+    /// Shell-style code: `128 + signal` for cancellation.
+    pub fn code(self) -> i32 {
+        match self {
+            Exit::Code(code) => code,
+            Exit::Signal(signal) => 128 + signal,
+        }
+    }
+
+    fn status(self) -> ExitStatus {
+        match self {
+            Exit::Code(code) => ExitStatus::from_raw((code & 0xff) << 8),
+            Exit::Signal(signal) => ExitStatus::from_raw(signal & 0x7f),
+        }
+    }
+}
+
 /// An admitted command, configured like [`std::process::Command`].
 #[derive(Debug)]
 pub struct Exec {
@@ -144,9 +222,9 @@ pub struct Exec {
     argv: Vec<OsString>,
     current_dir: Option<PathBuf>,
     env: BTreeMap<OsString, Option<OsString>>,
-    stdin: Option<Stdio>,
-    stdout: Option<Stdio>,
-    stderr: Option<Stdio>,
+    stdin: Option<Io>,
+    stdout: Option<Io>,
+    stderr: Option<Io>,
 }
 
 impl Exec {
@@ -198,78 +276,102 @@ impl Exec {
         self
     }
 
-    pub fn stdin(&mut self, stdio: impl Into<Stdio>) -> &mut Self {
-        self.stdin = Some(stdio.into());
+    pub fn stdin(&mut self, io: impl Into<Io>) -> &mut Self {
+        self.stdin = Some(io.into());
         self
     }
 
-    pub fn stdout(&mut self, stdio: impl Into<Stdio>) -> &mut Self {
-        self.stdout = Some(stdio.into());
+    pub fn stdout(&mut self, io: impl Into<Io>) -> &mut Self {
+        self.stdout = Some(io.into());
         self
     }
 
     /// Ignored when a ready token relays stderr for entry framing.
-    pub fn stderr(&mut self, stdio: impl Into<Stdio>) -> &mut Self {
-        self.stderr = Some(stdio.into());
+    pub fn stderr(&mut self, io: impl Into<Io>) -> &mut Self {
+        self.stderr = Some(io.into());
         self
     }
 
     /// Admit, run and supervise the workload; returns its exit code
     /// (`128 + signal` when cancelled, 75 for queued nonacceptance with a token).
     pub fn run(self, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
+        run(self, cancelled).map(Exit::code)
+    }
+
+    /// Like [`Exec::run`], keeping whether the workload exited or was signalled.
+    pub fn run_exit(self, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         run(self, cancelled)
     }
 
     /// Like [`Exec::run`], capturing stdout and, without a ready token, stderr.
+    /// Collectors stop and are joined on every return path, including
+    /// unresolved native outcomes.
     pub fn output(mut self, cancelled: impl Fn() -> Option<i32>) -> Result<Output> {
         let capture_stderr = self.request.ready_token.is_none();
+        let stop = Arc::new(AtomicBool::new(false));
         let (stdout_reader, stdout_writer) = std::io::pipe()?;
         self.stdout = Some(stdout_writer.into());
-        let stdout = drain(stdout_reader)?;
+        let stdout = collect(stdout_reader, stop.clone())?;
         let stderr = if capture_stderr {
             let (reader, writer) = std::io::pipe()?;
             self.stderr = Some(writer.into());
-            Some(drain(reader)?)
+            Some(collect(reader, stop.clone())?)
         } else {
             None
         };
-        // `run` drops every writer it holds before returning, so the readers
+        // `run` drops every writer it holds before returning, so collectors
         // reach EOF once the unit's own descriptors close.
-        let code = run(self, cancelled)?;
+        let result = run(self, cancelled);
+        if result.is_err() {
+            stop.store(true, Ordering::SeqCst);
+        }
         let join = |handle: thread::JoinHandle<std::io::Result<Vec<u8>>>| {
             handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("output capture thread panicked"))?
                 .context("capture admitted output")
         };
+        let stdout = join(stdout);
+        let stderr = stderr.map(join).transpose();
+        let exit = result?;
         Ok(Output {
-            status: exit_status(code),
-            stdout: join(stdout)?,
-            stderr: stderr.map(join).transpose()?.unwrap_or_default(),
+            status: exit.status(),
+            stdout: stdout?,
+            stderr: stderr?.unwrap_or_default(),
         })
     }
 }
 
-fn drain(
-    mut reader: impl Read + Send + 'static,
+/// Read `reader` to EOF unless `stop` is raised first.
+fn collect(
+    mut reader: PipeReader,
+    stop: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<std::io::Result<Vec<u8>>>> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     Ok(thread::Builder::new()
         .name("amc-output-capture".into())
         .spawn(move || {
-            let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes).map(|_| bytes)
+            let (mut bytes, mut buffer) = (Vec::new(), [0; 8192]);
+            while !stop.load(Ordering::SeqCst) {
+                let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+                match poll(&mut fds, PollTimeout::from(100u8)) {
+                    Ok(0) => continue,
+                    Ok(_) => {}
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(bytes)
         })?)
 }
 
-fn exit_status(code: i32) -> ExitStatus {
-    if code > 128 && code < 160 {
-        ExitStatus::from_raw(code - 128)
-    } else {
-        ExitStatus::from_raw((code & 0xff) << 8)
-    }
-}
-
-fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
+fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
     let Exec {
         request,
         argv,
@@ -300,7 +402,7 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
                     )
                     .as_bytes(),
                 )?;
-                return Ok(75);
+                return Ok(Exit::Code(75));
             }
             return Err(error);
         }
@@ -409,6 +511,10 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
     for name in forwarded_environment(&env) {
         client.arg(format!("--setenv={name}"));
     }
+    // User services inherit the manager environment; removal must be explicit.
+    for name in removed_environment(&env) {
+        client.arg(format!("--property=UnsetEnvironment={name}"));
+    }
     if let Some(dir) = &current_dir {
         client.current_dir(dir);
     }
@@ -429,10 +535,10 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
     }
     client.arg("--").args(&argv);
     if let Some(stdin) = stdin {
-        client.stdin(stdin);
+        client.stdin(stdin.stdio());
     }
     if let Some(stdout) = stdout {
-        client.stdout(stdout);
+        client.stdout(stdout.stdio());
     }
     // A reservation reply can arrive after the client's wait has expired.
     // The coordinator's extra entry grace must not authorize a late submission.
@@ -458,7 +564,7 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<i32> {
         }
         None => {
             if let Some(stderr) = stderr {
-                client.stderr(stderr);
+                client.stderr(stderr.stdio());
             }
             None
         }
@@ -527,6 +633,17 @@ fn forwarded_environment(overrides: &BTreeMap<OsString, Option<OsString>>) -> Ve
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+/// Valid environment names the caller removed with [`Exec::env_remove`].
+fn removed_environment(overrides: &BTreeMap<OsString, Option<OsString>>) -> Vec<String> {
+    overrides
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .filter_map(|(name, _)| name.to_str())
+        .filter(|name| amc_runner::systemd::valid_environment_name(name))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Refuse entry from a namespace runner without a backed aggregate allowance.
@@ -621,15 +738,15 @@ fn completion_frame(outcome: Outcome, token: &str) -> Option<String> {
     }
 }
 
-fn outcome_exit(outcome: Outcome, unit: &str) -> Result<i32> {
+fn outcome_exit(outcome: Outcome, unit: &str) -> Result<Exit> {
     match outcome {
-        Outcome::Completed(code) => Ok(code),
+        Outcome::Completed(code) => Ok(Exit::Code(code)),
         Outcome::Unknown { exit_code, .. } => {
             anyhow::bail!(
                 "native outcome unresolved for {unit} (launcher exit {exit_code}); reservation remains coordinator-owned; inspect admission status before retrying"
             )
         }
-        Outcome::Cancelled { signal, .. } => Ok(128 + signal),
+        Outcome::Cancelled { signal, .. } => Ok(Exit::Signal(signal)),
         Outcome::TimedOut { .. } => {
             anyhow::bail!(
                 "native submission timed out for {}; inspect admission status before retrying",
@@ -734,11 +851,38 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_round_trip_into_exit_statuses() {
-        assert_eq!(exit_status(0).code(), Some(0));
-        assert_eq!(exit_status(42).code(), Some(42));
-        assert_eq!(exit_status(75).code(), Some(75));
-        assert_eq!(exit_status(128 + 15).signal(), Some(15));
+    fn exits_keep_code_and_signal_provenance() {
+        for code in [0, 42, 75, 143, 255] {
+            let status = Exit::Code(code).status();
+            assert_eq!((status.code(), status.signal()), (Some(code), None));
+            assert_eq!(Exit::Code(code).code(), code);
+        }
+        let status = Exit::Signal(15).status();
+        assert_eq!((status.code(), status.signal()), (None, Some(15)));
+        assert_eq!(Exit::Signal(15).code(), 143);
+    }
+
+    #[test]
+    fn removed_variables_are_unset_in_the_unit() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(OsString::from("PATH"), None);
+        overrides.insert(OsString::from("KEEP"), Some(OsString::from("1")));
+        overrides.insert(OsString::from("bad=name"), None);
+        assert_eq!(removed_environment(&overrides), ["PATH"]);
+    }
+
+    #[test]
+    fn collectors_stop_even_while_a_writer_stays_open() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = collect(reader, stop.clone()).unwrap();
+        writer.write_all(b"partial").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        assert_eq!(handle.join().unwrap().unwrap(), b"partial");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(writer);
     }
 
     #[test]
@@ -800,11 +944,11 @@ mod tests {
         }
         assert_eq!(
             outcome_exit(Outcome::Completed(0), "fixture.service").unwrap(),
-            0
+            Exit::Code(0)
         );
         assert_eq!(
-            outcome_exit(Outcome::Completed(42), "fixture.service").unwrap(),
-            42
+            outcome_exit(Outcome::Completed(143), "fixture.service").unwrap(),
+            Exit::Code(143)
         );
     }
 
