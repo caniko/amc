@@ -2,7 +2,7 @@
 use crate::{
     host::{HostLedger, HostPolicy, Identity, Reservation, WaitReason},
     host_native,
-    protocol::{read_frame, write_frame},
+    protocol::{read_frame_cancellable, write_frame_cancellable},
     store::{Store, fresh_id, private_directory},
 };
 use anyhow::{Result, ensure};
@@ -33,7 +33,9 @@ pub enum Request {
     },
     Acquire {
         version: u32,
-        wait_ms: u64,
+        /// Omission means patient resource waiting; legacy peers reject it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation: Option<crate::continuation::ContinuationCapability>,
     },
@@ -151,6 +153,10 @@ pub struct Response {
 }
 
 pub fn call(socket: &Path, request: &Request) -> Result<Response> {
+    exchange(connect(socket)?, request)
+}
+
+fn connect(socket: &Path) -> Result<UnixStream> {
     let metadata = fs::symlink_metadata(socket)?;
     ensure!(
         metadata.uid() == 0,
@@ -161,10 +167,18 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response> {
         getsockopt(&stream, PeerCredentials)?.uid() == 0,
         "host admission peer must be root"
     );
-    exchange(stream, request)
+    Ok(stream)
 }
 
-fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
+fn exchange(stream: UnixStream, request: &Request) -> Result<Response> {
+    exchange_cancellable(stream, request, None)
+}
+
+fn exchange_cancellable(
+    mut stream: UnixStream,
+    request: &Request,
+    control: Option<(Instant, &dyn Fn() -> bool)>,
+) -> Result<Response> {
     let timeout = match request {
         Request::AcquirePageReturn { .. } | Request::AcquireRecovery { .. } => {
             Duration::from_secs(90)
@@ -173,8 +187,8 @@ fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
     };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    write_frame(&mut stream, request)?;
-    let response: Response = read_frame(&mut stream)?;
+    write_frame_cancellable(&mut stream, request, control)?;
+    let response: Response = read_frame_cancellable(&mut stream, control)?;
     ensure!(response.version == 1, "unsupported host admission response");
     if let Some(error) = &response.error {
         anyhow::bail!("{error}");
@@ -210,31 +224,47 @@ pub fn transient_transport(e: &anyhow::Error) -> bool {
 /// Helper calls this before its private coordinator's native entry handshake.
 pub fn acquire(
     socket: &Path,
-    wait: Duration,
+    wait: Option<Duration>,
     stopping: impl Fn() -> bool,
+    mut waiting: impl FnMut() -> Result<()>,
 ) -> Result<Option<crate::continuation::ContinuationCapability>> {
-    let deadline = Instant::now() + wait;
+    let began = Instant::now();
+    let deadline = wait.map(|wait| Instant::now() + wait);
     let mut explained = false;
     loop {
         ensure!(
-            !stopping() && Instant::now() < deadline,
+            !stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline),
             "host admission cancelled or timed out"
         );
-        let left = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .min(3_600_000) as u64;
-        let reply = call(
-            socket,
+        waiting()?;
+        let left = deadline.map(|deadline| {
+            (deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(3_600_000) as u64)
+                .max(1)
+        });
+        // A resource wait cannot inherit a fresh transport budget for each frame.
+        // A grant whose acknowledgement is lost remains held until native cleanup.
+        let rpc_deadline = deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(2))
+            .min(Instant::now() + Duration::from_secs(2));
+        let reply = exchange_cancellable(
+            connect(socket)?,
             &Request::Acquire {
                 version: 1,
-                wait_ms: left.max(1),
+                wait_ms: left,
                 continuation: std::env::var("AMC_CONTINUATION")
                     .ok()
                     .map(|value| serde_json::from_str(&value))
                     .transpose()?,
             },
+            Some((rpc_deadline, &stopping)),
         )?;
+        ensure!(
+            !stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline),
+            "host admission cancelled or timed out"
+        );
         if reply.granted {
             return Ok(reply.continuation);
         }
@@ -242,8 +272,18 @@ pub fn acquire(
             eprintln!("waiting for host capacity: {:?}", reply.waiting);
             explained = true;
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(poll_interval(began));
     }
+}
+
+/// Short grants usually settle within one broker turn and a manager probe;
+/// poll those quickly, then fall back to the idle interval for long waits.
+pub fn poll_interval(began: Instant) -> Duration {
+    Duration::from_millis(if began.elapsed() < Duration::from_secs(1) {
+        25
+    } else {
+        250
+    })
 }
 
 pub fn verify_entry(
@@ -344,6 +384,9 @@ pub fn serve_supervised(
     listener.set_nonblocking(true)?;
     store.save_snapshot(&ledger)?;
     let mut tick = Instant::now();
+    // A request that changed the ledger is advanced on the next turn rather
+    // than after the idle interval, so a grantable request is not delayed.
+    let mut due = false;
     let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
     let mut inventory: Option<PendingInventory> = None;
@@ -359,7 +402,8 @@ pub fn serve_supervised(
         recovery_manager.refresh(ledger.recovery.as_ref())?;
         let mut burst_evidence = burst_manager.snapshot();
         burst_evidence.extend(protected_manager.snapshot());
-        if tick.elapsed() >= Duration::from_millis(250) {
+        if due || tick.elapsed() >= Duration::from_millis(250) {
+            due = false;
             let before = serde_json::to_vec(&ledger)?;
             for r in &mut ledger.reservations {
                 if r.identity.uid == 0 {
@@ -507,14 +551,15 @@ pub fn serve_supervised(
                             ensure!(version == 1, "unsupported host protocol");
                             populate_status(&mut reply, ledger, credentials.uid());
                         }
-                        Request::Acquire {
-                            version, wait_ms, ..
-                        }
-                        | Request::AcquirePool {
-                            version, wait_ms, ..
-                        } => {
+                        Request::Acquire { version, .. } | Request::AcquirePool { version, .. } => {
+                            let wait_ms = match &request {
+                                Request::Acquire { wait_ms, .. } => *wait_ms,
+                                Request::AcquirePool { wait_ms, .. } => Some(*wait_ms),
+                                _ => unreachable!(),
+                            };
                             ensure!(
-                                version == 1 && (1..=3_600_000).contains(&wait_ms),
+                                version == 1
+                                    && wait_ms.is_none_or(|ms| (1..=3_600_000).contains(&ms)),
                                 "invalid host request"
                             );
                             let (domain, identity, memory_bytes, swap_bytes) =
@@ -712,7 +757,10 @@ pub fn serve_supervised(
                                     memory_bytes,
                                     swap_bytes,
                                     requested_ms: now,
-                                    deadline_ms: now.saturating_add(wait_ms),
+                                    // Any enrolled user can reach this socket, so an
+                                    // omitted (patient) wait still expires after the
+                                    // legacy hour; the helper then re-requests.
+                                    deadline_ms: now.saturating_add(wait_ms.unwrap_or(3_600_000)),
                                     granted: false,
                                     owners: vec![],
                                     owners_finished: false,
@@ -753,6 +801,7 @@ pub fn serve_supervised(
                 });
                 if before != serde_json::to_vec(&ledger)? {
                     store.save_snapshot(&ledger)?;
+                    due = true;
                 }
                 let reply = result.unwrap_or_else(|e| Response {
                     version: 1,
@@ -1957,6 +2006,105 @@ fn preparation_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{read_frame, write_frame};
+
+    #[test]
+    fn host_wait_is_optional_without_changing_legacy_finite_requests() {
+        for wait in [None, Some(250u64)] {
+            let mut value = serde_json::json!({"op": "acquire", "version": 1});
+            if let Some(wait) = wait {
+                value["wait_ms"] = serde_json::json!(wait);
+            }
+            let request: Request = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded.get("wait_ms").and_then(|v| v.as_u64()), wait);
+            assert_eq!(encoded.get("wait_ms").is_none(), wait.is_none());
+        }
+    }
+
+    #[test]
+    fn controlled_exchange_rejects_grants_after_a_wait_deadline_or_cancellation() {
+        for cancelled in [false, true] {
+            let (client, mut broker) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                let request: Request = read_frame(&mut broker).unwrap();
+                assert!(matches!(request, Request::Acquire { .. }));
+                thread::sleep(Duration::from_millis(400));
+                let _ = write_frame(
+                    &mut broker,
+                    &Response {
+                        version: 1,
+                        granted: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            let start = Instant::now();
+            let stopping = || cancelled && start.elapsed() >= Duration::from_millis(50);
+            let result = exchange_cancellable(
+                client,
+                &Request::Acquire {
+                    version: 1,
+                    wait_ms: Some(100),
+                    continuation: None,
+                },
+                Some((
+                    start + Duration::from_millis(if cancelled { 2000 } else { 100 }),
+                    &stopping,
+                )),
+            );
+            let elapsed = start.elapsed();
+            worker.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if cancelled {
+                    "cancelled"
+                } else {
+                    "deadline exceeded"
+                }),
+                "{error}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(250),
+                "{cancelled}: {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_exchange_still_validates_granted_responses() {
+        for (version, error) in [(1, None), (2, None), (1, Some("refused"))] {
+            let (client, mut broker) = UnixStream::pair().unwrap();
+            let valid = version == 1 && error.is_none();
+            let worker = thread::spawn(move || {
+                let _: Request = read_frame(&mut broker).unwrap();
+                write_frame(
+                    &mut broker,
+                    &Response {
+                        version,
+                        granted: true,
+                        error: error.map(str::to_owned),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            });
+            let result = exchange_cancellable(
+                client,
+                &Request::Acquire {
+                    version: 1,
+                    wait_ms: Some(1000),
+                    continuation: None,
+                },
+                Some((Instant::now() + Duration::from_secs(2), &|| false)),
+            );
+            worker.join().unwrap();
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if valid {
+                assert!(result.unwrap().granted);
+            }
+        }
+    }
 
     #[test]
     fn startup_reconciles_dead_children_before_reusing_a_pool_name() {

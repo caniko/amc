@@ -280,6 +280,18 @@ class GuardCleanupTests(unittest.TestCase):
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_patient_queue_matrix_requires_every_native_case(self):
+        tree = ast.parse((hosted.ROOT / "nix/queued-admission-vm-test.py").read_text())
+        names = {
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "test_section"
+        }
+        self.assertTrue(names)
+        self.assertLessEqual(names, hosted.NATIVE_CASES)
+
     def test_burst_responsiveness_uses_host_status_response_schema(self):
         source = ast.parse((hosted.ROOT / "nix/host-admission-vm-test.py").read_text())
         probes = [node.value for node in ast.walk(source)
@@ -313,7 +325,7 @@ class NativeEvidenceTests(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "test_section"
         }
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         self.assertEqual(names, hosted.PROTECTED_POOL_CASES)
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "junit.xml"

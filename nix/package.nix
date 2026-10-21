@@ -38,6 +38,9 @@ rustPlatform.buildRustPackage {
   strictDeps = true;
   passthru.nativeExecVersion = 1;
   passthru.admissionSizingVersion = 1;
+  passthru.admissionQueueVersion = 1;
+  passthru.admissionReadyVersion = 2;
+  passthru.admissionBackpressureVersion = 1;
   passthru.admissionProtectedPoolVersion = 1;
   passthru.admissionPreparationVersion = 2;
   passthru.admissionContinuationEnvelopesVersion = 1;

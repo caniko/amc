@@ -11,7 +11,7 @@ use std::{
 pub struct ExecArgs {
     /// Legacy isolation-only mode; requires explicit native bounds.
     #[arg(long, requires_all = ["memory_max", "memory_swap_max", "runtime_max_sec"],
-        conflicts_with_all = ["burst", "max_ram_usage", "contract", "socket"])]
+        conflicts_with_all = ["burst", "max_ram_usage", "contract", "socket", "queue"])]
     slice: Option<String>,
     #[arg(long, requires = "slice", value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
     memory_max: Option<u64>,
@@ -28,8 +28,12 @@ pub struct ExecArgs {
     contract: Option<String>,
     #[arg(long)]
     socket: Option<PathBuf>,
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
-    timeout: u64,
+    /// Maximum admission wait; defaults to 120s unless --queue is selected.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout: Option<u64>,
+    /// Queue bounded work without an implicit resource-wait deadline.
+    #[arg(long, requires_all = ["max_ram_usage", "runtime_max_sec"])]
+    queue: bool,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<OsString>,
 }
@@ -48,6 +52,8 @@ pub fn execute(arguments: ExecArgs) -> Result<i32> {
                 .into()
             }),
             timeout: arguments.timeout,
+            queue: arguments.queue,
+            ready_token: None,
             runtime_max_sec: arguments.runtime_max_sec,
             burst: arguments.burst,
             max_ram_usage: arguments.max_ram_usage,

@@ -237,6 +237,7 @@ fn enter(manifest: &Manifest, output: &Path, index: usize, id: String) -> Result
         deadline_ms: 0,
         identity: None,
         client: None,
+        queue: None,
     };
     let identity = Systemd {
         systemctl: "systemctl".into(),

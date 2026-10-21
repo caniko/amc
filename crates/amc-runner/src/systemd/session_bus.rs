@@ -1,30 +1,62 @@
 //! Namespace callers cannot use systemctl's implicit private-manager transport.
 //! Query only the required public properties through the exact host session bus.
-use super::control::{QUERY_TIMEOUT, capture_with_timeout};
+use super::control::{QUERY_TIMEOUT, capture_from};
 use super::{Cleanup, UnitState, safe_cgroup_path, terminated, valid_unit};
+use nix::unistd::{Uid, User, geteuid};
 use serde_json::Value;
 use std::{
+    fs::File,
+    os::unix::process::CommandExt,
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-fn command(uid: u32) -> Command {
+/// Whether `/proc/self/uid_map` is the identity map of the initial user namespace.
+fn initial_namespace(uid_map: &str) -> bool {
+    uid_map.split_whitespace().eq(["0", "0", "4294967295"])
+}
+
+/// A busctl command for `uid`'s session bus, with the runtime directory its
+/// address resolves beneath when the caller is the host root.
+fn command(uid: u32) -> Option<(Command, Option<File>)> {
     let mut command = Command::new("busctl");
+    let mut address = format!("unix:path=/run/user/{uid}/bus");
+    let mut runtime = None;
+    // A user bus authenticates the connecting UID, not the socket's pathname.
+    // Drop credentials in this child only; the broker retains its authority.
+    // A user-namespace root (a namespaced host-runner caller) already connects
+    // as its outer UID and can neither switch to it nor read init's root.
+    if geteuid().is_root()
+        && initial_namespace(&std::fs::read_to_string("/proc/self/uid_map").ok()?)
+    {
+        let user = User::from_uid(Uid::from_raw(uid)).ok()??;
+        command.gid(user.gid.as_raw()).uid(uid);
+        // ProtectHome=yes hides /run/user from the host broker; exposing it
+        // would admit late-propagated writable mounts. Pin the owner's runtime
+        // directory in init's root and pass only that directory as stdin, so
+        // the unprivileged child resolves `bus` beneath it. busctl never reads stdin.
+        runtime = Some(File::open(format!("/proc/1/root/run/user/{uid}")).ok()?);
+        address = "unix:path=/proc/self/fd/0/bus".into();
+    }
     command.args([
-        format!("--address=unix:path=/run/user/{uid}/bus"),
+        format!("--address={address}"),
         "--timeout=2s".into(),
         "--json=short".into(),
         "--".into(),
     ]);
-    command
+    Some((command, runtime))
 }
 
-pub(super) fn capture_until(command: &mut Command, deadline: Option<Instant>) -> Option<String> {
+pub(super) fn capture_until(
+    command: &mut Command,
+    stdin: Option<&File>,
+    deadline: Option<Instant>,
+) -> Option<String> {
     let timeout = deadline.map_or(QUERY_TIMEOUT, |end| {
         end.saturating_duration_since(Instant::now())
     });
-    let text = capture_with_timeout(command, timeout).ok()?;
+    let text = capture_from(command, timeout, stdin).ok()?;
     if deadline.is_some_and(|end| Instant::now() >= end) {
         return None;
     }
@@ -38,8 +70,9 @@ fn manager_call_until(
     arguments: &[&str],
     deadline: Option<Instant>,
 ) -> Option<Value> {
+    let (mut command, runtime) = command(uid)?;
     let text = capture_until(
-        command(uid)
+        command
             .args([
                 "call",
                 "org.freedesktop.systemd1",
@@ -49,6 +82,7 @@ fn manager_call_until(
                 signature,
             ])
             .args(arguments),
+        runtime.as_ref(),
         deadline,
     )?;
     serde_json::from_str(&text).ok()
@@ -61,10 +95,12 @@ fn properties(
     names: &[&str],
     deadline: Option<Instant>,
 ) -> Option<Vec<Value>> {
+    let (mut command, runtime) = command(uid)?;
     let text = capture_until(
-        command(uid)
+        command
             .args(["get-property", "org.freedesktop.systemd1", path, interface])
             .args(names),
+        runtime.as_ref(),
         deadline,
     )?;
     let values = text
@@ -73,6 +109,28 @@ fn properties(
         .collect::<Result<Vec<Value>, _>>()
         .ok()?;
     (values.len() == names.len()).then_some(values)
+}
+
+/// Read an already-loaded AMC service through its owner's exact session bus.
+/// Returns busctl's typed property values in `names` order. Missing services,
+/// malformed replies and expired observations are unknown, never permission to run.
+pub fn user_service_properties(uid: u32, unit: &str, names: &[&str]) -> Option<Vec<Value>> {
+    if !valid_unit(unit) {
+        return None;
+    }
+    let deadline = Some(Instant::now() + QUERY_TIMEOUT);
+    let loaded = manager_call_until(uid, "GetUnit", "s", &[unit], deadline)?;
+    let path = data(&loaded, "o")?.as_array()?.first()?.as_str()?;
+    if !path.starts_with("/org/freedesktop/systemd1/unit/") {
+        return None;
+    }
+    properties(
+        uid,
+        path,
+        "org.freedesktop.systemd1.Service",
+        names,
+        deadline,
+    )
 }
 
 fn data<'a>(property: &'a Value, kind: &str) -> Option<&'a Value> {
@@ -266,6 +324,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn only_the_initial_namespace_root_pins_the_owner_runtime() {
+        assert!(initial_namespace("         0          0 4294967295\n"));
+        // bwrap --unshare-user --uid 0 and unshare --map-root-user.
+        assert!(!initial_namespace("         0       1000          1\n"));
+        assert!(!initial_namespace(""));
+    }
+
+    #[test]
+    fn service_property_queries_reject_foreign_units_before_connecting() {
+        for unit in [
+            "foreign.service",
+            "app-amc-invalid/entry.service",
+            "app-amc-job.scope",
+        ] {
+            assert!(user_service_properties(u32::MAX, unit, &["MainPID"]).is_none());
+        }
+    }
+
+    #[test]
     fn session_bus_identity_and_unknown_states_cannot_prove_completion() {
         let unit = "app-amc-job-session.service";
         let fields = vec![
@@ -413,6 +490,7 @@ mod tests {
         assert!(
             capture_until(
                 Command::new("sh").args(["-c", "exec sleep 10"]),
+                None,
                 Some(started + Duration::from_millis(30)),
             )
             .is_none()
@@ -421,6 +499,7 @@ mod tests {
         assert!(
             capture_until(
                 &mut Command::new("must-not-spawn-after-deadline"),
+                None,
                 Some(started),
             )
             .is_none()

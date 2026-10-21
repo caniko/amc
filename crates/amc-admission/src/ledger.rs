@@ -62,6 +62,38 @@ pub struct Decision {
     pub headroom: Option<Headroom>,
 }
 
+/// A refusal to accept more work, not failure of an already accepted job.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backpressure {
+    pub retry_after_ms: u64,
+}
+
+impl std::fmt::Display for Backpressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("admission queue is full")
+    }
+}
+
+impl std::error::Error for Backpressure {}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueRequest {
+    pub memory_max: u64,
+    pub runtime_max_sec: u64,
+    /// None waits for resources until cancelled; it is not an execution timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueWait {
+    pub submitted_ms: u64,
+    pub deadline_ms: Option<u64>,
+}
+
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 80
@@ -217,6 +249,8 @@ impl Contract {
 pub enum Phase {
     Queued,
     Reserved,
+    /// Native helper is pinned but still waiting for host capacity.
+    Starting,
     Running,
 }
 
@@ -246,6 +280,8 @@ pub struct Entry {
     pub identity: Option<Identity>,
     #[serde(default)]
     pub client: Option<ClientIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueWait>,
 }
 
 impl Entry {
@@ -296,8 +332,18 @@ impl Ledger {
             );
             entry.contract.validate()?;
             ensure!(
-                (entry.phase == Phase::Running) == entry.identity.is_some(),
+                matches!(entry.phase, Phase::Starting | Phase::Running) == entry.identity.is_some(),
                 "inconsistent workload identity"
+            );
+            ensure!(
+                entry.phase != Phase::Starting || entry.queue.is_some(),
+                "legacy entry cannot wait natively"
+            );
+            ensure!(
+                entry.queue.as_ref().is_none_or(|queue| queue
+                    .deadline_ms
+                    .is_none_or(|deadline| deadline > queue.submitted_ms)),
+                "invalid queue deadline"
             );
         }
         Ok(())
@@ -362,6 +408,54 @@ impl Ledger {
             }
         });
         self.sync_protected_pools(policy);
+    }
+
+    /// Queue patience and the finite native entry grace have independent clocks.
+    /// Legacy enqueue operations retain their existing deadline semantics.
+    pub fn enqueue_waiting(
+        &mut self,
+        id: String,
+        name: &str,
+        policy: &Policy,
+        now: u64,
+        request: QueueRequest,
+    ) -> Result<()> {
+        ensure!(
+            request
+                .wait_ms
+                .is_none_or(|ms| (1..=3_600_000).contains(&ms) && now.checked_add(ms).is_some()),
+            "queue wait must be omitted or 1ms..1h"
+        );
+        let deadline_ms = request.wait_ms.map(|ms| now + ms);
+        self.enqueue_bounded(
+            id,
+            name,
+            policy,
+            deadline_ms.unwrap_or(u64::MAX),
+            request.memory_max,
+            request.runtime_max_sec,
+        )?;
+        let entry = self
+            .entries
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing queued entry"))?;
+        let deadline_ms = entry
+            .contract
+            .protected_pool
+            .as_ref()
+            .map_or(deadline_ms, |pool| {
+                Some(
+                    deadline_ms
+                        .unwrap_or(u64::MAX)
+                        .min(now.saturating_add(pool.wait_max_sec * 1000)),
+                )
+            });
+        entry.deadline_ms = deadline_ms.unwrap_or(u64::MAX);
+        entry.queue = Some(QueueWait {
+            submitted_ms: now,
+            deadline_ms,
+        });
+        Ok(())
     }
 
     pub fn enqueue_bounded(
@@ -451,7 +545,6 @@ impl Ledger {
         deadline_ms: u64,
         memory_max: Option<u64>,
     ) -> Result<()> {
-        self.sync_protected_pools(policy);
         ensure!(
             valid_name(&id) && self.get(&id).is_none(),
             "invalid or duplicate ticket"
@@ -461,6 +554,14 @@ impl Ledger {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown contract"))?
             .clone();
+        // Invalid requests must remain errors even when the queue is full.
+        if let Some(bytes) = memory_max {
+            ensure!(
+                bytes > 0 && bytes <= contract.memory_max,
+                "requested memory exceeds contract"
+            );
+            contract.memory_max = bytes;
+        }
         let count = self
             .entries
             .iter()
@@ -475,15 +576,11 @@ impl Ledger {
                     .protected_pool
                     .as_ref()
                     .map_or(policy.queue_limit, |pool| pool.queue_limit),
-            "admission queue is full"
+            Backpressure {
+                retry_after_ms: 250
+            }
         );
-        if let Some(bytes) = memory_max {
-            ensure!(
-                bytes > 0 && bytes <= contract.memory_max,
-                "requested memory exceeds contract"
-            );
-            contract.memory_max = bytes;
-        }
+        self.sync_protected_pools(policy);
         self.entries.push(Entry {
             id,
             name: name.into(),
@@ -492,6 +589,7 @@ impl Ledger {
             deadline_ms,
             identity: None,
             client: None,
+            queue: None,
         });
         Ok(())
     }
@@ -520,7 +618,7 @@ impl Ledger {
         mut headroom: impl FnMut(&Contract) -> Option<Headroom>,
     ) -> BTreeMap<String, Decision> {
         self.entries
-            .retain(|e| e.phase == Phase::Running || now < e.deadline_ms);
+            .retain(|e| e.identity.is_some() || now < e.deadline_ms);
         self.sync_protected_pools(policy);
         let mut decisions = BTreeMap::new();
         let mut blocked = BTreeSet::new();
@@ -608,7 +706,9 @@ impl Ledger {
                     },
                 );
             } else {
-                if self.entries[index].contract.protected_pool.is_some() {
+                if self.entries[index].queue.is_some() {
+                    self.entries[index].deadline_ms = now.saturating_add(30_000);
+                } else if self.entries[index].contract.protected_pool.is_some() {
                     // The queue deadline stays finite; only a reserved call
                     // gains the existing native-submission grace, exactly once.
                     self.entries[index].deadline_ms =
@@ -618,6 +718,34 @@ impl Ledger {
             }
         }
         decisions
+    }
+
+    /// Pin queued native startup without authorizing payload execution. Expiry
+    /// or cancellation now requires native cleanup rather than dropping a ticket.
+    pub fn start(&mut self, id: &str, identity: Identity, now: u64) -> Result<()> {
+        ensure!(
+            identity.cgroup.len() <= 4096 && identity.invocation.len() <= 32,
+            "workload identity exceeds bounds"
+        );
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
+        let queue = entry
+            .queue
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("legacy ticket cannot wait natively"))?;
+        ensure!(
+            entry.phase == Phase::Reserved
+                && now < entry.deadline_ms
+                && queue.deadline_ms.is_none_or(|deadline| now < deadline),
+            "ticket cannot start"
+        );
+        entry.phase = Phase::Starting;
+        entry.deadline_ms = queue.deadline_ms.unwrap_or(u64::MAX);
+        entry.identity = Some(identity);
+        Ok(())
     }
 
     /// Called by the native pre-exec helper, not the submitting client. The
@@ -633,7 +761,11 @@ impl Ledger {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("ticket expired or unknown"))?;
         ensure!(
-            entry.phase == Phase::Reserved,
+            if entry.queue.is_some() {
+                entry.phase == Phase::Starting && entry.identity.as_ref() == Some(&identity)
+            } else {
+                entry.phase == Phase::Reserved
+            },
             "ticket is not ready or already entered"
         );
         entry.phase = Phase::Running;
@@ -643,8 +775,7 @@ impl Ledger {
 
     pub fn cancel_pending(&mut self, id: &str) -> bool {
         let before = self.entries.len();
-        self.entries
-            .retain(|e| e.id != id || e.phase == Phase::Running);
+        self.entries.retain(|e| e.id != id || e.identity.is_some());
         before != self.entries.len()
     }
 
@@ -652,6 +783,6 @@ impl Ledger {
     /// entry. A missing reply, client death, or expired deadline is insufficient.
     pub fn reconcile(&mut self, mut terminated: impl FnMut(&Entry) -> bool) {
         self.entries
-            .retain(|e| e.phase != Phase::Running || !terminated(e));
+            .retain(|e| e.identity.is_none() || !terminated(e));
     }
 }

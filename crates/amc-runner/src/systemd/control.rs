@@ -1,5 +1,6 @@
 //! Bounded, non-interactive manager queries. Workload forwarding does not use this path.
 use std::{
+    fs::File,
     io::{ErrorKind, Read},
     os::{fd::OwnedFd, unix::net::UnixStream},
     process::{Command, Stdio},
@@ -15,20 +16,34 @@ pub const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Run a bounded manager query, never including subprocess output in errors.
 pub fn capture(command: &mut Command) -> Result<String> {
-    capture_with_limit(command, QUERY_TIMEOUT, OUTPUT_LIMIT)
+    capture_with_limit(command, QUERY_TIMEOUT, OUTPUT_LIMIT, None)
 }
 
 /// Run a bounded manager query with a caller-supplied timeout, clamped to
 /// at `QUERY_TIMEOUT`, never extending the caller's budget. A zero timeout fails immediately without
 /// spawning: the caller's deadline is already exhausted.
 pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<String> {
+    capture_from(command, timeout, None)
+}
+
+/// `capture_with_timeout` with `stdin`, rather than null, as standard input.
+pub(super) fn capture_from(
+    command: &mut Command,
+    timeout: Duration,
+    stdin: Option<&File>,
+) -> Result<String> {
     if timeout.is_zero() {
         bail!("diagnostic deadline exhausted; state unknown");
     }
-    capture_with_limit(command, timeout.min(QUERY_TIMEOUT), OUTPUT_LIMIT)
+    capture_with_limit(command, timeout.min(QUERY_TIMEOUT), OUTPUT_LIMIT, stdin)
 }
 
-fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) -> Result<String> {
+fn capture_with_limit(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    stdin: Option<&File>,
+) -> Result<String> {
     let deadline = Instant::now() + timeout;
     // A nonblocking socket avoids both pipe-reader threads and a descendant
     // holding stdout open indefinitely after the queried process has exited.
@@ -43,8 +58,12 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
         }
         let (reader, writer) = UnixStream::pair()?;
         reader.set_nonblocking(true)?;
+        let input = match stdin {
+            Some(file) => Stdio::from(file.try_clone()?),
+            None => Stdio::null(),
+        };
         command
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::from(OwnedFd::from(writer)))
             .stderr(Stdio::null());
         let spawned = {
@@ -68,7 +87,7 @@ fn capture_with_limit(command: &mut Command, timeout: Duration, limit: usize) ->
             }
         }
     };
-    command.stdout(Stdio::null());
+    command.stdin(Stdio::null()).stdout(Stdio::null());
     let mut bytes = Vec::new();
     let result = (|| {
         let mut eof = false;
@@ -137,6 +156,7 @@ mod tests {
                 Command::new("sh").args(["-c", "exec sleep 10"]),
                 Duration::from_millis(30),
                 64,
+                None,
             )
             .is_err()
         );
@@ -146,10 +166,21 @@ mod tests {
                 Command::new("sh").args(["-c", "printf SENSITIVE_TOO_LONG"]),
                 Duration::from_secs(1),
                 4,
+                None,
             )
             .unwrap_err()
             .to_string()
             .contains("byte limit")
         );
+    }
+
+    #[test]
+    fn supplied_stdin_reaches_the_child() {
+        let path = std::env::temp_dir().join(format!("amc-capture-stdin-{}", std::process::id()));
+        std::fs::write(&path, "pinned").unwrap();
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let text = capture_from(&mut Command::new("cat"), QUERY_TIMEOUT, Some(&file));
+        assert_eq!(text.unwrap(), "pinned");
     }
 }
