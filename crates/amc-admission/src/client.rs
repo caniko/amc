@@ -100,6 +100,39 @@ impl ExecRequest {
         })
     }
 
+    /// Enforce the bounds the CLI parser applies: positive ceilings and
+    /// runtimes within 1..=86400 seconds.
+    pub fn validate(&self) -> Result<()> {
+        let runtime = |seconds: u64| {
+            ensure!(
+                (1..=86400).contains(&seconds),
+                "runtime must be within 1..=86400 seconds, got {seconds}"
+            );
+            Ok(())
+        };
+        if let Some(seconds) = self.runtime_max_sec {
+            runtime(seconds)?;
+        }
+        match self.mode {
+            Mode::Queued {
+                memory_max,
+                runtime_max_sec,
+            }
+            | Mode::Bounded {
+                memory_max,
+                runtime_max_sec,
+            } => {
+                runtime(runtime_max_sec)?;
+                ensure!(memory_max > 0, "memory ceiling must be positive");
+            }
+            Mode::Sized { memory_max } => {
+                ensure!(memory_max > 0, "memory ceiling must be positive")
+            }
+            Mode::Plain => {}
+        }
+        Ok(())
+    }
+
     fn effective_wait(&self) -> Option<Duration> {
         match self.mode {
             Mode::Queued { .. } => self.wait,
@@ -322,7 +355,9 @@ impl Exec {
         // `run` drops every writer it holds before returning, so collectors
         // reach EOF once the unit's own descriptors close.
         let result = run(self, cancelled);
-        if result.is_err() {
+        // Only a completed exit confirms native cleanup; a cancellation may
+        // leave a descendant holding the forwarded pipes.
+        if !matches!(result, Ok(Exit::Code(_))) {
             stop.store(true, Ordering::SeqCst);
         }
         let join = |handle: thread::JoinHandle<std::io::Result<Vec<u8>>>| {
@@ -381,6 +416,7 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         stdout,
         stderr,
     } = exec;
+    request.validate()?;
     let socket = request.socket.as_path();
     let ready_token = request.ready_token.as_deref();
     let burst = request.burst;
@@ -616,32 +652,36 @@ fn forwarded_environment(overrides: &BTreeMap<OsString, Option<OsString>>) -> Ve
                 .map(|(name, _)| name.clone()),
         )
         .filter_map(|name| name.into_string().ok())
-        .filter(|name| {
-            amc_runner::systemd::valid_environment_name(name)
-                && !name.starts_with("SYSTEMD_")
-                && !name.starts_with("LISTEN_")
-                && !matches!(
-                    name.as_str(),
-                    "INVOCATION_ID"
-                        | "MANAGERPID"
-                        | "JOURNAL_STREAM"
-                        | "NOTIFY_SOCKET"
-                        | "WATCHDOG_PID"
-                        | "WATCHDOG_USEC"
-                )
-        })
+        .filter(|name| caller_owned_environment(name))
         .collect::<Vec<_>>();
     names.sort();
     names
 }
 
-/// Valid environment names the caller removed with [`Exec::env_remove`].
+/// Valid names that are not owned by the unit lifecycle; systemd and the
+/// entry handshake own the rest (queued entry needs `NOTIFY_SOCKET`).
+fn caller_owned_environment(name: &str) -> bool {
+    amc_runner::systemd::valid_environment_name(name)
+        && !name.starts_with("SYSTEMD_")
+        && !name.starts_with("LISTEN_")
+        && !matches!(
+            name,
+            "INVOCATION_ID"
+                | "MANAGERPID"
+                | "JOURNAL_STREAM"
+                | "NOTIFY_SOCKET"
+                | "WATCHDOG_PID"
+                | "WATCHDOG_USEC"
+        )
+}
+
+/// Caller-owned names removed with [`Exec::env_remove`].
 fn removed_environment(overrides: &BTreeMap<OsString, Option<OsString>>) -> Vec<String> {
     overrides
         .iter()
         .filter(|(_, value)| value.is_none())
         .filter_map(|(name, _)| name.to_str())
-        .filter(|name| amc_runner::systemd::valid_environment_name(name))
+        .filter(|name| caller_owned_environment(name))
         .map(str::to_owned)
         .collect()
 }
@@ -868,7 +908,30 @@ mod tests {
         overrides.insert(OsString::from("PATH"), None);
         overrides.insert(OsString::from("KEEP"), Some(OsString::from("1")));
         overrides.insert(OsString::from("bad=name"), None);
+        overrides.insert(OsString::from("NOTIFY_SOCKET"), None);
         assert_eq!(removed_environment(&overrides), ["PATH"]);
+    }
+
+    #[test]
+    fn requests_reject_unbounded_or_empty_limits() {
+        let queued = |runtime_max_sec, memory_max| {
+            request(
+                Mode::Queued {
+                    memory_max,
+                    runtime_max_sec,
+                },
+                None,
+            )
+        };
+        assert!(queued(86400, 4096).validate().is_ok());
+        assert!(queued(0, 4096).validate().is_err());
+        assert!(queued(86401, 4096).validate().is_err());
+        assert!(queued(60, 0).validate().is_err());
+        let mut sized = request(Mode::Sized { memory_max: 4096 }, None);
+        sized.runtime_max_sec = Some(0);
+        assert!(sized.validate().is_err());
+        sized.runtime_max_sec = Some(30);
+        assert!(sized.validate().is_ok());
     }
 
     #[test]
