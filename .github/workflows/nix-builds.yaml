@@ -95,7 +95,7 @@ jobs:
         run: python3 -B nix/test-hosted-ci.py
 
       - name: Project setup 3
-        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/bd04eedca7cdb76042fb3d4eeda9658721988fa2 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
+        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/8a132e416caf9cc58a753005b804343181477200 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
 
       - name: Resolve cached Nix inputs
         id: simit-nix-cache
@@ -194,7 +194,7 @@ jobs:
           set -euo pipefail
           cache_root="$RUNNER_TEMP/simit-nix-cache"
           export_input() {
-            local hit="SIMIT_NIX_CACHE_HIT_$1" outputs bytes
+            local hit="SIMIT_NIX_CACHE_HIT_$1" outputs kib
             [ "${!hit}" != true ] && test -s "$cache_root/$1.drv" || return 0
             outputs=$(nix-store --query --outputs "$(cat "$cache_root/$1.drv")")
             nix-store --check-validity $outputs 2>/dev/null || return 0
@@ -203,9 +203,10 @@ jobs:
               rm -rf "$cache_root/$1"
               return 0
             fi
-            bytes=$(du -sb "$cache_root/$1" | cut -f1)
-            if [ "$bytes" -gt 4294967296 ]; then
-              echo "::warning::Cached Nix input $1 closure is $bytes bytes; not saving above 4294967296"
+            # POSIX du: Darwin has no byte-granular -b.
+            kib=$(du -sk "$cache_root/$1" | cut -f1)
+            if [ "$kib" -gt 4194304 ]; then
+              echo "::warning::Cached Nix input $1 closure is $kib KiB; not saving above 4194304 KiB"
               rm -rf "$cache_root/$1"
               return 0
             fi

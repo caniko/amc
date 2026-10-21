@@ -37,7 +37,7 @@ cache_installables = [
 extra_setup = [
   "python3 -c 'from pathlib import Path; p = Path.home() / \".config/nix/nix.conf\"; p.parent.mkdir(parents=True, exist_ok=True); p.open(\"a\").write(\"\\nlog-lines = 1000\\n\")'",
   "python3 -B nix/test-hosted-ci.py",
-  "nix run --max-jobs 1 --cores 2 github:caniko/simit/bd04eedca7cdb76042fb3d4eeda9658721988fa2 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
+  "nix run --max-jobs 1 --cores 2 github:caniko/simit/8a132e416caf9cc58a753005b804343181477200 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
 ]
 post_build = ["python3 nix/hosted-ci.py"]
 post_build_always = ["python3 -B nix/retain-diagnostics.py"]
