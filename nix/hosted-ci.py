@@ -537,7 +537,11 @@ def retain():
     output = Path(result[0]["outputs"]["out"])
     if not str(output).startswith("/nix/store/") or not output.exists():
         raise RuntimeError("Selected qualification output is not realized")
-    revision = (evidence / "revision").read_text().strip()
+    # Grouped Simit jobs retain one source revision beside the member folders.
+    revision_file = evidence / "revision"
+    if not revision_file.exists():
+        revision_file = evidence.parent / "revision"
+    revision = revision_file.read_text().strip()
     actual = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()

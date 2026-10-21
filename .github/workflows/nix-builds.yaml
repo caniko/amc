@@ -3,7 +3,8 @@ name: Nix installable builds
 
 on:
   push:
-    branches: ["**"]
+    branches:
+      - "trunk"
     tags:
       - "**"
   pull_request:
@@ -13,40 +14,43 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow_ref }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow_ref }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.ref_type == 'tag' && github.ref || format('refs/heads/{0}', github.event.pull_request.head.ref || github.ref_name) }}
   cancel-in-progress: true
 
 jobs:
   build:
+    name: build (${{ matrix.group }})
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
-        installable:
-          - ".#packages.x86_64-linux.default"
-          - ".#checks.x86_64-linux.test"
-          - ".#checks.x86_64-linux.clippy"
-          - ".#nixosTests.x86_64-linux.protected-pool"
-          - ".#nixosTests.x86_64-linux.shared-admission"
-          - ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"
-          - ".#nixosTests.x86_64-linux.supervision"
+        include:
+          - group: "atlas-kernel"
+            installables: '[".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"]'
+          - group: "rust"
+            installables: '[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy"]'
+          - group: "shared-admission"
+            installables: '[".#nixosTests.x86_64-linux.shared-admission"]'
+          - group: "vm"
+            installables: '[".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.supervision"]'
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Prepare Nix build evidence
-        env:
-          INSTALLABLE: ${{ matrix.installable }}
         run: |
           SIMIT_NIX_BUILD_RESULTS="$RUNNER_TEMP/simit-nix-build-${{ strategy.job-index }}"
-          printf '%s\n' "SIMIT_NIX_BUILD_RESULTS=$SIMIT_NIX_BUILD_RESULTS" >> "$GITHUB_ENV"
           mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+          printf '%s\n' "SIMIT_NIX_BUILD_RESULTS=$SIMIT_NIX_BUILD_RESULTS" >> "$GITHUB_ENV"
           git rev-parse HEAD > "$SIMIT_NIX_BUILD_RESULTS/revision"
-          printf '%s\n' "$INSTALLABLE" > "$SIMIT_NIX_BUILD_RESULTS/installable"
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
 
@@ -55,6 +59,29 @@ jobs:
           git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
           git config --global --add url.https://github.com/.insteadOf git@github.com:
 
+      - name: Provision grouped-build Rust engine
+        shell: bash
+        env:
+          SIMIT_CI_ENGINE_REVISION: ${{ vars.SIMIT_CI_ENGINE_REVISION }}
+          BASH_ENV: ''
+          ENV: ''
+          NIX_CONFIG: 'experimental-features = nix-command flakes'
+          NIX_USER_CONF_FILES: /dev/null
+          NIX_PATH: ''
+        run: |
+          [[ "$SIMIT_CI_ENGINE_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Enroll an immutable SIMIT_CI_ENGINE_REVISION containing ci nix-group' >&2; exit 1; }
+          case "$(uname -s):$(uname -m)" in
+            Linux:x86_64|Linux:aarch64|Linux:arm64|Darwin:arm64|Darwin:aarch64) ;;
+            *) echo 'unsupported grouped engine runner system' >&2; exit 1 ;;
+          esac
+          engine_path=$(env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_OAUTH_TOKEN -u ATTIC_TOKEN -u CACHIX_AUTH_TOKEN -u CACHIX_SIGNING_KEY nix build --no-link --no-update-lock-file --print-out-paths --option accept-flake-config false --option access-tokens '' --option substituters https://cache.nixos.org "github:caniko/simit/$SIMIT_CI_ENGINE_REVISION#default")
+          [[ "$engine_path" =~ ^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+$ ]] || { echo 'Invalid engine output inventory' >&2; exit 1; }
+          test -x "$engine_path/bin/simit"
+          "$engine_path/bin/simit" ci nix-group --help > /dev/null
+          printf '%s\n' "$SIMIT_CI_ENGINE_REVISION" > "$SIMIT_NIX_BUILD_RESULTS/engine-source-revision"
+          engine_digest=$(nix hash file --type sha256 --base16 "$engine_path/bin/simit")
+          printf '%s  %s\n' "$engine_digest" "$engine_path/bin/simit" > "$SIMIT_NIX_BUILD_RESULTS/engine-executable.sha256"
+          printf '%s\n' "SIMIT_CI_ENGINE=$engine_path/bin/simit" >> "$GITHUB_ENV"
       - name: Enable hosted KVM
         run: |
           test "${RUNNER_ENVIRONMENT:-}" = github-hosted
@@ -68,34 +95,247 @@ jobs:
         run: python3 -B nix/test-hosted-ci.py
 
       - name: Project setup 3
-        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/eac437a218b6471df772c9bf73c177988b03aed0 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
+        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/bd04eedca7cdb76042fb3d4eeda9658721988fa2 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
 
-      - name: Build ${{ matrix.installable }}
-        env:
-          INSTALLABLE: ${{ matrix.installable }}
+      - name: Resolve cached Nix inputs
+        id: simit-nix-cache
+        shell: bash
         run: |
           set -euo pipefail
-          exec 3> >(tee "$SIMIT_NIX_BUILD_RESULTS/build.log" >&2)
-          log_pid=$!
-          status=0
-          nix build --no-link --no-update-lock-file --max-jobs 1 --cores 4 --json "$INSTALLABLE" 2>&3 | tee "$SIMIT_NIX_BUILD_RESULTS/result.json" || status=$?
-          exec 3>&-
-          wait "$log_pid"
-          exit "$status"
-      - name: Retain Nix results 1
+          cache_root="$RUNNER_TEMP/simit-nix-cache"
+          mkdir -p "$cache_root"
+          resolve() {
+            local drv
+            drv=$(nix path-info --derivation --no-update-lock-file "$2")
+            [[ "$drv" =~ ^/nix/store/([0-9a-z]{32})-[^/]+\.drv$ ]] || { echo "Cached Nix input $2 must select exactly one local derivation" >&2; exit 1; }
+            printf '%s\n' "$drv" > "$cache_root/$1.drv"
+            printf 'key-%s=simit-nix-input-v1-%s\n' "$1" "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          }
+          resolve 0 .#nixosTests.x86_64-linux.shared-admission.nodes.machine.boot.kernelPackages.kernel
+          resolve 1 .#nixosTests.x86_64-linux.shared-admission-atlas-kernel.nodes.machine.boot.kernelPackages.kernel
+      - name: Restore cached Nix input 0
+        id: simit-nix-cache-0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-nix-cache/0
+          key: ${{ steps.simit-nix-cache.outputs.key-0 }}
+      - name: Restore cached Nix input 1
+        id: simit-nix-cache-1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-nix-cache/1
+          key: ${{ steps.simit-nix-cache.outputs.key-1 }}
+      - name: Import cached Nix inputs
+        shell: bash
+        env:
+          SIMIT_NIX_GROUP: ${{ matrix.group }}
+          SIMIT_NIX_CACHE_HIT_0: ${{ steps.simit-nix-cache-0.outputs.cache-hit }}
+          SIMIT_NIX_CACHE_HIT_1: ${{ steps.simit-nix-cache-1.outputs.cache-hit }}
         run: |
-          python3 nix/hosted-ci.py
-      - name: Retain Nix diagnostics 1
+          set -euo pipefail
+          cache_root="$RUNNER_TEMP/simit-nix-cache"
+          case "$SIMIT_NIX_GROUP" in
+            atlas-kernel) members=(.#nixosTests.x86_64-linux.shared-admission-atlas-kernel) ;;
+            rust) members=(.#packages.x86_64-linux.default .#checks.x86_64-linux.test .#checks.x86_64-linux.clippy) ;;
+            shared-admission) members=(.#nixosTests.x86_64-linux.shared-admission) ;;
+            vm) members=(.#nixosTests.x86_64-linux.protected-pool .#nixosTests.x86_64-linux.supervision) ;;
+            *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
+          esac
+          gate_drvs=$(nix path-info --derivation --no-update-lock-file "${members[@]}")
+          gates=$(nix-store --query --outputs $gate_drvs)
+          test -n "$gates"
+          import_input() {
+            local hit="SIMIT_NIX_CACHE_HIT_$1" outputs closure
+            [ "${!hit}" = true ] || return 0
+            outputs=$(nix-store --query --outputs "$(cat "$cache_root/$1.drv")")
+            if ! closure=$(nix path-info --store "file://$cache_root/$1" --recursive $outputs); then
+              echo "::warning::Cached Nix input $1 is unreadable; building it normally"
+              rm -rf "$cache_root/$1"
+              return 0
+            fi
+            if grep -xF -- "$gates" <<< "$closure"; then
+              echo "Cached Nix input $1 contains the qualification outputs above" >&2
+              exit 1
+            fi
+            nix copy --no-check-sigs --from "file://$cache_root/$1" $outputs || echo "::warning::Cached Nix input $1 failed to import; building it normally"
+            rm -rf "$cache_root/$1"
+          }
+          import_input 0
+          import_input 1
+      - name: Build Nix group
+        shell: bash
+        env:
+          SIMIT_NIX_GROUP: ${{ matrix.group }}
+        run: |
+          case "$SIMIT_NIX_GROUP" in
+            atlas-kernel)
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              ;;
+            rust)
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              ;;
+            shared-admission)
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              ;;
+            vm)
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.supervision"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              ;;
+            *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
+          esac
+          "$SIMIT_CI_ENGINE" ci nix-group --spec "$SIMIT_NIX_BUILD_RESULTS/group-spec.json"
+      - name: Export cached Nix inputs
+        id: simit-nix-cache-save
         if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          SIMIT_NIX_CACHE_HIT_0: ${{ steps.simit-nix-cache-0.outputs.cache-hit }}
+          SIMIT_NIX_CACHE_HIT_1: ${{ steps.simit-nix-cache-1.outputs.cache-hit }}
         run: |
-          python3 -B nix/retain-diagnostics.py
+          set -euo pipefail
+          cache_root="$RUNNER_TEMP/simit-nix-cache"
+          export_input() {
+            local hit="SIMIT_NIX_CACHE_HIT_$1" outputs bytes
+            [ "${!hit}" != true ] && test -s "$cache_root/$1.drv" || return 0
+            outputs=$(nix-store --query --outputs "$(cat "$cache_root/$1.drv")")
+            nix-store --check-validity $outputs 2>/dev/null || return 0
+            if ! nix copy --to "file://$cache_root/$1?compression=zstd" $outputs; then
+              echo "::warning::Cached Nix input $1 failed to export; not saving it"
+              rm -rf "$cache_root/$1"
+              return 0
+            fi
+            bytes=$(du -sb "$cache_root/$1" | cut -f1)
+            if [ "$bytes" -gt 4294967296 ]; then
+              echo "::warning::Cached Nix input $1 closure is $bytes bytes; not saving above 4294967296"
+              rm -rf "$cache_root/$1"
+              return 0
+            fi
+            printf 'save-%s=true\n' "$1" >> "$GITHUB_OUTPUT"
+          }
+          export_input 0
+          export_input 1
+      - name: Save cached Nix input 0
+        if: ${{ !cancelled() && steps.simit-nix-cache-save.outputs.save-0 == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-nix-cache/0
+          key: ${{ steps.simit-nix-cache.outputs.key-0 }}
+      - name: Save cached Nix input 1
+        if: ${{ !cancelled() && steps.simit-nix-cache-save.outputs.save-1 == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-nix-cache/1
+          key: ${{ steps.simit-nix-cache.outputs.key-1 }}
+      - name: Retain uncollected group diagnostics
+        if: ${{ !cancelled() }}
+        env:
+          SIMIT_NIX_GROUP: ${{ matrix.group }}
+          SIMIT_NIX_BUILD_RESULTS: ${{ runner.temp }}/simit-nix-build-${{ strategy.job-index }}
+        run: |
+          group_root="$SIMIT_NIX_BUILD_RESULTS"
+          collector_failed=0
+          case "$SIMIT_NIX_GROUP" in
+            atlas-kernel)
+              export INSTALLABLE=.#nixosTests.x86_64-linux.shared-admission-atlas-kernel
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/0"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              ;;
+            rust)
+              export INSTALLABLE=.#packages.x86_64-linux.default
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/0"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              export INSTALLABLE=.#checks.x86_64-linux.test
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/1"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              export INSTALLABLE=.#checks.x86_64-linux.clippy
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/2"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              ;;
+            shared-admission)
+              export INSTALLABLE=.#nixosTests.x86_64-linux.shared-admission
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/0"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              ;;
+            vm)
+              export INSTALLABLE=.#nixosTests.x86_64-linux.protected-pool
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/0"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              export INSTALLABLE=.#nixosTests.x86_64-linux.supervision
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/1"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              ;;
+            *) echo 'Unknown Nix diagnostic group' >&2; exit 1 ;;
+          esac
+          exit "$collector_failed"
       - name: Upload Nix build evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
 
         with:
           name: nix-build-${{ strategy.job-index }}
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
           path: |
             ${{ runner.temp }}/simit-nix-build-${{ strategy.job-index }}
