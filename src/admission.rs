@@ -586,6 +586,19 @@ fn run(
         );
         anyhow::bail!("admission cancelled or timed out before submission");
     }
+    // A helper that fails before entry also completes natively. Relay its
+    // stderr so only an observed entry frame authorizes completion proof.
+    let entered = match ready_token {
+        Some(token) => {
+            let (reader, writer) = std::io::pipe()?;
+            client.stderr(writer);
+            Some(relay_entry(
+                reader,
+                format!("\x1e{token}\x1f").into_bytes(),
+            )?)
+        }
+        None => None,
+    };
     let outcome = execute(
         &mut client,
         Path::new("systemctl"),
@@ -595,6 +608,8 @@ fn run(
         || signals.cancelled(),
         &record,
     );
+    // Drop this process's relay writer so the relay sees EOF.
+    client.stderr(std::process::Stdio::inherit());
     // Cancel only this owned attempt. The server retains an entered workload's
     // reservation until native termination, including on ambiguous outcomes.
     let _ = call(
@@ -603,12 +618,45 @@ fn run(
             id: entry.id.clone(),
         },
     );
-    if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token)) {
+    // Completion confirmed native cleanup, so the relay reaches EOF promptly.
+    if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token))
+        && entered.is_some_and(|seen| seen.recv_timeout(Duration::from_secs(1)) == Ok(true))
+    {
         std::io::stderr()
             .write_all(frame.as_bytes())
             .context("notify caller of confirmed native completion")?;
     }
     outcome_exit(outcome, &entry.unit())
+}
+
+/// Forward `reader` to stderr and report, at EOF, whether `frame` passed through.
+fn relay_entry(
+    mut reader: impl Read + Send + 'static,
+    frame: Vec<u8>,
+) -> Result<std::sync::mpsc::Receiver<bool>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::Builder::new()
+        .name("amc-stderr-relay".into())
+        .spawn(move || {
+            let (mut seen, mut window, mut buffer) = (false, Vec::new(), [0; 4096]);
+            loop {
+                let n = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                // Keep draining even if the caller closed stderr.
+                let _ = std::io::stderr().write_all(&buffer[..n]);
+                if !seen {
+                    window.extend_from_slice(&buffer[..n]);
+                    seen = window.windows(frame.len()).any(|bytes| bytes == frame);
+                    window.drain(..window.len().saturating_sub(frame.len() - 1));
+                }
+            }
+            let _ = sender.send(seen);
+        })?;
+    Ok(receiver)
 }
 
 fn parse_ready_token(value: &str) -> std::result::Result<String, String> {
@@ -703,6 +751,33 @@ fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32
 mod tests {
     use super::*;
     use amc_runner::systemd::{Cleanup, Outcome};
+
+    #[test]
+    fn only_a_relayed_entry_frame_authorizes_completion_proof() {
+        let frame = b"\x1e0123456789abcdef0123456789abcdef\x1f".to_vec();
+        for (chunks, expected) in [
+            (
+                vec![
+                    &b"waiting\n\x1e0123456789abcdef"[..],
+                    &b"0123456789abcdef\x1fout"[..],
+                ],
+                true,
+            ),
+            (vec![&b"waiting for host capacity: None\n"[..]], false),
+            (
+                vec![&b"\x1e0123456789abcdef0123456789abcdef:complete:1\x1f"[..]],
+                false,
+            ),
+        ] {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            let seen = relay_entry(reader, frame.clone()).unwrap();
+            for chunk in chunks {
+                writer.write_all(chunk).unwrap();
+            }
+            drop(writer);
+            assert_eq!(seen.recv_timeout(Duration::from_secs(5)), Ok(expected));
+        }
+    }
 
     #[test]
     fn native_ready_tokens_are_bounded_and_cannot_inject_framing() {
