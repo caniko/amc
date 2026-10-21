@@ -15,21 +15,44 @@ nix_builds = [
 
 [ci.nix_build]
 only = true
-separate_events = true
+# Pull requests qualify their exact head once; trunk and tags keep push runs.
+push_branches = ["trunk"]
 push_tags = ["**"]
 # Both original ThinLTO builds exhausted four hours before VM startup. Public
 # ubuntu-24.04 runners provide four CPUs; keep realization serial per runner.
+# A kernel cache miss still needs that budget.
 timeout_minutes = 360
-max_parallel = 2
+max_parallel = 4
 max_jobs = 1
 cores = 4
 kvm = true
 capture_results = true
 artifact_retention_days = 30
+# Each VM gate builds its own patched kernel for about two hours. Reuse them
+# across runs by exact derivation; the VM gates themselves always execute.
+cache_installables = [
+  ".#nixosTests.x86_64-linux.shared-admission.nodes.machine.boot.kernelPackages.kernel",
+  ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel.nodes.machine.boot.kernelPackages.kernel",
+]
 extra_setup = [
   "python3 -c 'from pathlib import Path; p = Path.home() / \".config/nix/nix.conf\"; p.parent.mkdir(parents=True, exist_ok=True); p.open(\"a\").write(\"\\nlog-lines = 1000\\n\")'",
   "python3 -B nix/test-hosted-ci.py",
-  "nix run --max-jobs 1 --cores 2 github:caniko/simit/eac437a218b6471df772c9bf73c177988b03aed0 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
+  "nix run --max-jobs 1 --cores 2 github:caniko/simit/8a132e416caf9cc58a753005b804343181477200 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
 ]
 post_build = ["python3 nix/hosted-ci.py"]
 post_build_always = ["python3 -B nix/retain-diagnostics.py"]
+
+# Jobs share one store per group: the Rust outputs and the kernel-free VMs
+# each build AMC once, and each patched-kernel gate keeps its own runner.
+[ci.nix_build.groups]
+rust = [
+  ".#packages.x86_64-linux.default",
+  ".#checks.x86_64-linux.test",
+  ".#checks.x86_64-linux.clippy",
+]
+vm = [
+  ".#nixosTests.x86_64-linux.protected-pool",
+  ".#nixosTests.x86_64-linux.supervision",
+]
+shared-admission = [".#nixosTests.x86_64-linux.shared-admission"]
+atlas-kernel = [".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"]

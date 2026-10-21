@@ -452,12 +452,12 @@ class NativeEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "simit.toml").write_text(source)
-            self.assertEqual(hosted.generator_revision(root), "eac437a218b6471df772c9bf73c177988b03aed0")
+            self.assertEqual(hosted.generator_revision(root), "8a132e416caf9cc58a753005b804343181477200")
             replacement = "1234567890abcdef1234567890abcdef12345678"
-            (root / "simit.toml").write_text(source.replace("eac437a218b6471df772c9bf73c177988b03aed0", replacement))
+            (root / "simit.toml").write_text(source.replace("8a132e416caf9cc58a753005b804343181477200", replacement))
             self.assertEqual(hosted.generator_revision(root), replacement)
             for invalid in ["main", "1234567", "", replacement.upper()]:
-                (root / "simit.toml").write_text(source.replace("eac437a218b6471df772c9bf73c177988b03aed0", invalid))
+                (root / "simit.toml").write_text(source.replace("8a132e416caf9cc58a753005b804343181477200", invalid))
                 with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
                     hosted.generator_revision(root)
 

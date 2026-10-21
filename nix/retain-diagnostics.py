@@ -38,8 +38,11 @@ def retain():
                 result = {"timedOut": True}
         results.append({"derivation": derivation, "log": str(path.relative_to(evidence)),
                         "bytes": path.stat().st_size, **result})
+    revision = evidence / "revision"
+    if not revision.exists():
+        revision = evidence.parent / "revision"
     (evidence / "builder-diagnostics.json").write_text(json.dumps({
-        "schemaVersion": 1, "revision": (evidence / "revision").read_text().strip(),
+        "schemaVersion": 1, "revision": revision.read_text().strip(),
         "installable": (evidence / "installable").read_text().strip(),
         "failureCount": len(failures), "logs": results,
     }, indent=2) + "\n")
