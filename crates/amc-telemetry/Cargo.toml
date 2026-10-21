@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Shared bounded cgroup observation core: readers, parsers, identity, comparison"
+repository = "https://github.com/caniko/amc"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

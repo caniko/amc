@@ -3,6 +3,8 @@ platform = "github"
 provider = "actions"
 runtime = "nix"
 runner = "ubuntu-24.04"
+publish_crates = true
+publish_strategy = "coordinated"
 nix_builds = [
   ".#packages.x86_64-linux.default",
   ".#checks.x86_64-linux.test",

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Memory admission and managed execution for AMC"
-repository = "https://codeberg.org/caniko/amc"
+repository = "https://github.com/caniko/amc"
 readme = false
 
 [features]
@@ -15,7 +15,7 @@ sysinfo = ["dep:sysinfo"]
 systemd = ["sync", "dep:anyhow", "dep:nix", "dep:serde_json"]
 
 [dependencies]
-amc-telemetry = { path = "../amc-telemetry" }
+amc-telemetry = { version = "0.1.0", path = "../amc-telemetry" }
 anyhow = { version = "1", optional = true }
 nix = { version = "0.30", optional = true, features = ["socket", "user"] }
 serde_json = { version = "1", optional = true }
