@@ -204,25 +204,6 @@ fn host_command(
     Ok(command)
 }
 
-pub fn verify_host_runner(socket: &Path) -> Result<()> {
-    let placement = std::fs::read_to_string("/proc/self/cgroup")?;
-    if placement.lines().any(|line| {
-        line.rsplit('/').next().is_some_and(|leaf| {
-            leaf.starts_with("app-amc-host-runner-") && leaf.ends_with(".service")
-        })
-    }) {
-        ensure!(
-            amc_admission::host_server::call(
-                socket,
-                &amc_admission::host_server::Request::NamespaceRunner { version: 1 }
-            )?
-            .granted,
-            "namespace runner has no backed aggregate allowance"
-        );
-    }
-    Ok(())
-}
-
 #[derive(Debug, clap::Args)]
 pub struct NativeStartArgs {
     #[arg(long)]
@@ -253,26 +234,9 @@ pub fn execute(arguments: NativeStartArgs) -> Result<i32> {
     .with_context(|| format!("execute native workload {:?}", arguments.command[0]))
 }
 
-/// The same outer helper wraps admitted entry and ordinary native tools. Both
-/// exec in place after capture; existing admission checks still precede payload.
+/// Startup barrier for native tools; admitted entry uses the library directly.
 pub fn wrap(client: &mut Command) -> Result<amc_runner::systemd::ClientRecord> {
-    let barrier = amc_runner::systemd::StartupBarrier::new(format!(
-        "amc-start-{}",
-        amc_admission::store::fresh_id()?
-    ))?;
-    let parent = std::process::id() as i32;
-    let start = amc_admission::host_native::process_start(parent)?;
-    client.arg("--").arg(std::env::current_exe()?).args([
-        "native-start",
-        "--socket",
-        barrier.name(),
-        "--parent",
-        &parent.to_string(),
-        "--parent-start",
-        &start.to_string(),
-        "--",
-    ]);
-    Ok(amc_runner::systemd::ClientRecord::with_startup(barrier))
+    amc_admission::client::wrap(client, &std::env::current_exe()?)
 }
 
 #[cfg(test)]

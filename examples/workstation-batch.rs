@@ -391,7 +391,7 @@ fn job_run(
             &Default::default(),
         ))
     };
-    let accounting = control::capture_with_timeout(Command::new("systemctl").args(["--user", "show", "--no-pager", "--property=Id,LoadState,ActiveState,Result,InvocationID,ControlGroup,MemoryPeak,MemorySwapPeak,CPUUsageNSec,IOReadBytes,IOWriteBytes,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic", "--", &unit]), control::QUERY_TIMEOUT).ok();
+    let accounting = amc_runner::systemd::capture_with_timeout(Command::new("systemctl").args(["--user", "show", "--no-pager", "--property=Id,LoadState,ActiveState,Result,InvocationID,ControlGroup,MemoryPeak,MemorySwapPeak,CPUUsageNSec,IOReadBytes,IOWriteBytes,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic", "--", &unit]), control::QUERY_TIMEOUT).ok();
     save(
         &output.join(format!("job-{index}-native.json")),
         &accounting,

@@ -1,6 +1,6 @@
 //! Production admission CLI. The native entry handshake gates execution.
 use amc_admission::{
-    ledger::{Backpressure, Phase, Policy, QueueRequest},
+    ledger::Policy,
     native::Systemd,
     protocol::{Message, call},
     server,
@@ -15,7 +15,6 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -244,47 +243,35 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             protected_pool,
             command,
         } => {
-            let wait = timeout.or((!queue).then_some(120));
-            let wait_ms = timeout.unwrap_or(120) * 1000;
-            let request = if queue {
-                Message::EnqueueWaiting {
-                    contract,
-                    request: QueueRequest {
-                        memory_max: max_ram_usage.ok_or_else(|| {
-                            anyhow::anyhow!("queued work requires a memory ceiling")
-                        })?,
-                        runtime_max_sec: runtime_max_sec.ok_or_else(|| {
-                            anyhow::anyhow!("queued work requires an execution deadline")
-                        })?,
-                        wait_ms: wait.map(|seconds| seconds * 1000),
-                    },
-                }
-            } else {
-                match (max_ram_usage, protected_pool) {
-                    (Some(memory_max), true) => Message::EnqueueBounded {
-                        contract,
-                        wait_ms,
-                        memory_max,
-                        runtime_max_sec: runtime_max_sec
-                            .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
-                    },
-                    (Some(memory_max), false) => Message::EnqueueSized {
-                        contract,
-                        wait_ms,
-                        memory_max,
-                    },
-                    (None, _) => Message::Enqueue { contract, wait_ms },
-                }
+            use amc_admission::client::{Exec, ExecRequest, Mode};
+            let mode = match (queue, max_ram_usage, protected_pool) {
+                (true, memory_max, _) => Mode::Queued {
+                    memory_max: memory_max
+                        .ok_or_else(|| anyhow::anyhow!("queued work requires a memory ceiling"))?,
+                    runtime_max_sec: runtime_max_sec.ok_or_else(|| {
+                        anyhow::anyhow!("queued work requires an execution deadline")
+                    })?,
+                },
+                (false, Some(memory_max), true) => Mode::Bounded {
+                    memory_max,
+                    runtime_max_sec: runtime_max_sec
+                        .ok_or_else(|| anyhow::anyhow!("missing bounded runtime"))?,
+                },
+                (false, Some(memory_max), false) => Mode::Sized { memory_max },
+                (false, None, _) => Mode::Plain,
             };
-            run(
-                &socket_path(socket)?,
-                wait.map(Duration::from_secs),
+            let request = ExecRequest {
+                contract,
+                mode,
+                wait: timeout.map(Duration::from_secs),
                 runtime_max_sec,
                 burst,
-                request,
-                &command,
-                ready_token.as_deref(),
-            )
+                ready_token,
+                socket: socket_path(socket)?,
+                helper: std::env::current_exe()?,
+            };
+            let signals = crate::control::Signals::install()?;
+            Exec::new(request, command).run(|| signals.cancelled())
         }
         AdmissionCommand::Enter {
             socket,
@@ -408,257 +395,6 @@ fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn run(
-    socket: &Path,
-    wait: Option<Duration>,
-    runtime_max_sec: Option<u64>,
-    burst: bool,
-    request: Message,
-    argv: &[OsString],
-    ready_token: Option<&str>,
-) -> Result<i32> {
-    use amc_runner::systemd::execute;
-    let signals = crate::control::Signals::install()?;
-    let deadline = wait.map(|wait| Instant::now() + wait);
-    let queued = matches!(request, Message::EnqueueWaiting { .. });
-    let response = match call(socket, request) {
-        Ok(response) => response,
-        Err(error) => {
-            if queued
-                && let Some(token) = ready_token
-                && let Some(backpressure) = error.downcast_ref::<Backpressure>()
-            {
-                // Only explicit nonacceptance permits the intent owner to try
-                // again. Exit, rather than retaining one process per overflow.
-                std::io::stderr().lock().write_all(
-                    format!(
-                        "\x1e{token}:backpressure:{}\x1f",
-                        backpressure.retry_after_ms
-                    )
-                    .as_bytes(),
-                )?;
-                return Ok(75);
-            }
-            return Err(error);
-        }
-    };
-    let host_socket = response.host_socket;
-    if let Some(host_socket) = &host_socket
-        && let Err(error) = crate::native_start::verify_host_runner(host_socket)
-    {
-        if let Some(entry) = &response.entry {
-            let _ = call(
-                socket,
-                Message::Cancel {
-                    id: entry.id.clone(),
-                },
-            );
-        }
-        return Err(error);
-    }
-    let entry_key = response
-        .entry_key
-        .ok_or_else(|| anyhow::anyhow!("missing admission entry capability"))?;
-    let mut entry = response
-        .entry
-        .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
-    let runtime_max_sec = match execution_runtime(&entry.contract, burst, runtime_max_sec) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = call(socket, Message::Cancel { id: entry.id });
-            return Err(error);
-        }
-    };
-    let short_call = burst || entry.contract.protected_pool.is_some();
-    let queued = Instant::now();
-    while entry.phase == Phase::Queued {
-        if signals.cancelled().is_some()
-            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            let _ = call(socket, Message::Cancel { id: entry.id });
-            anyhow::bail!("admission cancelled or timed out before submission");
-        }
-        thread::sleep(amc_admission::host_server::poll_interval(queued));
-        entry = call(
-            socket,
-            Message::Poll {
-                id: entry.id.clone(),
-            },
-        )?
-        .entry
-        .ok_or_else(|| anyhow::anyhow!("missing admission ticket"))?;
-    }
-    ensure!(
-        entry.phase == Phase::Reserved,
-        "ticket has already been submitted"
-    );
-    let mut client = Command::new("systemd-run");
-    client.args([
-        "--user",
-        "--quiet",
-        "--wait",
-        "--pipe",
-        "--same-dir",
-        "--expand-environment=no",
-    ]);
-    client.arg(if entry.queue.is_some() {
-        "--service-type=notify"
-    } else {
-        "--service-type=exec"
-    });
-    if entry.queue.is_some() {
-        client.arg("--property=NotifyAccess=main");
-    }
-    client.arg(format!("--unit={}", entry.unit()));
-    for property in [
-        format!("Slice={}", entry.contract.slice),
-        format!("MemoryMax={}", entry.contract.memory_max),
-        format!("MemorySwapMax={}", entry.contract.memory_swap_max),
-        "MemoryAccounting=yes".into(),
-        "OOMPolicy=kill".into(),
-        "KillMode=control-group".into(),
-        "Restart=no".into(),
-        "TimeoutStartSec=30s".into(),
-        format!("TimeoutStopSec={}s", if short_call { 1 } else { 15 }),
-    ] {
-        client.arg(format!("--property={property}"));
-    }
-    if let Some(seconds) = runtime_max_sec {
-        client.arg(format!("--property=RuntimeMaxSec={seconds}s"));
-        client.arg("--property=RuntimeRandomizedExtraSec=0");
-    }
-    if short_call {
-        client.arg("--property=SendSIGKILL=yes");
-        client.arg("--property=FinalKillSignal=SIGKILL");
-    }
-    if burst {
-        eprintln!(
-            "AMC burst: {} bytes reserved, {}s native runtime ceiling",
-            entry.contract.memory_max,
-            runtime_max_sec.unwrap_or_default()
-        );
-    }
-    for (name, _) in std::env::vars_os() {
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if amc_runner::systemd::valid_environment_name(name)
-            && !name.starts_with("SYSTEMD_")
-            && !name.starts_with("LISTEN_")
-            && !matches!(
-                name,
-                "INVOCATION_ID"
-                    | "MANAGERPID"
-                    | "JOURNAL_STREAM"
-                    | "NOTIFY_SOCKET"
-                    | "WATCHDOG_PID"
-                    | "WATCHDOG_USEC"
-            )
-        {
-            client.arg(format!("--setenv={name}"));
-        }
-    }
-    let record = crate::native_start::wrap(&mut client)?;
-    client
-        .arg(std::env::current_exe()?)
-        .args(["admission", "enter", "--socket"])
-        .arg(socket)
-        .args(["--ticket", &entry.id, "--entry-key", &entry_key]);
-    if entry.queue.is_some() {
-        client.arg("--queue");
-    }
-    if let Some(token) = ready_token {
-        client.arg("--ready-token").arg(token);
-    }
-    if let Some(host_socket) = host_socket {
-        client.arg("--host-socket").arg(host_socket);
-    }
-    client.arg("--").args(argv);
-    // A reservation reply can arrive after the client's wait has expired.
-    // The coordinator's extra entry grace must not authorize a late submission.
-    if signals.cancelled().is_some() || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        let _ = call(
-            socket,
-            Message::Cancel {
-                id: entry.id.clone(),
-            },
-        );
-        anyhow::bail!("admission cancelled or timed out before submission");
-    }
-    // A helper that fails before entry also completes natively. Relay its
-    // stderr so only an observed entry frame authorizes completion proof.
-    let entered = match ready_token {
-        Some(token) => {
-            let (reader, writer) = std::io::pipe()?;
-            client.stderr(writer);
-            Some(relay_entry(
-                reader,
-                format!("\x1e{token}\x1f").into_bytes(),
-            )?)
-        }
-        None => None,
-    };
-    let outcome = execute(
-        &mut client,
-        Path::new("systemctl"),
-        &entry.unit(),
-        false,
-        true,
-        || signals.cancelled(),
-        &record,
-    );
-    // Drop this process's relay writer so the relay sees EOF.
-    client.stderr(std::process::Stdio::inherit());
-    // Cancel only this owned attempt. The server retains an entered workload's
-    // reservation until native termination, including on ambiguous outcomes.
-    let _ = call(
-        socket,
-        Message::Cancel {
-            id: entry.id.clone(),
-        },
-    );
-    // Completion confirmed native cleanup, so the relay reaches EOF promptly.
-    if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token))
-        && entered.is_some_and(|seen| seen.recv_timeout(Duration::from_secs(1)) == Ok(true))
-    {
-        std::io::stderr()
-            .write_all(frame.as_bytes())
-            .context("notify caller of confirmed native completion")?;
-    }
-    outcome_exit(outcome, &entry.unit())
-}
-
-/// Forward `reader` to stderr and report, at EOF, whether `frame` passed through.
-fn relay_entry(
-    mut reader: impl Read + Send + 'static,
-    frame: Vec<u8>,
-) -> Result<std::sync::mpsc::Receiver<bool>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    thread::Builder::new()
-        .name("amc-stderr-relay".into())
-        .spawn(move || {
-            let (mut seen, mut window, mut buffer) = (false, Vec::new(), [0; 4096]);
-            loop {
-                let n = match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                // Keep draining even if the caller closed stderr.
-                let _ = std::io::stderr().write_all(&buffer[..n]);
-                if !seen {
-                    window.extend_from_slice(&buffer[..n]);
-                    seen = window.windows(frame.len()).any(|bytes| bytes == frame);
-                    window.drain(..window.len().saturating_sub(frame.len() - 1));
-                }
-            }
-            let _ = sender.send(seen);
-        })?;
-    Ok(receiver)
-}
-
 fn parse_ready_token(value: &str) -> std::result::Result<String, String> {
     if !(32..=64).contains(&value.len())
         || !value
@@ -697,87 +433,9 @@ pub fn parse_memory(value: &str) -> std::result::Result<u64, String> {
     Ok(bytes)
 }
 
-fn execution_runtime(
-    contract: &amc_admission::ledger::Contract,
-    burst: bool,
-    requested: Option<u64>,
-) -> Result<Option<u64>> {
-    ensure!(
-        contract.burst == burst,
-        "burst flag must match the selected contract"
-    );
-    if let (Some(requested), Some(maximum)) = (requested, contract.runtime_max_sec) {
-        ensure!(requested <= maximum, "requested runtime exceeds contract");
-    }
-    Ok(requested.or(contract.runtime_max_sec))
-}
-
-fn completion_frame(outcome: amc_runner::systemd::Outcome, token: &str) -> Option<String> {
-    match outcome {
-        amc_runner::systemd::Outcome::Completed(code) => {
-            Some(format!("\x1e{token}:complete:{code}\x1f"))
-        }
-        _ => None,
-    }
-}
-
-fn outcome_exit(outcome: amc_runner::systemd::Outcome, unit: &str) -> Result<i32> {
-    use amc_runner::systemd::Outcome;
-    match outcome {
-        Outcome::Completed(code) => Ok(code),
-        Outcome::Unknown { exit_code, .. } => {
-            anyhow::bail!(
-                "native outcome unresolved for {unit} (launcher exit {exit_code}); reservation remains coordinator-owned; inspect admission status before retrying"
-            )
-        }
-        Outcome::Cancelled { signal, .. } => Ok(128 + signal),
-        Outcome::TimedOut { .. } => {
-            anyhow::bail!(
-                "native submission timed out for {}; inspect admission status before retrying",
-                unit
-            )
-        }
-        _ => {
-            anyhow::bail!(
-                "native submission {:?} for {}; inspect admission status before retrying",
-                outcome,
-                unit
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amc_runner::systemd::{Cleanup, Outcome};
-
-    #[test]
-    fn only_a_relayed_entry_frame_authorizes_completion_proof() {
-        let frame = b"\x1e0123456789abcdef0123456789abcdef\x1f".to_vec();
-        for (chunks, expected) in [
-            (
-                vec![
-                    &b"waiting\n\x1e0123456789abcdef"[..],
-                    &b"0123456789abcdef\x1fout"[..],
-                ],
-                true,
-            ),
-            (vec![&b"waiting for host capacity: None\n"[..]], false),
-            (
-                vec![&b"\x1e0123456789abcdef0123456789abcdef:complete:1\x1f"[..]],
-                false,
-            ),
-        ] {
-            let (reader, mut writer) = std::io::pipe().unwrap();
-            let seen = relay_entry(reader, frame.clone()).unwrap();
-            for chunk in chunks {
-                writer.write_all(chunk).unwrap();
-            }
-            drop(writer);
-            assert_eq!(seen.recv_timeout(Duration::from_secs(5)), Ok(expected));
-        }
-    }
 
     #[test]
     fn native_ready_tokens_are_bounded_and_cannot_inject_framing() {
@@ -793,80 +451,10 @@ mod tests {
     }
 
     #[test]
-    fn declared_decimal_memory_is_rounded_down_and_burst_runtime_cannot_grow() {
+    fn declared_decimal_memory_is_rounded_down() {
         assert_eq!(parse_memory("512MiB").unwrap(), 536870912);
         assert_eq!(parse_memory("3GB").unwrap(), 2999996416);
         assert!(parse_memory("-1GB").is_err());
         assert!(parse_memory("1KB").is_err());
-        let contract: amc_admission::ledger::Contract = serde_json::from_value(serde_json::json!({
-            "slice": "agent-burst.slice", "memory_max": 536870912, "memory_swap_max": 0,
-            "max_running": 2, "pause_file": null, "burst": true, "runtime_max_sec": 5
-        }))
-        .unwrap();
-        assert_eq!(execution_runtime(&contract, true, None).unwrap(), Some(5));
-        assert_eq!(
-            execution_runtime(&contract, true, Some(2)).unwrap(),
-            Some(2)
-        );
-        assert!(execution_runtime(&contract, true, Some(6)).is_err());
-        assert!(execution_runtime(&contract, false, None).is_err());
-    }
-
-    #[test]
-    fn unresolved_native_outcome_never_reports_success() {
-        for cleanup in [Cleanup::Unknown, Cleanup::Stopped] {
-            assert!(
-                outcome_exit(
-                    Outcome::Unknown {
-                        exit_code: 0,
-                        cleanup
-                    },
-                    "fixture.service"
-                )
-                .is_err()
-            );
-        }
-        assert_eq!(
-            outcome_exit(Outcome::Completed(0), "fixture.service").unwrap(),
-            0
-        );
-        assert_eq!(
-            outcome_exit(Outcome::Completed(42), "fixture.service").unwrap(),
-            42
-        );
-    }
-
-    #[test]
-    fn only_confirmed_workload_results_emit_token_bound_completion_proof() {
-        let token = "0123456789abcdef0123456789abcdef";
-        for code in [0, 1, 42, 75, 255] {
-            assert_eq!(
-                completion_frame(Outcome::Completed(code), token),
-                Some(format!("\x1e{token}:complete:{code}\x1f"))
-            );
-        }
-        for cleanup in [Cleanup::Unknown, Cleanup::Running, Cleanup::Stopped] {
-            for outcome in [
-                Outcome::Unknown {
-                    exit_code: 0,
-                    cleanup,
-                },
-                Outcome::Unknown {
-                    exit_code: 1,
-                    cleanup,
-                },
-                Outcome::TimedOut {
-                    started: true,
-                    cleanup,
-                },
-                Outcome::Cancelled {
-                    signal: 15,
-                    started: true,
-                    cleanup,
-                },
-            ] {
-                assert_eq!(completion_frame(outcome, token), None);
-            }
-        }
     }
 }
