@@ -65,14 +65,23 @@
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
-      *RuntimeMaxUSec*)
-        if test "$EUID" -eq 0 && test -e /run/amc-host/amc-burst-observation-slow; then
-          ${pkgs.coreutils}/bin/touch /run/amc-host/amc-burst-observation-entered
+    esac
+    exec ${pkgs.systemd}/bin/systemctl "$@"
+  '';
+  # The host broker reads native deadlines over the owner's bus through its
+  # pinned runtime descriptor. That child already runs as the bus owner, so it
+  # appends to an entry marker the test pre-creates world-writable.
+  busObserver = pkgs.writeShellScriptBin "busctl" ''
+    set -eu
+    case "$*" in
+      *--address=unix:path=/proc/self/fd/0/bus*RuntimeMaxUSec*)
+        if test -e /run/amc-host/amc-burst-observation-slow; then
+          printf entered >> /run/amc-host/amc-burst-observation-entered
           ${pkgs.coreutils}/bin/sleep 1.5
         fi
         ;;
     esac
-    exec ${pkgs.systemd}/bin/systemctl "$@"
+    exec ${pkgs.systemd}/bin/busctl "$@"
   '';
   guardLifetime =
     pkgs.runCommand "amc-guard-lifetime-proof" {
@@ -214,7 +223,7 @@ in
         # and all hardening and lifecycle settings from the production module.
         systemd.services.amc-host-admission.serviceConfig.ExecStart =
           lib.mkForce "${nativeEngine} admission host-serve --policy /etc/amc-test-host-policy.json";
-        systemd.services.amc-host-admission.path = lib.mkBefore [observer pkgs.python3 pkgs.systemd pkgs.util-linux];
+        systemd.services.amc-host-admission.path = lib.mkBefore [observer busObserver pkgs.python3 pkgs.systemd pkgs.util-linux];
         systemd.user.services.amc-admission = {
           wantedBy = ["default.target"];
           requires = ["agent-tools.slice" "agent-burst.slice"];

@@ -501,13 +501,14 @@ with test_section(
     assert state["committed_bytes"] > state["budget_bytes"]
     assert state["burst_committed_bytes"] == 32 * 1048576
     assert grant["runtime_max_ms"] == 5000 and grant["swap_bytes"] == 0
+    machine.succeed("install -m 0666 /dev/null /run/amc-host/amc-burst-observation-entered")
     machine.succeed("touch /run/amc-host/amc-burst-observation-slow")
     machine.wait_until_succeeds(
-        "test -e /run/amc-host/amc-burst-observation-entered", timeout=10
+        "test -s /run/amc-host/amc-burst-observation-entered", timeout=10
     )
     responsive = json.loads(machine.succeed("python3 - <<'PY'\nimport json, subprocess, time\nstart = time.monotonic()\nfor _ in range(3):\n    result = subprocess.run(['amc', 'admission', 'host-status'], check=True, capture_output=True, text=True, timeout=1)\n    status = json.loads(result.stdout)\n    assert status['version'] == 1 and status['error'] is None, status\n    assert status['budget_bytes'] == 160 * 1048576 and isinstance(status['reservations'], list), status\nprint(json.dumps({'responses': 3, 'elapsedSeconds': time.monotonic() - start}))\nPY"))
     assert responsive["elapsedSeconds"] < 1, responsive
-    machine.succeed("rm /run/amc-host/amc-burst-observation-slow")
+    machine.succeed("rm /run/amc-host/amc-burst-observation-slow /run/amc-host/amc-burst-observation-entered")
     evidence["burstManagerResponsiveness"] = responsive
     machine.succeed("systemctl restart amc-host-admission")
     machine.wait_until_succeeds("test -S /run/amc-host/admission.sock")
