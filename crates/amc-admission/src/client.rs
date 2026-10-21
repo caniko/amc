@@ -417,6 +417,9 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         stderr,
     } = exec;
     request.validate()?;
+    // Resolve the launcher before enqueueing and before any caller environment
+    // change, so a missing launcher never leaves a reservation behind.
+    let launcher = amc_runner::systemd::inspect::resolve_executable("systemd-run")?;
     let socket = request.socket.as_path();
     let ready_token = request.ready_token.as_deref();
     let burst = request.burst;
@@ -491,7 +494,7 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         entry.phase == Phase::Reserved,
         "ticket has already been submitted"
     );
-    let mut client = Command::new("systemd-run");
+    let mut client = Command::new(&launcher);
     client.args([
         "--user",
         "--quiet",
@@ -537,12 +540,12 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
             runtime_max_sec.unwrap_or_default()
         );
     }
-    // systemd-run reads each forwarded value from its own environment.
+    // systemd-run reads each forwarded value from its own environment. Removals
+    // apply only to the unit (UnsetEnvironment), never to the launcher.
     for (name, value) in &env {
-        match value {
-            Some(value) => client.env(name, value),
-            None => client.env_remove(name),
-        };
+        if let Some(value) = value {
+            client.env(name, value);
+        }
     }
     for name in forwarded_environment(&env) {
         client.arg(format!("--setenv={name}"));
@@ -593,10 +596,13 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         Some(token) => {
             let (reader, writer) = std::io::pipe()?;
             client.stderr(writer);
-            Some(relay_entry(
+            let stop = Arc::new(AtomicBool::new(false));
+            let (seen, relay) = relay_entry(
                 reader,
                 format!("\x1e{token}\x1f").into_bytes(),
-            )?)
+                stop.clone(),
+            )?;
+            Some((seen, relay, stop))
         }
         None => {
             if let Some(stderr) = stderr {
@@ -629,8 +635,16 @@ fn run(exec: Exec, cancelled: impl Fn() -> Option<i32>) -> Result<Exit> {
         },
     );
     // Completion confirmed native cleanup, so the relay reaches EOF promptly.
+    // Other outcomes may leave a workload holding the pipe: stop the relay.
+    let entered = entered.is_some_and(|(seen, relay, stop)| {
+        let entered = matches!(outcome, Outcome::Completed(_))
+            && seen.recv_timeout(Duration::from_secs(1)) == Ok(true);
+        stop.store(true, Ordering::SeqCst);
+        let _ = relay.join();
+        entered
+    });
     if let Some(frame) = ready_token.and_then(|token| completion_frame(outcome, token))
-        && entered.is_some_and(|seen| seen.recv_timeout(Duration::from_secs(1)) == Ok(true))
+        && entered
     {
         std::io::stderr()
             .write_all(frame.as_bytes())
@@ -726,17 +740,26 @@ pub fn wrap(client: &mut Command, helper: &Path) -> Result<ClientRecord> {
     Ok(ClientRecord::with_startup(barrier))
 }
 
-/// Forward `reader` to stderr and report, at EOF, whether `frame` passed through.
+/// Forward `reader` to stderr and report, at EOF or `stop`, whether `frame`
+/// passed through.
 fn relay_entry(
-    mut reader: impl Read + Send + 'static,
+    mut reader: PipeReader,
     frame: Vec<u8>,
-) -> Result<std::sync::mpsc::Receiver<bool>> {
+    stop: Arc<AtomicBool>,
+) -> Result<(std::sync::mpsc::Receiver<bool>, thread::JoinHandle<()>)> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     let (sender, receiver) = std::sync::mpsc::channel();
-    thread::Builder::new()
+    let relay = thread::Builder::new()
         .name("amc-stderr-relay".into())
         .spawn(move || {
             let (mut seen, mut window, mut buffer) = (false, Vec::new(), [0; 4096]);
-            loop {
+            while !stop.load(Ordering::SeqCst) {
+                let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+                match poll(&mut fds, PollTimeout::from(100u8)) {
+                    Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
                 let n = match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => n,
@@ -753,7 +776,7 @@ fn relay_entry(
             }
             let _ = sender.send(seen);
         })?;
-    Ok(receiver)
+    Ok((receiver, relay))
 }
 
 fn execution_runtime(
@@ -935,6 +958,22 @@ mod tests {
     }
 
     #[test]
+    fn relays_stop_even_while_a_writer_stays_open() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let frame = b"\x1e0123456789abcdef0123456789abcdef\x1f".to_vec();
+        let (seen, relay) = relay_entry(reader, frame.clone(), stop.clone()).unwrap();
+        writer.write_all(&frame).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        relay.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(seen.recv_timeout(Duration::from_secs(1)), Ok(true));
+        drop(writer);
+    }
+
+    #[test]
     fn collectors_stop_even_while_a_writer_stays_open() {
         let (reader, mut writer) = std::io::pipe().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -966,12 +1005,14 @@ mod tests {
             ),
         ] {
             let (reader, mut writer) = std::io::pipe().unwrap();
-            let seen = relay_entry(reader, frame.clone()).unwrap();
+            let (seen, relay) =
+                relay_entry(reader, frame.clone(), Arc::new(AtomicBool::new(false))).unwrap();
             for chunk in chunks {
                 writer.write_all(chunk).unwrap();
             }
             drop(writer);
             assert_eq!(seen.recv_timeout(Duration::from_secs(5)), Ok(expected));
+            relay.join().unwrap();
         }
     }
 
