@@ -128,7 +128,7 @@ fn discover_one(manager: &Manager, domain: &Domain, policy: &Policy, known: &Mut
                     || i.pid.to_string() != native::field(shown, "MainPID")
             })
         });
-        if native::field(shown, "ActiveState") == "active" && changed {
+        if native::attachable(shown, domain) && changed {
             manager.attach(domain.clone(), policy).ok()
         } else {
             None
