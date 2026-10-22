@@ -1,6 +1,13 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-22
 
 ### Added
 
@@ -27,6 +34,11 @@
   independent of the queue wait timeout.
 - Standalone systemd units, a small admission policy and an operational
   workstation guide covering useful work, upgrade, disable and removal.
+- Rust libraries for direct admission: `amc_admission::client` (`ExecRequest`,
+  `Exec::{run, run_exit, output}`, `Io`, `Exit`, `validate_ready_token`)
+  admits, runs and supervises native work in-process, and
+  `amc_runner::systemd::inspect` exposes unit inspection. `amc-telemetry`,
+  `amc-runner` and `amc-admission` publish to crates.io in dependency order.
 
 ### Changed
 
@@ -167,3 +179,5 @@
   capture reports; safely render JSON-escaped lone Unicode surrogates.
 - Keep the executable wrapper out of marker-only Nix check outputs and handle
   unavailable host cgroup trees explicitly in sandboxed runner tests.
+
+[Unreleased]: https://github.com/caniko/amc/compare/0.1.0...HEAD
