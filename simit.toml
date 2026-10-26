@@ -30,6 +30,9 @@ cores = 4
 kvm = true
 capture_results = true
 artifact_retention_days = 30
+# Fork pull requests receive no repository variables; grouped jobs fall back to
+# this committed engine, the same revision SIMIT_CI_ENGINE_REVISION enrolls.
+engine_revision = "8a132e416caf9cc58a753005b804343181477200"
 # Each VM gate builds its own patched kernel for about two hours. Reuse them
 # across runs by exact derivation; the VM gates themselves always execute.
 cache_installables = [
@@ -39,7 +42,7 @@ cache_installables = [
 extra_setup = [
   "python3 -c 'from pathlib import Path; p = Path.home() / \".config/nix/nix.conf\"; p.parent.mkdir(parents=True, exist_ok=True); p.open(\"a\").write(\"\\nlog-lines = 1000\\n\")'",
   "python3 -B nix/test-hosted-ci.py",
-  "nix run --max-jobs 1 --cores 2 github:caniko/simit/8a132e416caf9cc58a753005b804343181477200 -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
+  "nix run --max-jobs 1 --cores 2 github:caniko/simit/1691a26f5e5d70a0763dd5d60c9fd638cd321d5e -- init ci --platform github --ci-provider actions --runtime nix --check --diff",
 ]
 post_build = ["python3 nix/hosted-ci.py"]
 post_build_always = ["python3 -B nix/retain-diagnostics.py"]
