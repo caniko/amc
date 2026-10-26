@@ -59,10 +59,31 @@ jobs:
           git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
           git config --global --add url.https://github.com/.insteadOf git@github.com:
 
+      - name: Restore grouped-build engine
+        id: simit-engine-cache
+        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '8a132e416caf9cc58a753005b804343181477200') != '' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-engine-cache
+          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '8a132e416caf9cc58a753005b804343181477200') }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Import grouped-build engine
+        if: ${{ steps.simit-engine-cache.outputs.cache-hit == 'true' }}
+        shell: bash
+        env:
+          BASH_ENV: ''
+          ENV: ''
+          NIX_CONFIG: 'experimental-features = nix-command flakes'
+          NIX_USER_CONF_FILES: /dev/null
+          NIX_PATH: ''
+        run: |
+          set -euo pipefail
+          cache_root="$RUNNER_TEMP/simit-engine-cache"
+          env -u GH_TOKEN -u GITHUB_TOKEN -u GITHUB_OAUTH_TOKEN -u ATTIC_TOKEN -u CACHIX_AUTH_TOKEN -u CACHIX_SIGNING_KEY nix copy --no-check-sigs --all --from "file://$cache_root" || echo '::warning::Cached grouped-build engine failed to import; building it normally'
+          rm -rf "$cache_root"
       - name: Provision grouped-build Rust engine
         shell: bash
         env:
-          SIMIT_CI_ENGINE_REVISION: ${{ vars.SIMIT_CI_ENGINE_REVISION }}
+          SIMIT_CI_ENGINE_REVISION: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '8a132e416caf9cc58a753005b804343181477200') }}
           BASH_ENV: ''
           ENV: ''
           NIX_CONFIG: 'experimental-features = nix-command flakes'
@@ -82,6 +103,31 @@ jobs:
           engine_digest=$(nix hash file --type sha256 --base16 "$engine_path/bin/simit")
           printf '%s  %s\n' "$engine_digest" "$engine_path/bin/simit" > "$SIMIT_NIX_BUILD_RESULTS/engine-executable.sha256"
           printf '%s\n' "SIMIT_CI_ENGINE=$engine_path/bin/simit" >> "$GITHUB_ENV"
+      - name: Export grouped-build engine
+        id: simit-engine-cache-save
+        if: ${{ (vars.SIMIT_CI_ENGINE_REVISION || '8a132e416caf9cc58a753005b804343181477200') != '' && steps.simit-engine-cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        env:
+          BASH_ENV: ''
+          ENV: ''
+          NIX_CONFIG: 'experimental-features = nix-command flakes'
+          NIX_USER_CONF_FILES: /dev/null
+          NIX_PATH: ''
+        run: |
+          set -euo pipefail
+          cache_root="$RUNNER_TEMP/simit-engine-cache"
+          rm -rf "$cache_root"
+          if nix copy --to "file://$cache_root?compression=zstd" "${SIMIT_CI_ENGINE%/bin/simit}"; then
+            printf 'save=true\n' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::Grouped-build engine failed to export; not saving it'
+          fi
+      - name: Save grouped-build engine
+        if: ${{ steps.simit-engine-cache-save.outputs.save == 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/simit-engine-cache
+          key: simit-engine-v1-${{ (vars.SIMIT_CI_ENGINE_REVISION || '8a132e416caf9cc58a753005b804343181477200') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Enable hosted KVM
         run: |
           test "${RUNNER_ENVIRONMENT:-}" = github-hosted
@@ -95,7 +141,7 @@ jobs:
         run: python3 -B nix/test-hosted-ci.py
 
       - name: Project setup 3
-        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/8a132e416caf9cc58a753005b804343181477200 -- init ci --platform github --ci-provider actions --runtime nix --check --diff
+        run: nix run --max-jobs 1 --cores 2 github:caniko/simit/1691a26f5e5d70a0763dd5d60c9fd638cd321d5e -- init ci --platform github --ci-provider actions --runtime nix --check --diff
 
       - name: Resolve cached Nix inputs
         id: simit-nix-cache
