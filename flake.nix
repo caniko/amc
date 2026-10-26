@@ -64,6 +64,10 @@
             RUSTDOCFLAGS="-D warnings" cargo doc -p amc-runner --no-deps --locked "''${flags[@]}"
           done
         '';
+        consumer-wrappers = import ./nix/consumer-wrappers-test.nix {
+          inherit pkgs;
+          inherit (self.lib) mkToolShell mkServiceWrap;
+        };
         fixture-scripts =
           pkgs.runCommand "amc-fixture-scripts" {
             nativeBuildInputs = [pkgs.python3 pkgs.bash];
@@ -115,6 +119,9 @@
     nixosModules.supervision = import ./nix/supervision-module.nix;
     lib.supervisionPolicyVersion = 1;
     homeManagerModules.default = import ./nix/home-module.nix;
+    # Consumer launch shims: `inputs.amc.lib.mkToolShell pkgs { slice = ...; }`.
+    lib.mkToolShell = pkgs: pkgs.callPackage ./nix/tool-shell.nix;
+    lib.mkServiceWrap = pkgs: pkgs.callPackage ./nix/service-wrap.nix;
 
     # Deliberately excluded from checks: run explicitly with
     # nix build .#nixosTests.x86_64-linux.generic

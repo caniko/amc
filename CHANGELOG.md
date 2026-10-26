@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Nix consumer shims: `lib.mkToolShell` starts each agent tool command
+  (`<shell> -c ...`) in a contained transient service, and `lib.mkServiceWrap`
+  admits a program (optionally one subcommand) through a named contract.
+
 ## [0.1.0] - 2026-10-22
 
 ### Added
