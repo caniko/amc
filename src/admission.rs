@@ -332,15 +332,16 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                             .as_ref()
                             .is_some_and(|signals| signals.cancelled().is_some())
                     },
-                    || {
+                    |reply| {
                         if queue
                             && extension.is_none_or(|last: Instant| {
                                 last.elapsed() >= Duration::from_secs(5)
                             })
                         {
-                            crate::native_start::notify(
-                                "EXTEND_TIMEOUT_USEC=30000000\nSTATUS=Waiting for host capacity",
-                            )?;
+                            crate::native_start::notify(&format!(
+                                "EXTEND_TIMEOUT_USEC=30000000\nSTATUS={}",
+                                wait_status(reply)
+                            ))?;
                             extension = Some(Instant::now());
                         }
                         Ok(())
@@ -381,6 +382,33 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                 .with_context(|| format!("execute admitted workload {:?}", command[0]))
         }
     }
+}
+
+/// Why a queued reservation waits, for the unit's systemd STATUS.
+fn wait_status(reply: &amc_admission::host_server::Response) -> String {
+    let mut status = "Waiting for host capacity".to_owned();
+    let Some(reason) = reply.waiting else {
+        return status;
+    };
+    status += &format!(": {reason:?}");
+    if let (Some(free), Some(reserve), Some(committed)) = (
+        reply.swap_free_bytes,
+        reply.swap_reserve_bytes,
+        reply.swap_committed_bytes,
+    ) {
+        let gib = |bytes: u64| match bytes {
+            0 => "0".to_owned(),
+            b if b % (1 << 30) == 0 => format!("{} GiB", b >> 30),
+            b => format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64),
+        };
+        status += &format!(
+            " (swap free {}, reserve {}, committed {})",
+            gib(free),
+            gib(reserve),
+            gib(committed)
+        );
+    }
+    status
 }
 
 fn host_policy(path: &Path) -> Result<amc_admission::host::HostPolicy> {
@@ -450,5 +478,22 @@ mod tests {
         assert_eq!(parse_memory("3GB").unwrap(), 2999996416);
         assert!(parse_memory("-1GB").is_err());
         assert!(parse_memory("1KB").is_err());
+    }
+
+    #[test]
+    fn wait_status_names_the_reason_and_swap_numbers() {
+        use amc_admission::{host::WaitReason, host_server::Response};
+        let mut reply = Response::default();
+        assert_eq!(wait_status(&reply), "Waiting for host capacity");
+        reply.waiting = Some(WaitReason::Budget);
+        assert_eq!(wait_status(&reply), "Waiting for host capacity: Budget");
+        reply.waiting = Some(WaitReason::SwapHeadroom);
+        reply.swap_free_bytes = Some(2_501_000_000);
+        reply.swap_reserve_bytes = Some(2 << 30);
+        reply.swap_committed_bytes = Some(0);
+        assert_eq!(
+            wait_status(&reply),
+            "Waiting for host capacity: SwapHeadroom (swap free 2.33 GiB, reserve 2 GiB, committed 0)"
+        );
     }
 }
