@@ -58,8 +58,19 @@ in
     inherit contract;
     runtimeMaxSec = 86401;
   })).success;
-  assert disabled.build-cgroup-parent == "";
-  assert !(disabled ? build-cgroup-available-min);
+  # Pin each ceiling to its own key: a swapped key must fail, not just a missing one.
+  assert disabled
+  == {
+    experimental-features = ["cgroups"];
+    use-cgroups = true;
+    build-cgroup-memory-high = 0;
+    build-cgroup-memory-max = 17179869184;
+    build-cgroup-swap-max = 2147483648;
+    build-cgroup-cpu-cores = 0;
+    daemon-cgroup-memory-min = 536870912;
+    daemon-cgroup-memory-max = 4294967296;
+    build-cgroup-parent = "";
+  };
   assert enabled.build-cgroup-parent == builder.admission.parent;
   assert enabled.build-cgroup-available-min == 25769803776;
   assert enabled.build-cgroup-wait-seconds == 300;
