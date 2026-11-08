@@ -110,6 +110,13 @@ pub struct Response {
     pub granted: bool,
     pub ticket: Option<String>,
     pub waiting: Option<WaitReason>,
+    /// Filled only while waiting on `SwapHeadroom`, so the caller can say why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_reserve_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_committed_bytes: Option<u64>,
     pub committed_bytes: u64,
     #[serde(default)]
     pub budget_bytes: u64,
@@ -226,7 +233,7 @@ pub fn acquire(
     socket: &Path,
     wait: Option<Duration>,
     stopping: impl Fn() -> bool,
-    mut waiting: impl FnMut() -> Result<()>,
+    mut waiting: impl FnMut(&Response) -> Result<()>,
 ) -> Result<Option<crate::continuation::ContinuationCapability>> {
     let began = Instant::now();
     let deadline = wait.map(|wait| Instant::now() + wait);
@@ -236,7 +243,6 @@ pub fn acquire(
             !stopping() && deadline.is_none_or(|deadline| Instant::now() < deadline),
             "host admission cancelled or timed out"
         );
-        waiting()?;
         let left = deadline.map(|deadline| {
             (deadline
                 .saturating_duration_since(Instant::now())
@@ -268,6 +274,7 @@ pub fn acquire(
         if reply.granted {
             return Ok(reply.continuation);
         }
+        waiting(&reply)?;
         if !explained {
             eprintln!("waiting for host capacity: {:?}", reply.waiting);
             explained = true;
@@ -389,6 +396,7 @@ pub fn serve_supervised(
     let mut due = false;
     let mut healthy_since = BTreeMap::new();
     let mut waiting = BTreeMap::new();
+    let mut swap_free = None;
     let mut inventory: Option<PendingInventory> = None;
     let mut burst_manager = crate::burst_manager::Cache::default();
     // Separate bounded queues/workers: bulk/burst probes cannot consume the
@@ -418,6 +426,7 @@ pub fn serve_supervised(
             reconcile_recovery(&mut ledger, &recovery_manager);
             reconcile_preparation_helpers(&mut ledger, &policy);
             let capacity = observe(&mut ledger, &policy, health_file, &burst_evidence);
+            swap_free = capacity.map(|c| c.swap_free_bytes);
             waiting = ledger.advance_with_burst_runtime(
                 crate::clock::boot_ms()?,
                 &policy,
@@ -777,6 +786,11 @@ pub fn serve_supervised(
                                 .ok_or_else(|| anyhow::anyhow!("missing host reservation"))?;
                             reply.granted = r.granted;
                             reply.waiting = waiting.get(&id).copied();
+                            if reply.waiting == Some(WaitReason::SwapHeadroom) {
+                                reply.swap_free_bytes = swap_free;
+                                reply.swap_reserve_bytes = Some(policy.swap_reserve_bytes);
+                                reply.swap_committed_bytes = Some(ledger.swap_committed());
+                            }
                             reply.ticket = Some(id);
                             if r.granted {
                                 reply.continuation = ledger.continuation_capability(

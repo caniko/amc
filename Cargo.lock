@@ -37,6 +37,7 @@ dependencies = [
  "amc-telemetry",
  "anyhow",
  "nix",
+ "serde",
  "serde_json",
  "sysinfo",
  "tokio",

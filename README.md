@@ -60,6 +60,11 @@ visible. See [telemetry](docs/telemetry.md) for interpretation and
 OpenCode, the discovered shared backend is `opencode.service`; wrapping an
 activation client does not configure that backend. See
 [native integration](docs/rfc-v0.4/nixos-opencode.md).
+Their *tool commands* can still be contained per call: the flake's
+`lib.mkToolShell pkgs { slice; memoryMaxBytes; memorySwapMaxBytes; }` builds a
+shell for the agent's shell setting that runs each `-c` command through
+`amc exec` (or `amc admission exec` with `admission = true`), and
+`lib.mkServiceWrap` admits a launched backend such as `codex app-server`.
 
 ## Diagnostics
 

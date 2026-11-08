@@ -392,12 +392,14 @@ def prove_path(path):
         (ROOT / "original" / "cgroup.freeze").write_text("1")
         wait(lambda: "frozen 1" in (ROOT / "original" / "cgroup.events").read_text().splitlines())
         (ROOT / "backed" / "cgroup.freeze").write_text("1")
-        try:
-            (ROOT / "original" / "memory.reclaim").write_text(f"{8 * MIB} swappiness=max")
-        except OSError as error:
-            if error.errno != errno.EAGAIN:
-                raise
         def nonresident():
+            # Swap writeback completes asynchronously, so one reclaim pass can
+            # leave pages in the swap cache. Reclaim again until none remain.
+            try:
+                (ROOT / "original" / "memory.reclaim").write_text(f"{8 * MIB} swappiness=max")
+            except OSError as error:
+                if error.errno != errno.EAGAIN:
+                    raise
             stat = dict(line.split() for line in (ROOT / "original" / "memory.stat").read_text().splitlines())
             return int((ROOT / "original" / "memory.swap.current").read_text()) >= 4 * MIB and int(stat["swapcached"]) == 0
         wait(nonresident)

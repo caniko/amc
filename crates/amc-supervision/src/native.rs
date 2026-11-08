@@ -128,10 +128,7 @@ impl Manager {
 
     pub fn attach(&self, domain: Domain, policy: &Policy) -> Result<Session> {
         let shown = self.show(&domain)?;
-        ensure!(
-            field(&shown, "LoadState") == "loaded" && field(&shown, "ActiveState") == "active",
-            "domain not active"
-        );
+        ensure!(attachable(&shown, &domain), "domain not active");
         if domain.lifecycle != Lifecycle::Observe && policy.mode == Mode::Enforce {
             ensure!(
                 field(&shown, "Restart") == "no"
@@ -198,6 +195,19 @@ impl Manager {
         session.verify_manager(self, policy.mode == Mode::Enforce)?;
         Ok(session)
     }
+}
+
+/// Whether supervision may attach to a domain's current native unit. A queued
+/// admitted helper stays `activating` (Type=notify) while it waits for host
+/// capacity; its ledger identity already pins the invocation that attach then
+/// verifies. Without that identity, a unit must be active.
+pub fn attachable(shown: &BTreeMap<String, String>, domain: &Domain) -> bool {
+    field(shown, "LoadState") == "loaded"
+        && match field(shown, "ActiveState") {
+            "active" => true,
+            "activating" => domain.expected.is_some(),
+            _ => false,
+        }
 }
 
 pub fn field<'a>(map: &'a BTreeMap<String, String>, key: &str) -> &'a str {
@@ -744,6 +754,42 @@ pub fn job_domains(policy: &Policy, boot: &str) -> Result<Vec<Domain>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn admitted_helpers_attach_while_awaiting_native_readiness() {
+        let shown = |load: &str, active: &str| {
+            BTreeMap::from([
+                ("LoadState".to_owned(), load.to_owned()),
+                ("ActiveState".to_owned(), active.to_owned()),
+            ])
+        };
+        let mut domain = Domain {
+            id: "backend".into(),
+            uid: None,
+            unit: "backend.service".into(),
+            lifecycle: Lifecycle::Restart,
+            memory_max: 1024,
+            memory_swap_max: 0,
+            priority: 0,
+            expected: None,
+        };
+        // A configured backend is still unsupervised until it is active.
+        assert!(attachable(&shown("loaded", "active"), &domain));
+        assert!(!attachable(&shown("loaded", "activating"), &domain));
+        // A queued Type=notify helper waits for host capacity while activating;
+        // its pinned ledger identity is checked by attach before supervision.
+        domain.expected = Some(amc_admission::ledger::Identity {
+            invocation: "a".repeat(32),
+            cgroup: "/work/job".into(),
+            inode: 1,
+        });
+        assert!(attachable(&shown("loaded", "activating"), &domain));
+        assert!(attachable(&shown("loaded", "active"), &domain));
+        for state in ["deactivating", "failed", "inactive", "reloading", ""] {
+            assert!(!attachable(&shown("loaded", state), &domain), "{state}");
+        }
+        assert!(!attachable(&shown("not-found", "activating"), &domain));
+    }
 
     #[test]
     fn queued_native_helpers_remain_visible_to_supervision_before_payload_entry() {

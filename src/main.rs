@@ -8,7 +8,6 @@ mod preparation;
 mod supervision;
 mod swap_recovery;
 mod systemd;
-mod telemetry;
 mod watch;
 
 use std::{path::PathBuf, thread, time::Duration};

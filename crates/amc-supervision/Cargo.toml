@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Bounded native-domain memory supervision and sequential forecasting"
+publish = false
 
 [dependencies]
 amc-admission = { path = "../amc-admission" }

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Durable per-user admission for native systemd workloads"
+repository = "https://github.com/caniko/amc"
 
 [dependencies]
-amc-runner = { path = "../amc-runner", default-features = false, features = ["systemd"] }
+amc-runner = { version = "0.1.0", path = "../amc-runner", default-features = false, features = ["systemd"] }
 anyhow = "1"
 nix = { version = "0.30", features = ["socket", "user", "fs", "time", "poll", "feature"] }
 serde = { version = "1", features = ["derive"] }

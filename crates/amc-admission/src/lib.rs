@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod burst_manager;
+pub mod client;
 pub mod clock;
 pub mod continuation;
 pub mod health;

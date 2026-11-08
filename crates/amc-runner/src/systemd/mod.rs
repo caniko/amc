@@ -7,6 +7,7 @@
 //! Detached acknowledgment is not workload termination.
 
 mod control;
+pub mod inspect;
 mod managed;
 mod session_bus;
 mod startup;
