@@ -314,6 +314,10 @@ class NativeEvidenceTests(unittest.TestCase):
                 with self.assertRaises((AssertionError, KeyError)):
                     exec(probe, {})
 
+    def test_allowed_installables_match_the_hosted_build_list(self):
+        policy = hosted.tomllib.loads((hosted.ROOT / "simit.toml").read_text())
+        self.assertEqual(hosted.ALLOWED, set(policy["ci"]["nix_builds"]))
+
     def test_protected_pool_matrix_requires_every_native_case_and_rejects_failures(self):
         installable = ".#nixosTests.x86_64-linux.protected-pool"
         self.assertIn(installable, hosted.ALLOWED)

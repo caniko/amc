@@ -17,6 +17,7 @@ ALLOWED = {
     ".#packages.x86_64-linux.default",
     ".#checks.x86_64-linux.test",
     ".#checks.x86_64-linux.clippy",
+    ".#checks.x86_64-linux.execution-policy",
     ".#nixosTests.x86_64-linux.protected-pool",
     ".#nixosTests.x86_64-linux.shared-admission",
     ".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",
