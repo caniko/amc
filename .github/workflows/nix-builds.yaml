@@ -30,7 +30,7 @@ jobs:
           - group: "atlas-kernel"
             installables: '[".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"]'
           - group: "rust"
-            installables: '[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy"]'
+            installables: '[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy"]'
           - group: "shared-admission"
             installables: '[".#nixosTests.x86_64-linux.shared-admission"]'
           - group: "vm"
@@ -182,7 +182,7 @@ jobs:
           cache_root="$RUNNER_TEMP/simit-nix-cache"
           case "$SIMIT_NIX_GROUP" in
             atlas-kernel) members=(.#nixosTests.x86_64-linux.shared-admission-atlas-kernel) ;;
-            rust) members=(.#packages.x86_64-linux.default .#checks.x86_64-linux.test .#checks.x86_64-linux.clippy) ;;
+            rust) members=(.#packages.x86_64-linux.default .#checks.x86_64-linux.test .#checks.x86_64-linux.clippy .#checks.x86_64-linux.execution-policy) ;;
             shared-admission) members=(.#nixosTests.x86_64-linux.shared-admission) ;;
             vm) members=(.#nixosTests.x86_64-linux.protected-pool .#nixosTests.x86_64-linux.supervision) ;;
             *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
@@ -215,16 +215,16 @@ jobs:
         run: |
           case "$SIMIT_NIX_GROUP" in
             atlas-kernel)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission-atlas-kernel"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             rust)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             shared-admission)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.shared-admission"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             vm)
-              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.supervision"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
+              (umask 077; set -C; printf '%s' '{"schema":"simit.nix-group-spec.v1","members":[".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.supervision"],"plan":[".#packages.x86_64-linux.default",".#checks.x86_64-linux.test",".#checks.x86_64-linux.clippy",".#checks.x86_64-linux.execution-policy",".#nixosTests.x86_64-linux.protected-pool",".#nixosTests.x86_64-linux.shared-admission",".#nixosTests.x86_64-linux.shared-admission-atlas-kernel",".#nixosTests.x86_64-linux.supervision"],"check_systems":[],"limits":["--max-jobs","1","--cores","4"],"post_build":["python3 nix/hosted-ci.py"],"post_build_always":["python3 -B nix/retain-diagnostics.py"],"fresh_installables":[]}' > "$SIMIT_NIX_BUILD_RESULTS/group-spec.json")
               ;;
             *) echo 'Unknown Nix execution group' >&2; exit 1 ;;
           esac
@@ -322,6 +322,18 @@ jobs:
               fi
               export INSTALLABLE=.#checks.x86_64-linux.clippy
               export SIMIT_NIX_BUILD_RESULTS="$group_root/2"
+              mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
+              if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
+                (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
+                status=0
+                SIMIT_NIX_HOOK_FILE="$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script" bash -e -o pipefail -c 'IFS= read -r -d '\'''\'' SIMIT_NIX_HOOK_SCRIPT < "$SIMIT_NIX_HOOK_FILE" || :
+          eval -- "$SIMIT_NIX_HOOK_SCRIPT"' || status=$?
+                printf '%s\n' "$status" > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.status"
+                if [ "$status" -ne 0 ]; then collector_failed=1; fi
+                printf 'completed\n' > "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete"
+              fi
+              export INSTALLABLE=.#checks.x86_64-linux.execution-policy
+              export SIMIT_NIX_BUILD_RESULTS="$group_root/3"
               mkdir -p "$SIMIT_NIX_BUILD_RESULTS"
               if [ ! -e "$SIMIT_NIX_BUILD_RESULTS/diagnostics-complete" ]; then
                 (umask 077; set -C; printf '%s' 'python3 -B nix/retain-diagnostics.py' > "$SIMIT_NIX_BUILD_RESULTS/fallback-diagnostic-0.script")
