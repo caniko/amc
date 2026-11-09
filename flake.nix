@@ -76,6 +76,8 @@
             bash -n ${self}/scripts/prove-local.sh
             touch $out
           '';
+        execution-policy = assert import ./nix/test-execution-policy.nix;
+          pkgs.runCommand "amc-execution-policy" {} "touch $out";
       }
     );
 
@@ -104,6 +106,9 @@
     nixosModules.default = import ./nix/module.nix;
     nixosModules.host-admission = import ./nix/host-admission-module.nix;
     lib.hostDomainPressureVersion = 1;
+    lib.executionPolicyVersion = 1;
+    lib.executionArgs = import ./nix/execution-args.nix;
+    lib.nixBuilderSettings = import ./nix/nix-builder-settings.nix;
     lib.admissionSizingVersion = 1;
     lib.admissionQueueVersion = 1;
     lib.admissionReadyVersion = 2;
