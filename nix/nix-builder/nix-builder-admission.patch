@@ -1,0 +1,267 @@
+From: Canix resource policy integration
+Subject: [PATCH] Admit local builds across handlers and bound sustained pressure
+
+Applied after nix-builder-cgroups.patch to Nix 2.34.8. Policy is immutable
+after daemon startup. Waiters yield through the existing coroutine scheduler;
+substitution and request processing do not wait on the local build slot.
+
+diff --git a/src/libstore/include/nix/store/local-settings.hh b/src/libstore/include/nix/store/local-settings.hh
+--- a/src/libstore/include/nix/store/local-settings.hh
++++ b/src/libstore/include/nix/store/local-settings.hh
+@@ -345,5 +345,21 @@ struct LocalSettings : Config
+     Setting<unsigned int> buildCgroupCpuCores{
+         this, 0, "build-cgroup-cpu-cores", "Aggregate builder CPU quota in cores; zero means unlimited."};
++    Setting<std::string> buildCgroupParent{
++        this, "", "build-cgroup-parent", "Finite memory ancestor used for local build admission; empty disables admission."};
++    Setting<uint64_t> buildCgroupAvailableMin{
++        this, 0, "build-cgroup-available-min", "Minimum host MemAvailable in bytes for a local build; swap is excluded."};
++    Setting<unsigned int> buildCgroupWaitSeconds{
++        this, 300, "build-cgroup-wait-seconds", "Maximum local admission wait in seconds."};
++    Setting<unsigned int> buildCgroupPressureSeconds{
++        this, 30, "build-cgroup-pressure-seconds", "Sustained builder full PSI deadline in seconds."};
++    Setting<unsigned int> buildCgroupPressurePercent{
++        this, 10, "build-cgroup-pressure-percent", "Builder full PSI avg10 percent that starts the pressure deadline."};
++    Setting<unsigned int> buildCgroupMemoryPsiMax{
++        this, 1, "build-cgroup-memory-psi-max", "Host full memory PSI avg10 must be below this percent at admission."};
++    Setting<unsigned int> buildCgroupIoPsiMax{
++        this, 20, "build-cgroup-io-psi-max", "Host full IO PSI avg10 must be below this percent at admission."};
++    Setting<uint64_t> buildCgroupStoreFreeMin{
++        this, 0, "build-cgroup-store-free-min", "Minimum available store filesystem bytes at local build admission."};
+ #endif
+ 
+     Setting<bool> impersonateLinux26{
+diff --git a/src/libutil/linux/include/nix/util/cgroup.hh b/src/libutil/linux/include/nix/util/cgroup.hh
+--- a/src/libutil/linux/include/nix/util/cgroup.hh
++++ b/src/libutil/linux/include/nix/util/cgroup.hh
+@@ -1,5 +1,6 @@
+ #pragma once
+ ///@file
++#include "nix/util/nix-build-policy.hh"
+ 
+ #include <chrono>
+ #include <optional>
+@@ -43,5 +44,7 @@ CanonPath getRootCgroup();
+ void setDaemonBuildCgroup(const std::filesystem::path & path);
+ /** The initialized boundary is inherited by workers, independently of client settings. */
+ const std::optional<std::filesystem::path> & getDaemonBuildCgroup();
++void setDaemonBuildPolicy(DaemonBuildPolicy policy);
++const std::optional<DaemonBuildPolicy> & getDaemonBuildPolicy();
+ 
+ } // namespace nix
+diff --git a/src/libutil/linux/cgroup.cc b/src/libutil/linux/cgroup.cc
+--- a/src/libutil/linux/cgroup.cc
++++ b/src/libutil/linux/cgroup.cc
+@@ -186,4 +186,18 @@ const std::optional<std::filesystem::path> & getDaemonBuildCgroup()
+     return daemonBuildCgroup;
+ }
+ 
++static std::optional<DaemonBuildPolicy> daemonBuildPolicy;
++
++void setDaemonBuildPolicy(DaemonBuildPolicy policy)
++{
++    if (daemonBuildPolicy)
++        throw Error("daemon build admission was already initialized");
++    daemonBuildPolicy = std::move(policy);
++}
++
++const std::optional<DaemonBuildPolicy> & getDaemonBuildPolicy()
++{
++    return daemonBuildPolicy;
++}
++
+ } // namespace nix
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -274,5 +274,7 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+ #ifdef __linux__
+     const auto & local = settings.getLocalSettings();
++    if (!local.buildCgroupParent.get().empty() && !local.buildCgroupMemoryMax.get())
++        throw Error("build admission requires aggregate builder containment");
+     if (local.buildCgroupMemoryMax.get() && !local.useCgroups)
+         throw Error("aggregate builder limits require use-cgroups");
+ 
+@@ -320,4 +322,28 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+             setDaemonBuildCgroup(builders);
++            if (!local.buildCgroupParent.get().empty()) {
++                if (!local.buildCgroupAvailableMin.get() || !local.buildCgroupWaitSeconds.get()
++                    || !local.buildCgroupPressureSeconds.get() || !local.buildCgroupPressurePercent.get()
++                    || local.buildCgroupPressurePercent.get() > 100
++                    || !local.buildCgroupMemoryPsiMax.get() || local.buildCgroupMemoryPsiMax.get() > 100
++                    || !local.buildCgroupIoPsiMax.get() || local.buildCgroupIoPsiMax.get() > 100)
++                    throw Error("invalid local build admission or pressure policy");
++                auto parent = std::filesystem::path(local.buildCgroupParent.get());
++                if (builders.string().rfind(parent.string() + "/", 0) != 0)
++                    throw Error("build admission parent must be a cgroup ancestor of builders");
++                auto slots = std::filesystem::path(settings.nixStateDir) / "build-slots";
++                createDirs(slots);
++                if (chmod(slots.c_str(), 0700) != 0)
++                    throw SysError("protecting daemon build admission slots");
++                auto slot = slots / "local";
++                AutoCloseFD fd = open(slot.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
++                if (!fd)
++                    throw SysError("creating daemon build admission slot");
++                setDaemonBuildPolicy({slot, parent, local.buildCgroupAvailableMin.get(),
++                    local.buildCgroupMemoryMax.get(), local.daemonCgroupMemoryMin.get(),
++                    local.buildCgroupWaitSeconds.get(), local.buildCgroupPressureSeconds.get(),
++                    local.buildCgroupPressurePercent.get(), local.buildCgroupMemoryPsiMax.get(),
++                    local.buildCgroupIoPsiMax.get(), local.buildCgroupStoreFreeMin.get()});
++            }
+             notice("aggregate builder cgroup initialized at %s", PathFmt(builders));
+         }
+     }
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -24,6 +24,11 @@
+ 
+ #include <nlohmann/json.hpp>
+ 
++#ifdef __linux__
++#  include "nix/util/cgroup.hh"
++#  include "nix/util/signals.hh"
++#  include <sys/file.h>
++#endif
+ #include "nix/util/strings.hh"
+ 
+ namespace nix {
+@@ -810,6 +814,55 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+         worker.updateProgress();
+     };
+ 
++#ifdef __linux__
++    // Keep the slot until after builder destruction/cgroup cleanup. Each
++    // coroutine opens its own descriptor, so even same-handler builds contend.
++    AutoCloseFD admissionSlot;
++    if (auto & policy = getDaemonBuildPolicy()) {
++        if (localBuildCap.externalBuilder)
++            co_return doneFailure(BuildError(BuildError::InputRejected, "local build admission requires Nix's sandboxed native builder"));
++        if (drvOptions.getRequiredSystemFeatures(*drv).count("recursive-nix"))
++            co_return doneFailure(BuildError(BuildError::InputRejected, "recursive-nix requires a builder without single-slot admission"));
++        // Recursion would otherwise hold this slot while waiting for itself.
++        if (!admissionWaitingSince)
++            admissionWaitingSince = steady_time_point::clock::now();
++        std::unique_ptr<Activity> waiting;
++        // ponytail: trivial local derivations (shell environments, writeText,
++        // runCommandLocal) skip the wait: they stay inside the capped builder
++        // cgroup and pressure cancellation, but must not queue behind compiles
++        // or unrelated host PSI. Attribute-level trust; tighten if abused.
++        while (!(drvOptions.preferLocalBuild && !drvOptions.allowSubstitutes)) {
++            checkInterrupt();
++            AutoCloseFD candidate = open(policy->slot.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
++            if (!candidate)
++                throw SysError("opening daemon build admission slot");
++            bool locked = flock(candidate.get(), LOCK_EX | LOCK_NB) == 0;
++            if (!locked && errno != EWOULDBLOCK)
++                throw SysError("locking daemon build admission slot");
++            if (locked && buildPolicyReady(*policy, *getDaemonBuildCgroup())
++                && buildPolicyDiskReady(*policy, localBuildCap.localStore.getRealStoreDir())) {
++                admissionSlot = std::move(candidate);
++                admissionWaitingSince.reset();
++                notice("admitted local build %s", worker.store.printStorePath(drvPath));
++                break;
++            }
++            // Release both slot and output locks before yielding, including
++            // pressure waits. A waiter never consumes a build user or process.
++            candidate.close();
++            outputLocks.unlock();
++            if (steady_time_point::clock::now() - *admissionWaitingSince >= std::chrono::seconds(policy->waitSeconds))
++                co_return doneFailure(BuildError(BuildError::TransientFailure, "local build admission timed out for '%s' (slot, RAM, parent headroom, disk or PSI)",
++                    worker.store.printStorePath(drvPath)));
++            if (!waiting)
++                waiting = std::make_unique<Activity>(*logger, lvlWarn, actBuildWaiting,
++                    fmt("waiting for local build capacity for '%s'", worker.store.printStorePath(drvPath)));
++            co_await waitForAWhile();
++            // Recheck output validity and reacquire locks through Nix's normal
++            // state machine; retain a bounded wait across these retries.
++            co_return tryToBuild(std::move(inputPaths));
++        }
++    }
++#endif
+     std::unique_ptr<Activity> actLock;
+     DerivationBuilderUnique builder;
+     Descriptor builderOut;
+diff --git a/src/libstore/include/nix/store/build/derivation-building-goal.hh b/src/libstore/include/nix/store/build/derivation-building-goal.hh
+--- a/src/libstore/include/nix/store/build/derivation-building-goal.hh
++++ b/src/libstore/include/nix/store/build/derivation-building-goal.hh
+@@ -61,5 +61,7 @@ struct DerivationBuildingGoal : public Goal
+     const BuildMode buildMode;
+ 
++    std::optional<std::chrono::steady_clock::time_point> admissionWaitingSince;
++
+     std::unique_ptr<MaintainCount<uint64_t>> mcRunningBuilds;
+ 
+     std::string key() override;
+diff --git a/src/libstore/include/nix/store/build/worker.hh b/src/libstore/include/nix/store/build/worker.hh
+--- a/src/libstore/include/nix/store/build/worker.hh
++++ b/src/libstore/include/nix/store/build/worker.hh
+@@ -1,4 +1,7 @@
+ #pragma once
+ ///@file
++#ifdef __linux__
++#  include "nix/util/nix-build-policy.hh"
++#endif
+ 
+ #include "nix/util/types.hh"
+@@ -59,5 +62,8 @@ struct Child
+     steady_time_point lastOutput;
+     steady_time_point timeStarted;
++#ifdef __linux__
++    BuildPressureWindow buildPressure;
++#endif
+ };
+ 
+ #ifndef _WIN32 // TODO Enable building on Windows
+diff --git a/src/libstore/build/worker.cc b/src/libstore/build/worker.cc
+--- a/src/libstore/build/worker.cc
++++ b/src/libstore/build/worker.cc
+@@ -15,4 +15,7 @@
+ #include "nix/util/signals.hh"
+ #include "nix/store/globals.hh"
++#ifdef __linux__
++#  include "nix/util/cgroup.hh"
++#endif
+ 
+ namespace nix {
+@@ -448,6 +451,13 @@ void Worker::waitForInput()
+     } else
+         lastWokenUp = steady_time_point::min();
+ 
++#ifdef __linux__
++    if (getDaemonBuildPolicy() && nrLocalBuilds) {
++        // Check quiet builds too, without changing normal log-silence policy.
++        timeout = useTimeout ? std::min(timeout, 3L) : 3L;
++        useTimeout = true;
++    }
++#endif
+     if (useTimeout)
+         vomit("sleeping %d seconds", timeout);
+ 
+@@ -496,5 +506,18 @@ void Worker::waitForInput()
+             });
+ 
++#ifdef __linux__
++        if (getDaemonBuildPolicy() && j->inBuildSlot && j->respectTimeouts
++            && goal->jobCategory() == JobCategory::Build && goal->exitCode == Goal::ecBusy) {
++            auto & policy = *getDaemonBuildPolicy();
++            double full = buildPolicyFullPsi(*getDaemonBuildCgroup() / "memory.pressure");
++            if (j->buildPressure.exceeded(after, full, policy)) {
++                warn("cancelling %s: builder full memory PSI %.2f%% persisted for %d seconds",
++                    goal->getName(), full, policy.pressureSeconds);
++                goal->timedOut(TimedOut(policy.pressureSeconds));
++                continue;
++            }
++        }
++#endif
+         if (goal->exitCode == Goal::ecBusy && 0 != settings.maxSilentTime && j->respectTimeouts
+             && after - j->lastOutput >= std::chrono::seconds(settings.maxSilentTime)) {
+             goal->timedOut(TimedOut(settings.maxSilentTime));
+diff --git a/src/libutil/linux/include/nix/util/meson.build b/src/libutil/linux/include/nix/util/meson.build
+--- a/src/libutil/linux/include/nix/util/meson.build
++++ b/src/libutil/linux/include/nix/util/meson.build
+@@ -5,4 +5,5 @@
+ headers += files(
+   'cgroup.hh',
++  'nix-build-policy.hh',
+   'linux-namespaces.hh',
+ )

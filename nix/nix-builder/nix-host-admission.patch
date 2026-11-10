@@ -1,0 +1,76 @@
+From: Canix resource policy integration
+Subject: [PATCH] Enroll the bounded builder pool in shared host admission
+
+Applied after the existing cgroup/admission patches. Empty socket retains
+single-slot admission. Enrolled pools retain their aggregate hard/swap limits;
+the host broker holds their reservation until owner and cgroup cleanup.
+
+diff --git a/src/libstore/include/nix/store/local-settings.hh b/src/libstore/include/nix/store/local-settings.hh
+--- a/src/libstore/include/nix/store/local-settings.hh
++++ b/src/libstore/include/nix/store/local-settings.hh
+@@ -344,6 +344,8 @@ struct LocalSettings : Config
+         this, 0, "daemon-cgroup-memory-max", "Daemon handler memory.max in bytes; zero means unlimited."};
+     Setting<unsigned int> buildCgroupCpuCores{
+         this, 0, "build-cgroup-cpu-cores", "Aggregate builder CPU quota in cores; zero means unlimited."};
++    Setting<std::string> buildHostAdmissionSocket{
++        this, "", "build-host-admission-socket", "Root AMC broker for the bounded execution-owner build pool."};
+     Setting<std::string> buildCgroupParent{
+         this, "", "build-cgroup-parent", "Finite memory ancestor used for local build admission; empty disables admission."};
+     Setting<uint64_t> buildCgroupAvailableMin{
+diff --git a/src/libutil/linux/include/nix/util/nix-build-policy.hh b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+--- a/src/libutil/linux/include/nix/util/nix-build-policy.hh
++++ b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+@@ -28,6 +28,7 @@ struct DaemonBuildPolicy
+     unsigned int memoryPsiMax;
+     unsigned int ioPsiMax;
+     uint64_t storeFreeMin;
++    std::string hostSocket{};
+ };
+ 
+ inline uint64_t buildPolicyNumber(const std::filesystem::path & path)
+@@ -115,7 +116,7 @@ inline bool buildPolicyReady(const DaemonBuildPolicy & policy, const std::filesystem::path & builders)
+     // A request-worker crash must not admit a new build while the old sandbox
+     // is still exiting. Nix's PID namespace/death signal owns that cleanup.
+     std::ifstream events(builders / "cgroup.events");
+-    if (buildPolicyPopulated(events))
++    if (policy.hostSocket.empty() && buildPolicyPopulated(events))
+         return false;
+     std::ifstream memory("/proc/meminfo");
+     return buildPolicyFits(policy, buildPolicyAvailable(memory),
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -323,2 +323,4 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+             if (!local.buildCgroupParent.get().empty()) {
++                if (!local.buildHostAdmissionSocket.get().empty() && geteuid() != 0)
++                    throw Error("shared host build admission requires a root daemon");
+                 if (!local.buildCgroupAvailableMin.get() || !local.buildCgroupWaitSeconds.get()
+@@ -344,1 +346,2 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+-                    local.buildCgroupIoPsiMax.get(), local.buildCgroupStoreFreeMin.get()});
++                    local.buildCgroupIoPsiMax.get(), local.buildCgroupStoreFreeMin.get(),
++                    local.buildHostAdmissionSocket.get()});
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -27,2 +27,3 @@
+ #ifdef __linux__
++#include "nix/util/nix-host-admission.hh"
+ #  include "nix/util/cgroup.hh"
+@@ -848,3 +849,5 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+-            bool locked = flock(candidate.get(), LOCK_EX | LOCK_NB) == 0;
++            bool locked = !policy->hostSocket.empty()
++                ? acquireHostBuildPool(policy->hostSocket, policy->waitSeconds)
++                : flock(candidate.get(), LOCK_EX | LOCK_NB) == 0;
+-            if (!locked && errno != EWOULDBLOCK)
++            if (!locked && policy->hostSocket.empty() && errno != EWOULDBLOCK)
+                 throw SysError("locking daemon build admission slot");
+diff --git a/src/libutil/linux/include/nix/util/meson.build b/src/libutil/linux/include/nix/util/meson.build
+--- a/src/libutil/linux/include/nix/util/meson.build
++++ b/src/libutil/linux/include/nix/util/meson.build
+@@ -5,5 +5,6 @@
+ headers += files(
+   'cgroup.hh',
+   'nix-build-policy.hh',
++  'nix-host-admission.hh',
+   'linux-namespaces.hh',
+ )

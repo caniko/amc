@@ -1,0 +1,75 @@
+From: Canix resource policy integration
+Subject: [PATCH] Bound Atlas-first capacity alongside shared memory admission
+
+Applied after worker/drain integration. Kernel slots belong to Nix's execution
+owner through sandbox cleanup, independently of per-client max-jobs and AMC's
+aggregate memory reservation. Zero retains the existing admission behavior.
+Atlas selects its installed job policy, preserving shared-pool concurrency.
+
+diff --git a/src/libstore/include/nix/store/local-settings.hh b/src/libstore/include/nix/store/local-settings.hh
+--- a/src/libstore/include/nix/store/local-settings.hh
++++ b/src/libstore/include/nix/store/local-settings.hh
+@@ -348,6 +348,8 @@
+         this, "", "build-host-admission-socket", "Root AMC broker for the bounded execution-owner build pool."};
+     Setting<bool> buildHostAdmissionContinuations{
+         this, false, "build-host-admission-continuations", "Bind bounded completion rights to the native Nix socket client."};
++    Setting<unsigned int> buildHostMaxJobs{
++        this, 0, "build-host-max-jobs", "Daemon-wide local builder capacity alongside shared host admission; zero retains legacy admission."};
+     Setting<std::string> buildCgroupParent{
+         this, "", "build-cgroup-parent", "Finite memory ancestor used for local build admission; empty disables admission."};
+     Setting<uint64_t> buildCgroupAvailableMin{
+diff --git a/src/libutil/linux/include/nix/util/nix-build-policy.hh b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+--- a/src/libutil/linux/include/nix/util/nix-build-policy.hh
++++ b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+@@ -31,4 +31,5 @@
+     uint64_t storeFreeMin;
+     std::string hostSocket{};
+     bool continuations = false;
++    unsigned int maxJobs = 0;
+ };
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -347,7 +347,8 @@
+                     local.buildCgroupWaitSeconds.get(), local.buildCgroupPressureSeconds.get(),
+                     local.buildCgroupPressurePercent.get(), local.buildCgroupMemoryPsiMax.get(),
+                     local.buildCgroupIoPsiMax.get(), local.buildCgroupStoreFreeMin.get(),
+-                    local.buildHostAdmissionSocket.get(), local.buildHostAdmissionContinuations.get()});
++                    local.buildHostAdmissionSocket.get(), local.buildHostAdmissionContinuations.get(),
++                    local.buildHostMaxJobs.get()});
+             }
+             notice("aggregate builder cgroup initialized at %s", PathFmt(builders));
+         }
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -833,18 +833,21 @@
+             checkInterrupt();
+-            AutoCloseFD candidate = open(policy->slot.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+-            if (!candidate)
+-                throw SysError("opening daemon build admission slot");
+-            bool locked = !policy->hostSocket.empty()
+-                ? acquireHostBuildPool(policy->hostSocket, policy->waitSeconds, policy->continuations)
+-                : flock(candidate.get(), LOCK_EX | LOCK_NB) == 0;
+-            if (!locked && policy->hostSocket.empty() && errno != EWOULDBLOCK)
+-                throw SysError("locking daemon build admission slot");
++            AutoCloseFD candidate = openHostBuildSlot(policy->slot, policy->maxJobs);
++            bool locked = bool(candidate);
++            if (locked && !policy->maxJobs && policy->hostSocket.empty())
++                locked = hostBuildSlotReady(candidate.get(), true);
++            if (locked && !policy->hostSocket.empty())
++                locked = acquireHostBuildPool(policy->hostSocket, policy->waitSeconds, policy->continuations);
++            // A crashed handler may release its descriptor before its sandbox
++            // exits. Count actual native cgroups too; do not exceed capacity
++            // during that cleanup interval.
++            if (locked && policy->maxJobs)
++                locked = hostBuildLiveSlots(*getDaemonBuildCgroup()) < policy->maxJobs;
+             if (locked && buildPolicyReady(*policy, *getDaemonBuildCgroup())
+                 && buildPolicyDiskReady(*policy, localBuildCap.localStore.getRealStoreDir())) {
+                 admissionSlot = std::move(candidate);
+                 admissionWaitingSince.reset();
+                 notice("admitted local build %s", worker.store.printStorePath(drvPath));
+                 break;
+             }
+             // Release both slot and output locks before yielding, including
+             // pressure waits. A waiter never consumes a build user or process.

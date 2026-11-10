@@ -26,6 +26,13 @@ selects `amc admission exec --contract worker`. In admitted mode the coordinator
 named contract owns the memory/swap policy. Both modes retain a finite runtime.
 An unavailable coordinator is an error, never an automatic native-mode fallback.
 
+## Patched Nix package
+
+`amc.lib.mkNixBuilderPackage {inherit pkgs;}` returns `pkgs.nix` with the
+builder-cgroup and host-admission patches from `nix/nix-builder/`. The consumer
+assigns it to `nix.package`. The patches target the Nix 2.34 source; another
+minor series fails evaluation until they are rebased.
+
 ## Nix builder settings
 
 `lib.nixBuilderSettings` takes native byte limits (`memoryMaxBytes`,

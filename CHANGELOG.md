@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Nix consumer shims: `lib.mkToolShell` starts each agent tool command
   (`<shell> -c ...`) in a contained transient service, and `lib.mkServiceWrap`
   admits a program (optionally one subcommand) through a named contract.
+- `lib.mkNixBuilderPackage {pkgs}` returns Nix 2.34 with the builder-cgroup
+  and host-admission patches, which now live in `nix/nix-builder/` with their
+  header tests.
 
 ## [0.1.0] - 2026-10-22
 

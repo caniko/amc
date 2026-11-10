@@ -1,0 +1,43 @@
+From: Canix resource policy integration
+Subject: [PATCH] Scope native pool continuation to one Nix Worker lifetime
+
+The member is declared before goal ownership so its destructor runs after native
+builder cleanup. New workers change serial even if a release reply was lost.
+
+diff --git a/src/libstore/include/nix/store/build/worker.hh b/src/libstore/include/nix/store/build/worker.hh
+--- a/src/libstore/include/nix/store/build/worker.hh
++++ b/src/libstore/include/nix/store/build/worker.hh
+@@ -2,6 +2,7 @@
+ ///@file
+ #ifdef __linux__
+ #  include "nix/util/nix-build-policy.hh"
++#  include "nix/util/nix-host-admission.hh"
+ #endif
+ 
+ #include "nix/util/types.hh"
+@@ -79,6 +80,10 @@
+ {
+ private:
+ 
++#ifdef __linux__
++    std::optional<HostBuildOperation> hostBuildOperation;
++#endif
++
+     /* Note: the worker should only have strong pointers to the
+        top-level goals. */
+ 
+diff --git a/src/libstore/build/worker.cc b/src/libstore/build/worker.cc
+--- a/src/libstore/build/worker.cc
++++ b/src/libstore/build/worker.cc
+@@ -33,6 +33,11 @@
+         return nix::settings.getWorkerSettings().useSubstitutes ? getDefaultSubstituters() : std::list<ref<Store>>{};
+     }}
+ {
++#ifdef __linux__
++    if (getDaemonBuildPolicy() && getDaemonBuildPolicy()->continuations)
++        hostBuildOperation.emplace(getDaemonBuildPolicy()->hostSocket);
++#endif
++
+ #ifdef _WIN32
+     if (!ioport)
+         throw windows::WinError("CreateIoCompletionPort");
