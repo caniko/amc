@@ -1,0 +1,192 @@
+From: Canix resource policy integration
+Subject: [PATCH] Bound aggregate daemon builders independently of request handlers
+
+Nix 2.34.8 integration pending upstream ownership. The daemon configures the
+delegated boundary once before accepting requests. Workers inherit the chosen
+builder root, so client settings cannot disable containment. Existing per-UID
+cleanup and the namespace synchronization barrier remain Nix-owned.
+
+diff --git a/src/libstore/include/nix/store/local-settings.hh b/src/libstore/include/nix/store/local-settings.hh
+--- a/src/libstore/include/nix/store/local-settings.hh
++++ b/src/libstore/include/nix/store/local-settings.hh
+@@ -331,6 +331,19 @@ struct LocalSettings : Config
+           Cgroups are required and enabled automatically for derivations
+           that require the `uid-range` system feature.
+         )"};
++
++    Setting<uint64_t> buildCgroupMemoryHigh{
++        this, 0, "build-cgroup-memory-high", "Aggregate daemon builder memory.high in bytes; zero means unlimited."};
++    Setting<uint64_t> buildCgroupMemoryMax{
++        this, 0, "build-cgroup-memory-max", "Aggregate daemon builder memory.max in bytes; zero disables the aggregate boundary."};
++    Setting<uint64_t> buildCgroupSwapMax{
++        this, 0, "build-cgroup-swap-max", "Aggregate daemon builder memory.swap.max in bytes."};
++    Setting<uint64_t> daemonCgroupMemoryMin{
++        this, 0, "daemon-cgroup-memory-min", "Daemon handler memory.min in bytes inside the delegated service."};
++    Setting<uint64_t> daemonCgroupMemoryMax{
++        this, 0, "daemon-cgroup-memory-max", "Daemon handler memory.max in bytes; zero means unlimited."};
++    Setting<unsigned int> buildCgroupCpuCores{
++        this, 0, "build-cgroup-cpu-cores", "Aggregate builder CPU quota in cores; zero means unlimited."};
+ #endif
+ 
+     Setting<bool> impersonateLinux26{
+diff --git a/src/libutil/linux/include/nix/util/cgroup.hh b/src/libutil/linux/include/nix/util/cgroup.hh
+--- a/src/libutil/linux/include/nix/util/cgroup.hh
++++ b/src/libutil/linux/include/nix/util/cgroup.hh
+@@ -40,4 +40,9 @@ CanonPath getCurrentCgroup();
+  */
+ CanonPath getRootCgroup();
+ 
++/** Set once by the daemon before forking request handlers. */
++void setDaemonBuildCgroup(const std::filesystem::path & path);
++/** The initialized boundary is inherited by workers, independently of client settings. */
++const std::optional<std::filesystem::path> & getDaemonBuildCgroup();
++
+ } // namespace nix
+diff --git a/src/libutil/linux/cgroup.cc b/src/libutil/linux/cgroup.cc
+--- a/src/libutil/linux/cgroup.cc
++++ b/src/libutil/linux/cgroup.cc
+@@ -174,4 +174,18 @@ CanonPath getRootCgroup()
+     return rootCgroup;
+ }
+ 
++static std::optional<std::filesystem::path> daemonBuildCgroup;
++
++void setDaemonBuildCgroup(const std::filesystem::path & path)
++{
++    if (daemonBuildCgroup)
++        throw Error("daemon builder cgroup was already initialized");
++    daemonBuildCgroup = path;
++}
++
++const std::optional<std::filesystem::path> & getDaemonBuildCgroup()
++{
++    return daemonBuildCgroup;
++}
++
+ } // namespace nix
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -275,6 +275,10 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+     setSigChldAction(true);
+ 
+ #ifdef __linux__
++    const auto & local = settings.getLocalSettings();
++    if (local.buildCgroupMemoryMax.get() && !local.useCgroups)
++        throw Error("aggregate builder limits require use-cgroups");
++
+     if (settings.getLocalSettings().useCgroups) {
+         experimentalFeatureSettings.require(Xp::Cgroups);
+ 
+@@ -292,6 +296,33 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+             throw SysError("creating cgroup '%s'", daemonCgroupPath);
+         //  Move daemon into the new cgroup.
+         writeFile(daemonCgroupPath + "/cgroup.procs", fmt("%d", getpid()));
++
++        if (local.buildCgroupMemoryMax.get()) {
++            if (local.buildCgroupMemoryHigh.get() >= local.buildCgroupMemoryMax.get())
++                throw Error("builder memory.high must be below memory.max");
++            // No processes remain at the delegated root. Nix is its sole writer.
++            writeFile(rootCgroupPath / "cgroup.subtree_control", "+memory +cpu +io");
++            auto builders = rootCgroupPath / "nix-builders";
++            if (mkdir(builders.c_str(), 0755) != 0 && errno != EEXIST)
++                throw SysError("creating builder cgroup '%s'", PathFmt(builders));
++            auto limit = [](uint64_t bytes) { return bytes ? std::to_string(bytes) : "max"; };
++            writeFile(builders / "memory.high", limit(local.buildCgroupMemoryHigh.get()));
++            writeFile(builders / "memory.max", std::to_string(local.buildCgroupMemoryMax.get()));
++            writeFile(builders / "memory.swap.max", std::to_string(local.buildCgroupSwapMax.get()));
++            writeFile(builders / "cpu.max", local.buildCgroupCpuCores.get()
++                ? fmt("%d 100000", uint64_t(local.buildCgroupCpuCores.get()) * 100000) : "max 100000");
++            writeFile(builders / "cpu.weight", "20");
++            writeFile(builders / "io.weight", "default 20");
++            // OOM grouping belongs to individual builds, never the aggregate.
++            writeFile(builders / "memory.oom.group", "0");
++            writeFile(builders / "cgroup.subtree_control", "+memory +cpu +io");
++            writeFile(daemonCgroupPath + "/memory.min", std::to_string(local.daemonCgroupMemoryMin.get()));
++            writeFile(daemonCgroupPath + "/memory.low", std::to_string(local.daemonCgroupMemoryMin.get()));
++            writeFile(daemonCgroupPath + "/memory.max", limit(local.daemonCgroupMemoryMax.get()));
++            writeFile(daemonCgroupPath + "/memory.swap.max", "0");
++            setDaemonBuildCgroup(builders);
++            notice("aggregate builder cgroup initialized at %s", PathFmt(builders));
++        }
+     }
+ #endif
+ 
+diff --git a/src/libstore/unix/build/linux-derivation-builder.cc b/src/libstore/unix/build/linux-derivation-builder.cc
+--- a/src/libstore/unix/build/linux-derivation-builder.cc
++++ b/src/libstore/unix/build/linux-derivation-builder.cc
+@@ -329,7 +329,7 @@ public:
+ 
+     void prepareUser() override
+     {
+-        if ((buildUser && buildUser->getUIDCount() != 1) || store.config->getLocalSettings().useCgroups) {
++        if (getDaemonBuildCgroup() || (buildUser && buildUser->getUIDCount() != 1) || store.config->getLocalSettings().useCgroups) {
+             experimentalFeatureSettings.require(Xp::Cgroups);
+ 
+             /* If we're running from the daemon, then this will return the
+@@ -338,7 +338,7 @@ public:
+             auto cgroupFS = getCgroupFS();
+             if (!cgroupFS)
+                 throw Error("cannot determine the cgroups file system");
+-            auto rootCgroupPath = *cgroupFS / getRootCgroup().rel();
++            auto rootCgroupPath = getDaemonBuildCgroup().value_or(*cgroupFS / getRootCgroup().rel());
+             if (!pathExists(rootCgroupPath))
+                 throw Error("expected cgroup directory %s", PathFmt(rootCgroupPath));
+ 
+@@ -379,6 +379,8 @@ public:
+         if (cgroup) {
+             if (mkdir(cgroup->c_str(), 0755) != 0)
+                 throw SysError("creating cgroup %s", PathFmt(*cgroup));
++            if (getDaemonBuildCgroup())
++                writeFile(*cgroup / "memory.oom.group", "1");
+             chownToBuilder(*cgroup);
+             chownToBuilder(*cgroup / "cgroup.procs");
+             chownToBuilder(*cgroup / "cgroup.threads");
+@@ -557,8 +559,10 @@ public:
+ 
+         /* Move the child into its own cgroup. */
+         if (cgroup)
+             writeFile(*cgroup / "cgroup.procs", fmt("%d", (pid_t) pid));
++        if (getDaemonBuildCgroup())
++            writeFile(fmt("/proc/%d/oom_score_adj", (pid_t) pid), "0");
+ 
+         /* Signal the builder that we've updated its user namespace. */
+         writeFull(userNamespaceSync.writeSide.get(), "1\n");
+         userNamespaceSyncDone = true;
+diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -29,6 +29,7 @@
+ #include <sys/resource.h>
+ #include <sys/socket.h>
+ #ifdef __linux__
++#  include "nix/util/cgroup.hh"
+ #  include <sys/prctl.h>
+ #endif
+ 
+@@ -2134,6 +2134,8 @@ DerivationBuilderUnique createDerivationBuilder(
+     return DerivationBuilderUnique(
+         new DarwinDerivationBuilder(store, std::move(miscMethods), std::move(params), useSandbox));
+ #elif defined(__linux__)
++    if (getDaemonBuildCgroup() && !useSandbox)
++        throw Error("aggregate builder containment requires a sandboxed native builder");
+     if (useSandbox)
+         return DerivationBuilderUnique(
+             new ChrootLinuxDerivationBuilder(store, std::move(miscMethods), std::move(params)));
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -370,7 +370,13 @@ static void daemonLoop(ref<const StoreConfig> storeConfig, std::optional<TrustedFlag> forceTrustClientOpt)
+                         if (setsid() == -1)
+                             throw SysError("creating a new session");
+ 
++#ifdef __linux__
++                        // Keep the listener protected if a request exhausts the
++                        // handler budget. Builders are reset separately at fork.
++                        if (getDaemonBuildCgroup())
++                            writeFile("/proc/self/oom_score_adj", "0");
++#endif
+                         // Restore normal handling of SIGCHLD.
+                         setSigChldAction(false);
+ 
+                         // For debugging, stuff the pid into argv[1].

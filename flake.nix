@@ -76,8 +76,22 @@
             bash -n ${self}/scripts/prove-local.sh
             touch $out
           '';
+        # The header tests run here; the patched Nix is only evaluated, its
+        # build is the consumer's gate.
         execution-policy = assert import ./nix/test-execution-policy.nix;
-          pkgs.runCommand "amc-execution-policy" {} "touch $out";
+        assert (self.lib.mkNixBuilderPackage {inherit pkgs;}).drvPath != "";
+          pkgs.runCommand "amc-execution-policy" {
+            buildInputs = [pkgs.nlohmann_json];
+            nativeBuildInputs = [pkgs.stdenv.cc];
+          } ''
+            for test in policy host-admission; do
+              c++ -std=c++20 -Wall -Wextra -Werror -I ${./nix/nix-builder} \
+                ${./nix/nix-builder}/$test.cc -o $test
+            done
+            ./policy "$PWD/slot"
+            ./host-admission
+            touch $out
+          '';
       }
     );
 
@@ -109,6 +123,7 @@
     lib.executionPolicyVersion = 1;
     lib.executionArgs = import ./nix/execution-args.nix;
     lib.nixBuilderSettings = import ./nix/nix-builder-settings.nix;
+    lib.mkNixBuilderPackage = import ./nix/nix-builder/package.nix;
     lib.admissionSizingVersion = 1;
     lib.admissionQueueVersion = 1;
     lib.admissionReadyVersion = 2;

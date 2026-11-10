@@ -1,0 +1,84 @@
+From: Canix resource policy integration
+Subject: [PATCH] Bind drain continuations to the original Nix socket client
+
+Applied after nix-host-admission.patch. Policy is inherited from the daemon,
+and SO_PEERCRED supplies the origin. Existing handlers retain their own pool
+rights; new handlers need the broker's finite completion contract during drain.
+
+diff --git a/src/libstore/include/nix/store/local-settings.hh b/src/libstore/include/nix/store/local-settings.hh
+--- a/src/libstore/include/nix/store/local-settings.hh
++++ b/src/libstore/include/nix/store/local-settings.hh
+@@ -346,6 +346,8 @@
+         this, 0, "build-cgroup-cpu-cores", "Aggregate builder CPU quota in cores; zero means unlimited."};
+     Setting<std::string> buildHostAdmissionSocket{
+         this, "", "build-host-admission-socket", "Root AMC broker for the bounded execution-owner build pool."};
++    Setting<bool> buildHostAdmissionContinuations{
++        this, false, "build-host-admission-continuations", "Bind bounded completion rights to the native Nix socket client."};
+     Setting<std::string> buildCgroupParent{
+         this, "", "build-cgroup-parent", "Finite memory ancestor used for local build admission; empty disables admission."};
+     Setting<uint64_t> buildCgroupAvailableMin{
+diff --git a/src/libutil/linux/include/nix/util/nix-build-policy.hh b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+--- a/src/libutil/linux/include/nix/util/nix-build-policy.hh
++++ b/src/libutil/linux/include/nix/util/nix-build-policy.hh
+@@ -29,6 +29,7 @@
+     unsigned int ioPsiMax;
+     uint64_t storeFreeMin;
+     std::string hostSocket{};
++    bool continuations = false;
+ };
+ 
+ inline uint64_t buildPolicyNumber(const std::filesystem::path & path)
+diff --git a/src/nix/unix/daemon.cc b/src/nix/unix/daemon.cc
+--- a/src/nix/unix/daemon.cc
++++ b/src/nix/unix/daemon.cc
+@@ -36,6 +36,7 @@
+ 
+ #ifdef __linux__
+ #  include "nix/util/cgroup.hh"
++#  include "nix/util/nix-host-admission.hh"
+ #endif
+ 
+ using namespace nix;
+@@ -348,7 +349,7 @@
+                     local.buildCgroupWaitSeconds.get(), local.buildCgroupPressureSeconds.get(),
+                     local.buildCgroupPressurePercent.get(), local.buildCgroupMemoryPsiMax.get(),
+                     local.buildCgroupIoPsiMax.get(), local.buildCgroupStoreFreeMin.get(),
+-                    local.buildHostAdmissionSocket.get()});
++                    local.buildHostAdmissionSocket.get(), local.buildHostAdmissionContinuations.get()});
+             }
+             notice("aggregate builder cgroup initialized at %s", PathFmt(builders));
+         }
+@@ -386,6 +387,11 @@
+                     userName.value_or("<unknown>"));
+ 
+                 // Fork a child to handle the connection.
++#ifdef __linux__
++                const auto origin = peer.pid && getDaemonBuildPolicy() && getDaemonBuildPolicy()->continuations
++                    ? pinHostBuildOrigin(*peer.pid) : std::nullopt;
++#endif
++
+                 ProcessOptions options;
+                 options.errorPrefix = "unexpected Nix daemon error: ";
+                 options.dieWithParent = false;
+@@ -393,6 +399,9 @@
+                 startProcess(
+                     [&, storeConfig, closeListeners = std::move(closeListeners)]() {
+                         closeListeners();
++#ifdef __linux__
++                        hostBuildOrigin() = origin;
++#endif
+ 
+                         // Background the daemon.
+                         if (setsid() == -1)
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -835,7 +835,7 @@
+             if (!candidate)
+                 throw SysError("opening daemon build admission slot");
+             bool locked = !policy->hostSocket.empty()
+-                ? acquireHostBuildPool(policy->hostSocket, policy->waitSeconds)
++                ? acquireHostBuildPool(policy->hostSocket, policy->waitSeconds, policy->continuations)
+                 : flock(candidate.get(), LOCK_EX | LOCK_NB) == 0;
+             if (!locked && policy->hostSocket.empty() && errno != EWOULDBLOCK)
+                 throw SysError("locking daemon build admission slot");
