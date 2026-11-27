@@ -1,4 +1,5 @@
-# Admit a program's backend through the coordinator's named contract. With
+# Admit a program's backend through the coordinator's named contract, or run it
+# under a direct native AMC contract (`nativeContract` + `runtimeMaxSec`). With
 # `subcommand` set, only invocations naming it (e.g. `codex app-server`, spawned
 # by an editor extension) run in the contained transient service, together with
 # every child they spawn; other invocations keep direct execution. Any argv token
@@ -9,18 +10,37 @@
   callPackage,
   lib,
   writeShellScriptBin,
-  amc ? callPackage ./package.nix {},
+  amc ? callPackage ./package.nix { },
+  amcServiceExec ? null,
   name,
   program,
-  contract,
+  contract ? null,
+  nativeContract ? null,
+  runtimeMaxSec ? 86400,
   subcommand ? null,
-}: let
-  admitted = ''exec ${amc}/bin/amc admission exec --contract ${lib.escapeShellArg contract} -- ${program} "$@"'';
+}:
+assert nativeContract != null || (contract != null && contract != "");
+let
+  executionArgs = import ./execution-args.nix;
+  admitted =
+    if nativeContract != null then
+      ''exec ${amc}/bin/amc ${
+        lib.escapeShellArgs (executionArgs {
+          admission = false;
+          contract = nativeContract;
+          inherit runtimeMaxSec;
+        })
+      } -- ${program} "$@"''
+    else if amcServiceExec != null then
+      ''exec ${amcServiceExec}/bin/amc-service-exec --contract ${lib.escapeShellArg contract} -- ${program} "$@"''
+    else
+      ''exec ${amc}/bin/amc admission exec --contract ${lib.escapeShellArg contract} -- ${program} "$@"'';
 in
-  writeShellScriptBin name (
-    if subcommand == null
-    then admitted
-    else ''
+writeShellScriptBin name (
+  if subcommand == null then
+    admitted
+  else
+    ''
       for arg in "$@"; do
         if [ "$arg" = ${lib.escapeShellArg subcommand} ]; then
           ${admitted}
@@ -28,4 +48,4 @@ in
       done
       exec ${program} "$@"
     ''
-  )
+)
