@@ -65,6 +65,13 @@ pub enum AdmissionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Report bounded, read-only diagnostics from the user and host brokers.
+    Diagnose {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long, default_value = "/run/amc-host/admission.sock")]
+        host_socket: PathBuf,
+    },
     /// Admit and execute one native service using an operator-defined contract.
     Exec {
         #[arg(long)]
@@ -123,6 +130,82 @@ fn socket_path(path: Option<PathBuf>) -> Result<PathBuf> {
     })
 }
 
+fn user_status(socket: &Path) -> Result<amc_admission::protocol::Status> {
+    call(socket, Message::Status)?
+        .status
+        .ok_or_else(|| anyhow::anyhow!("missing admission status"))
+}
+
+fn host_status(socket: &Path) -> Result<amc_admission::host_server::Response> {
+    amc_admission::host_server::call(
+        socket,
+        &amc_admission::host_server::Request::Status { version: 1 },
+    )
+}
+
+fn diagnostic_source(snapshot: Result<serde_json::Value>) -> serde_json::Value {
+    use serde_json::json;
+    match snapshot {
+        Ok(snapshot) => json!({"state": "available", "error": null, "snapshot": snapshot}),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            json!({"state": "not_configured", "error": null, "snapshot": null})
+        }
+        Err(_) => json!({"state": "unavailable", "error": "status_unavailable", "snapshot": null}),
+    }
+}
+
+fn diagnostic_report(socket: Option<PathBuf>, host_socket: &Path) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let start = Instant::now();
+    std::thread::scope(|scope| {
+        let host = scope.spawn(|| {
+            diagnostic_source(host_status(host_socket).and_then(|status| {
+                ensure!(
+                    status.version == 1 && status.error.is_none(),
+                    "invalid host status"
+                );
+                Ok(json!({
+                    "committed_bytes": status.committed_bytes,
+                    "budget_bytes": status.budget_bytes,
+                    "burst_committed_bytes": status.burst_committed_bytes,
+                    "burst_budget_bytes": status.burst_budget_bytes,
+                    "swap_committed_bytes": status.swap_committed_bytes,
+                    "preparation_barrier": status.preparation_barrier,
+                    "reservation_count": status.reservations.map(|entries| entries.len()),
+                }))
+            }))
+        });
+        // Only emit aggregates: full broker responses include job identities,
+        // cgroup paths and reservation metadata that the plugin does not need.
+        let user = if socket.is_none() && std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            json!({"state": "not_configured", "error": null, "snapshot": null})
+        } else {
+            diagnostic_source(socket_path(socket).and_then(|path| user_status(&path)).map(
+                |status| {
+                    json!({
+                        "budget_bytes": status.budget_bytes,
+                        "reserve_bytes": status.reserve_bytes,
+                        "committed_bytes": status.committed_bytes,
+                        "job_count": status.entries.len(),
+                        "waiting_count": status.waiting.len(),
+                        "unreconciled_count": status.unreconciled.len(),
+                    })
+                },
+            ))
+        };
+        let host = host
+            .join()
+            .map_err(|_| anyhow::anyhow!("host diagnostics failed"))?;
+        Ok(
+            json!({"schema_version": 1, "collection_ms": start.elapsed().as_millis(), "user": user, "host": host}),
+        )
+    })
+}
+
 pub fn execute(command: AdmissionCommand) -> Result<i32> {
     match command {
         AdmissionCommand::HostPolicyCheck { policy } => {
@@ -149,10 +232,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             Ok(0)
         }
         AdmissionCommand::HostStatus { socket } => {
-            let status = amc_admission::host_server::call(
-                &socket,
-                &amc_admission::host_server::Request::Status { version: 1 },
-            )?;
+            let status = host_status(&socket)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
             Ok(0)
         }
@@ -201,9 +281,7 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
             Ok(0)
         }
         AdmissionCommand::Status { socket, json } => {
-            let status = call(&socket_path(socket)?, Message::Status)?
-                .status
-                .ok_or_else(|| anyhow::anyhow!("missing admission status"))?;
+            let status = user_status(&socket_path(socket)?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -229,6 +307,13 @@ pub fn execute(command: AdmissionCommand) -> Result<i32> {
                     println!("Unreconciled: {id}");
                 }
             }
+            Ok(0)
+        }
+        AdmissionCommand::Diagnose {
+            socket,
+            host_socket,
+        } => {
+            println!("{}", diagnostic_report(socket, &host_socket)?);
             Ok(0)
         }
         AdmissionCommand::Exec {

@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -9,6 +9,94 @@ use std::{
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn admission_diagnose_reports_missing_brokers_independently() {
+    let fixture = Fixture::new();
+    let missing = fixture.0.join("missing.sock");
+    let out = fixture
+        .command("diagnose")
+        .args(["admission", "diagnose", "--socket"])
+        .arg(&missing)
+        .arg("--host-socket")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    for layer in ["user", "host"] {
+        assert_eq!(report[layer]["state"], "not_configured");
+        assert!(report[layer]["snapshot"].is_null());
+    }
+}
+
+#[test]
+fn admission_diagnose_reads_user_broker_when_host_is_missing() {
+    use amc_admission::protocol::{Message, Request, Response, Status, read_frame, write_frame};
+
+    let fixture = Fixture::new();
+    let socket = fixture.0.join("user.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut child = fixture
+        .command("diagnose")
+        .args(["admission", "diagnose", "--socket"])
+        .arg(&socket)
+        .arg("--host-socket")
+        .arg(fixture.0.join("missing.sock"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("no status request received");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(matches!(
+        read_frame::<Request>(&mut stream).unwrap().message,
+        Message::Status
+    ));
+    write_frame(
+        &mut stream,
+        &Response {
+            version: 1,
+            status: Some(Status {
+                budget_bytes: 4096,
+                reserve_bytes: 512,
+                committed_bytes: 1024,
+                entries: vec![],
+                waiting: Default::default(),
+                protected_pools: Default::default(),
+                unreconciled: vec!["private-job".into()],
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["user"]["state"], "available");
+    assert_eq!(report["user"]["snapshot"]["committed_bytes"], 1024);
+    assert_eq!(report["user"]["snapshot"]["unreconciled_count"], 1);
+    assert_eq!(report["host"]["state"], "not_configured");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("private-job"));
+}
 
 struct Fixture(PathBuf);
 
