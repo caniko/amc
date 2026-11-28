@@ -11,107 +11,107 @@
 
 ## Abstract
 
-This proposal concerns making existing memory resource controls effective through ordinary application launch paths. The motivating problem is an interactive session becoming unusable during memory-intensive work, while configuring the relevant controls requires knowledge of how that work was started and which service actually owns it.
+Make existing memory controls work through ordinary application launches. Memory-intensive work can make an interactive session unusable, yet configuring controls requires knowing how the work started and which service owns it.
 
-The initial work is to document launch ownership, preserve existing activation semantics, apply selected policy before workload execution, and provide reproducible tests and diagnostics. On systemd systems, units, drop-ins, slices, resource-control properties, and existing pressure and lifecycle interfaces remain the configuration and enforcement model. A new application manifest, policy language, service manager, or desktop-wide launch broker is not proposed.
+First, document launch ownership, preserve activation semantics, apply selected policy before execution, and provide reproducible tests and diagnostics. On systemd, keep units, drop-ins, slices, resource-control properties, and existing pressure and lifecycle interfaces for configuration and enforcement. No new application manifest, policy language, service manager, or desktop-wide launch broker.
 
-The intended user experience remains simple: configure or install a policy once, then start an application normally. The first experiment will establish which launch paths already support that experience, fix specific gaps, and measure responsiveness and useful work. Broader metadata standardization is conditional on demonstrating a requirement that existing interfaces cannot express.
+The intended experience: configure or install policy once, then launch normally. The first experiment will identify working paths, fix specific gaps, and measure responsiveness and useful work. Standardize broader metadata only after showing a requirement existing interfaces cannot express.
 
 ## 1. Problem and proposed contribution
 
-The initiating report describes OpenCode and other applications becoming unresponsive as memory and swap use increase. That observation is a motivation, not a diagnosis: reproducing it must distinguish memory reclaim, storage contention, application deadlock, CPU contention, and work executed by external services. PSI provides information about resource stalls, but does not identify every cause of application unresponsiveness. [1]
+The original report describes OpenCode and other applications becoming unresponsive as memory and swap use rise. That motivates the experiment but establishes no cause. Reproduction must distinguish memory reclaim, storage contention, application deadlock, CPU contention, and work done by external services. PSI shows resource stalls, not every cause of unresponsiveness. [1]
 
 The proposed contribution is an integration practice with tests:
 
 > For a supported launch path with an explicitly selected resource policy, the component responsible for starting the workload applies that policy before releasing the workload to execute, preserves its activation and lifetime semantics, and makes the effective resource domain inspectable.
 
-This is not a promise that every allocation succeeds, that every application completes, or that memory limits establish a real-time bound on failure recovery. Responsiveness is an experimental outcome to measure.
+This guarantees neither successful allocations, application completion, nor a real-time recovery bound from memory limits. Responsiveness is a measured outcome, not a guarantee.
 
-Three outcomes are acceptable: existing unit configuration proves sufficient; a small launcher or service-manager integration fix is required; or a concrete missing interface is demonstrated. The experiment must not assume that creating a new framework is the successful outcome.
+Three outcomes are acceptable: existing unit configuration suffices, a small launcher or service-manager fix is needed, or the experiment demonstrates a missing interface. Do not treat creating a new framework as the criterion for success.
 
 ## 2. Scope and existing interfaces
 
-The initial integration target is a systemd-managed Linux session. It is not a freedesktop requirement that all desktops or operating systems use systemd.
+Start with systemd-managed Linux sessions. Choosing this target imposes no freedesktop requirement that all desktops or operating systems use systemd.
 
-Existing systemd desktop guidance describes application unit naming and the `app.slice`, `background.slice`, and `session.slice` groupings. It encourages service-based launching but is explicitly a work in progress. This RFC builds on that guidance rather than presenting those conventions as a newly completed cross-desktop standard. [2]
+Systemd's desktop guidance describes application unit naming and the `app.slice`, `background.slice`, and `session.slice` groupings. It encourages service-based launches but explicitly remains a work in progress. This RFC builds on that guidance, not a finished cross-desktop standard. [2]
 
-The systemd resource-control and service interfaces already express memory limits and protection, OOM handling, and service restart policy. The pressure protocol already supplies applications with a memory-pressure endpoint and configuration. Those interfaces should be used directly where applicable. [3][4][5]
+Use existing interfaces directly where applicable: systemd resource-control and service settings for memory limits and protection, OOM handling, and restart policy; the pressure protocol for an application's memory-pressure endpoint and configuration. [3][4][5]
 
-No kernel ABI, new D-Bus method, desktop-entry extension, universal resource class, mandatory library, or process-name classifier is requested by this revision. CPU, I/O, GPU, and energy policy remain outside the initial configuration proposal; their effects must nevertheless be recorded when they confound the experiment.
+This revision requests no kernel ABI, new D-Bus method, desktop-entry extension, universal resource class, mandatory library, or process-name classifier. CPU, I/O, GPU, and energy policy are outside the initial configuration proposal; record their effects when they confound the experiment.
 
-Earlier portal work is relevant prior art for possible component-level extensions, not an implemented contract standard or a prerequisite for this experiment. [17]
+Earlier portal work is prior art for possible component extensions, not an implemented contract standard or an experimental prerequisite. [17]
 
-The project name `amc` may remain a local prototype name. It does not designate a proposed upstream API or namespace.
+Keep `amc` as a local prototype name if useful, not a proposed upstream API or namespace.
 
 ## 3. Launch ownership and placement
 
 ### 3.1 Use the existing lifecycle owner
 
-For an application already started by a native service, add selected resource policy to that service. Do not put its activation client in a second service and claim that this contains the server.
+If a native service already starts the application, apply selected policy there. Putting its activation client in a second service does not contain the server.
 
-For an existing desktop launcher that creates transient services, investigate its established naming and configuration path before adding a resolver. Preserve names and aliases that users already target with configuration. For a launch path without appropriate isolation, implement the smallest integration needed in the component that actually starts the workload.
+If a desktop launcher creates transient services, check its naming and configuration before adding a resolver. Preserve names and aliases targeted by existing user configuration. If isolation is missing or inadequate, make the smallest needed change in the component that starts the workload.
 
-Services, scopes, and slices have different ownership models. A service delegates process lifetime to the service manager; a scope represents externally created processes; a slice groups units. This distinction should guide integration rather than imposing one unit type on every application. [6]
+A service delegates process lifetime to the manager; a scope represents externally created processes; a slice groups units. Choose by ownership rather than imposing one unit type on all applications. [6]
 
 ### 3.2 Define ordering, not a universal syscall requirement
 
-For a new transient service, submit execution information and required resource properties before starting the service. For a native service, use its ordinary unit configuration. With a compatible service type, `Type=exec` can improve reporting of executable startup failure; it is not an application-readiness protocol and should not replace an existing `Type=dbus` or `Type=notify` contract. [4][7]
+Submit execution information and required resource properties before starting a new transient service. For native services, use ordinary unit configuration. Where compatible, `Type=exec` can better report executable startup failure; it does not signal application readiness, and do not replace an existing `Type=dbus` or `Type=notify` contract. [4][7]
 
-A scope is not inherently racy. A launcher can arrange for a trusted child to wait while the manager places it in the configured scope, then release it to execute the target. Such an implementation must handle cancellation, registration failure, and child cleanup. An implementation that lets arbitrary workload code run and fork before migration does not meet this proposal's ordering requirement.
+A scope need not race: for example, a launcher can hold a trusted child until the manager places it in the configured scope, then release it to execute the target. Handle cancellation, registration failure, and child cleanup. Letting arbitrary workload code run and fork before migration violates the required ordering.
 
-Post-start migration also does not retroactively transfer all existing memory charges. Therefore report pre-execution containment separately from best-effort attachment of an already-running process. [8]
+Post-start migration does not transfer all existing memory charges. Report pre-execution containment separately from best-effort attachment to a running process. [8]
 
-“Before execution” refers to releasing the target workload, not to eliminating all allocations by the launcher, the manager, or a trusted setup child. No new atomic kernel operation is claimed or required.
+“Before execution” means before releasing the target, not before any allocation by the launcher, manager, or trusted setup child. This neither claims nor requires a new atomic kernel operation.
 
 ### 3.3 Handle failed and uncertain starts
 
-The integration must not report a strict, bounded launch as successful when a required controller or limit is unavailable. Capability checks and actual effective configuration both belong in its verification.
+Do not report strict, bounded launch success if a required controller or limit is unavailable. Verify both capabilities and effective configuration.
 
-An ordinary desktop path may retain its existing behavior when an optional integration is unavailable, provided it does not label that launch as contained. A deliberately strict test or administrative launch should fail before releasing the target instead. These are separate operating modes, not a silent downgrade.
+If optional integration is unavailable, ordinary desktop launches may behave as before but must not claim containment. Strict test or administrative launches should fail before releasing the target. Keep these modes distinct; never silently downgrade.
 
-A timeout after submitting a launch request does not establish that nothing started. Reconcile the requested unit's state before retrying; do not create a duplicate instance or launch an unrestricted fallback after an ambiguous result.
+A submitted request can start despite a timeout. Reconcile the requested unit's state before retrying; no duplicate instance or unrestricted fallback after an ambiguous result.
 
 ## 4. Configuration: use units, not a parallel contract language
 
 ### 4.1 Represent the policy with existing settings
 
-Use native units and drop-ins first. Where transient properties are necessary, use the existing resource-control names and meanings. Do not translate them into a second public vocabulary such as `hard_boundary`, `limit_action`, or `restart_action`.
+Use native units and drop-ins first. If transient properties are needed, use existing resource-control names and meanings, not a second public vocabulary like `hard_boundary`, `limit_action`, or `restart_action`.
 
-A NixOS module may generate these units and settings declaratively. Its configuration schema is a distribution integration detail, not a cross-desktop interchange format. A local helper may validate or explain generated settings, but should not become an independent source of policy truth.
+A NixOS module may generate units and settings declaratively. Its schema is distribution-specific, not a cross-desktop interchange format. A local helper may validate or explain generated settings, not define independent policy.
 
-Application packages may ship justified unit defaults. Operators and users may change defaults through normal supported configuration. There is no blanket prohibition on package-supplied numeric limits: the relevant distinction is between a configurable default and an enforced administrative constraint.
+Packages may ship justified unit defaults, including numeric limits. Operators and users may change them through supported configuration. Distinguish configurable defaults from enforced administrative constraints.
 
 ### 4.2 Respect configuration precedence
 
-Preserve the service manager's documented unit lookup and drop-in merging rules instead of inventing a new administrator/user/vendor precedence hierarchy. For transient units, test the interaction between submitted properties and applicable drop-ins on supported versions. Inspect the effective result rather than inferring it from the source file alone. [9]
+Keep documented manager lookup and drop-in merging rules, not a new administrator/user/vendor hierarchy. Test submitted transient properties against applicable drop-ins on supported versions. Inspect the effective result, not just the source file. [9]
 
-A launcher should avoid repeatedly supplying optional values that obscure or replace existing local policy without a documented reason. Do not install broad `app-` or `service.d` overrides merely to simplify the prototype.
+Launchers should not repeatedly supply optional values that obscure or replace local policy without documenting why. Do not install broad `app-` or `service.d` overrides for prototype convenience.
 
-An application ID is useful for selecting configuration and presenting diagnostics, but is not authentication. An executable basename is a label, not a trustworthy basis for privileged treatment. Existing desktop file selection and user customization must continue to work without introducing package attestation as a prerequisite.
+Application IDs can help select configuration and present diagnostics, not authenticate requests. An executable basename is a label, not a basis for privilege. Preserve desktop file selection and user customization without requiring package attestation.
 
 ### 4.3 Remove capability metadata from the initial proposal
 
 Revision 0.3 proposed `PressureAware` and `RestartSafe` metadata. Neither is necessary to test this integration.
 
-Pressure-aware code should consume an existing toolkit or service-manager pressure interface. Configuring or receiving notifications does not prove that an application can recover enough memory. Restart behavior belongs to the application's existing lifecycle owner and its explicit configuration, not to a global boolean intended to certify safe replay. [5]
+Pressure-aware code should use an existing toolkit or service-manager pressure interface. Configuring or receiving notifications does not prove sufficient memory recovery. Leave restarts to the existing lifecycle owner and explicit configuration, not a global boolean certifying safe replay. [5]
 
-A new desktop-entry key should be proposed only with demonstrated consumers, precise semantics, and an explanation of why existing activation or unit information is insufficient. The Desktop Entry Specification already provides a process for extensions; this RFC does not allocate an experimental namespace simply in anticipation of needing one. [10]
+Propose a desktop-entry key only with demonstrated consumers, precise semantics, and a reason existing activation or unit information falls short. Use the Desktop Entry Specification's extension process; this RFC reserves no speculative namespace. [10]
 
 ## 5. Resource ownership, hierarchy, and authority
 
-On systemd systems, use manager interfaces for manager-owned cgroups. A service that has received explicit delegation may manage its delegated subtree; delegation is legitimate and should not be disabled merely to simplify this project. Do not run a second writer against the same cgroup. [6]
+On systemd, use manager interfaces for manager-owned cgroups. Explicitly delegated services may manage their subtrees; do not disable legitimate delegation for convenience or add a second writer to a cgroup. [6]
 
-User-session configuration is normally user-controlled. This proposal targets accidental overload and predictable operation, not containment of a hostile process with equivalent user-manager privileges. An application ID check inside a user helper cannot create a security boundary absent from the surrounding session.
+Users normally control their session configuration. This proposal addresses accidental overload and predictable operation, not hostile processes with equivalent user-manager privileges. A user helper's application ID check cannot add a security boundary the session lacks.
 
-Where an administrator requires an enforceable limit across a user's workloads, place that constraint in the appropriate administrator-owned ancestor and use the existing privilege and delegation model. A same-user per-application setting is not a substitute for that boundary. [3][6]
+If an administrator needs enforceable limits across a user's workloads, set them at the appropriate administrator-owned ancestor using existing privilege and delegation. Same-user per-application settings cannot replace that boundary. [3][6]
 
-Per-unit limits are also not aggregate admission control. Several applications can each comply with their limit and still create pressure together. The deployment must identify which ancestor handles their aggregate budget and which infrastructure is outside it. Tests must inspect the entire relevant ancestry, including parent resource settings and any OOM grouping or monitoring.
+Per-unit limits are not aggregate admission control: applications within their limits can still create pressure together. Identify the budget-owning ancestor and, separately, the infrastructure outside its budget. Test the full relevant ancestry, including parent resource settings and any OOM grouping or monitoring.
 
-Do not derive universal limits by assigning every application a fixed fraction of installed RAM. Begin with explicit experimental values and separately evaluate the cost of false-positive termination, lost throughput, and unused capacity. The long-term goal of better defaults remains open; this revision does not claim to have solved automatic sizing.
+Do not give every application a fixed share of installed RAM as a universal limit. Start with explicit experimental values; separately measure false-positive termination, lost throughput, and unused capacity costs. Better defaults remain a goal; automatic sizing is unsolved here.
 
 ## 6. Preserve the actual resource-control semantics
 
-The authoritative meanings remain those in the kernel and systemd documentation. In particular:
+The kernel and systemd documentation remain authoritative:
 
 | Setting | Meaning relevant to this proposal |
 |---|---|
@@ -121,97 +121,97 @@ The authoritative meanings remain those in the kernel and systemd documentation.
 | `MemoryMax=` | Hard limit on accounted memory, subject to documented kernel behavior. |
 | `MemorySwapMax=` | Separate limit on charged swap use, not a reservation of extra RAM. |
 
-These settings should not be renamed as guaranteed application entitlements. [3]
+Do not rename these settings as guaranteed application entitlements. [3]
 
 ### 6.1 Keep `MemoryHigh` in its upstream role
 
-Upstream recommends `MemoryHigh=` as the principal control and `MemoryMax=` as a final defense. Reclamation can benefit a workload even when the application has no explicit pressure callback. Consequently, the `hard-contained`/`cooperative-contained` capability distinction in revision 0.3 is removed. [3]
+Upstream recommends `MemoryHigh=` as the main control and `MemoryMax=` as the last defense. Reclaim can help even without an explicit application pressure callback, so drop revision 0.3's `hard-contained`/`cooperative-contained` capability distinction. [3]
 
-A max-only test remains useful to isolate hard-limit behavior, but is not a recommendation to disable throttling in production. The evaluation should compare that fixture with an appropriate high/max configuration and, where already deployed, existing pressure management.
+A max-only fixture isolates hard-limit behavior; it does not justify disabling production throttling. Compare it with appropriate high/max settings and any already-deployed pressure management.
 
-For interactive workloads, excessive time spent reclaiming is an important failure outcome. Measure it and adjust policy or existing pressure handling; do not declare a configuration successful merely because the affected process remains alive.
+Excessive reclaim time is a failure for interactive workloads. Measure it and adjust policy or existing pressure handling; process survival alone is not success.
 
 ### 6.2 Avoid guarantees the kernel does not provide
 
-The memory controller accounts more than application heap or RSS, including page cache and substantial kernel memory. Shared charges are not equivalent to ownership of exclusive physical bytes. A hard limit may be temporarily exceeded, and some failed allocations do not invoke OOM killing. [8]
+The controller accounts for more than application heap or RSS: it includes page cache and substantial kernel memory. Shared charges do not imply exclusive ownership of physical bytes. Usage can temporarily exceed a hard limit, and some allocation failures do not trigger OOM killing. [8]
 
-Accordingly, this RFC promises neither an exact instantaneous physical-memory ceiling nor a fixed deadline from crossing a threshold to death. Killing a process also is not a general application recovery protocol. The experiment must distinguish resource accounting, reclaim, allocation failure, OOM selection, process exit, and useful service recovery.
+This RFC promises neither an exact instantaneous physical-memory ceiling nor a fixed deadline from threshold crossing to death. Killing is not a general recovery protocol. Distinguish resource accounting, reclaim, allocation failure, OOM selection, process exit, and useful service recovery.
 
-No universal “small swap” policy is proposed. zram stores compressed data in RAM, so its logical size must not be added to physical capacity as if it were independent memory. Record compression configuration and actual consumption; zero-filled allocation alone is not a representative compression stress test. [11]
+This RFC proposes no universal “small swap” policy. zram stores compressed data in RAM; do not add its logical size to physical capacity. Record compression settings and actual consumption; zero-filled allocation alone is not a representative compression stress test. [11]
 
 ## 7. Pressure and failure handling
 
 ### 7.1 Reuse pressure interfaces
 
-Use the existing memory-pressure protocol or an appropriate toolkit interface. `MemoryPressureWatch=` and `MemoryPressureThresholdSec=` configure notification; they are not a delivery acknowledgement, a promise to shed a particular number of bytes, or a timeout after which termination automatically follows. [5]
+Use the existing memory-pressure protocol or an appropriate toolkit interface. `MemoryPressureWatch=` and `MemoryPressureThresholdSec=` configure notifications, not delivery acknowledgements, byte-shedding guarantees, or automatic termination timeouts. [5]
 
-Applications decide which caches or concurrency can safely be reduced. Initial integration should not invent a generic “degrade” signal, require a new portal, or introduce another global pressure watcher.
+Applications decide which caches or concurrency they can safely reduce and by how much. Start without a generic “degrade” signal, new portal requirement, or another global pressure watcher.
 
-Existing systemd-oomd policy should be audited and preserved during ordinary deployment. Its pressure-driven cgroup selection is a different mechanism from a local hard-limit OOM. Tests should identify which mechanism acted and which subtree it selected. Newer optional rule interfaces are not required by this RFC. [12]
+Audit and preserve existing systemd-oomd policy during ordinary deployment. Its pressure-driven cgroup selection differs from local hard-limit OOM. Tests should identify the mechanism and selected subtree. This RFC requires no newer optional rule interfaces. [12]
 
 ### 7.2 Preserve the intended failure domain
 
-Select OOM behavior for the actual service, not indiscriminately for every application or ancestor. For a disposable multi-process fixture, `OOMPolicy=kill` is the documented service setting that requests group-OOM behavior through `memory.oom.group`. `KillMode=` describes service shutdown handling and is not a replacement for that OOM policy. [4][13]
+Select OOM behavior for the actual service, not indiscriminately for every application or ancestor. For a disposable multi-process fixture, the documented `OOMPolicy=kill` service setting requests group-OOM through `memory.oom.group`. `KillMode=` governs service shutdown, not OOM policy. [4][13]
 
-Do not add the previously suggested `MemoryOOMGroup=yes` property to the prototype. Use the documented interface and verify the resulting cgroup state.
+Do not add the earlier `MemoryOOMGroup=yes` suggestion. Use the documented interface and verify cgroup state.
 
-An application's own component recovery may make whole-unit killing undesirable. Respect existing `OOMPolicy` and delegation decisions unless an explicit, tested policy change is intended. In particular, do not mark an entire desktop session or shared broker as one disposable group by default.
+An application may recover individual components, making whole-unit killing undesirable. Preserve existing `OOMPolicy` and delegation unless explicitly changing and testing them. Never default an entire desktop session or shared broker to one disposable group.
 
 ### 7.3 Leave restart with the lifecycle owner
 
-Preserve an existing restart policy. For an experimental application with unknown replay semantics, leave automatic restart disabled. A service configured to recover may use existing restart delay and start-rate limiting, but `Restart=on-failure` is broader than “restart after a memory-limit event”. [4][9]
+Keep existing restart policy. For experimental applications with unknown replay semantics, leave automatic restart disabled. A service configured for recovery may use existing restart delays and start-rate limits, but `Restart=on-failure` covers more than memory-limit events. [4][9]
 
-Retries need application-specific justification: reconstructible inputs, handling of partially completed writes or external requests, and avoidance of duplicate work. Do not automatically replay terminal commands, package operations, or agent actions solely because their process was killed.
+Justify retries per application: inputs must be reconstructible, partial writes or external requests handled, and duplicate work avoided. Do not replay terminal commands, package operations, or agent actions automatically just because their process was killed.
 
-If an application should survive an individual worker failure, the application and its supervisor must provide that behavior. Top-level resource integration does not manufacture internal failure isolation.
+If an application must survive an individual worker failure, it and its supervisor must provide that behavior. Top-level resource integration does not isolate internal failures.
 
 ## 8. Preserve activation and execution boundaries
 
 ### 8.1 Desktop and D-Bus activation
 
-Do not change an application's activation model to make memory configuration easier. For `DBusActivatable` applications, preserve activation of the registered application and its existing server instance, including activation data. Placing the short-lived requesting process in a new unit is not equivalent to governing the application. [14]
+Do not change activation to simplify memory configuration. For `DBusActivatable` applications, preserve activation of the registered application and its existing server, including activation data. Moving the short-lived requester to a new unit does not govern the application. [14]
 
-Keep file/URI handling, desktop actions, working directory, environment, activation tokens, sandboxing, and singleton semantics intact. For a process that is already running, activation should not be misreported as a fresh pre-execution policy application. Changing its limits is a distinct administrative operation, not an automatic side effect of opening another window.
+Preserve file/URI handling, desktop actions, working directory, environment, activation tokens, sandboxing, and singleton semantics. Activation of a running process is not fresh pre-execution policy application. Changing its limits is a separate administrative operation, not a side effect of opening a window.
 
 ### 8.2 Terminal applications
 
-An existing terminal application's user service is the simplest initial real-world target. When an application is instead a direct shell child, a test helper can exercise the mechanism, but that does not establish transparent shell integration.
+An existing terminal application's user service is the simplest first real-world target. A test helper can exercise the mechanism for a direct shell child, but that test alone does not establish transparent shell integration.
 
-`systemd-run` provides service, scope, PTY, and pipe modes. These are useful existing mechanisms, not proof that every terminal invocation can be replaced without observable differences. [7]
+`systemd-run` offers service, scope, PTY, and pipe modes, not proof that every terminal invocation can be replaced transparently. [7]
 
-A normal-command integration must separately verify pipelines, job control, terminal ownership, signals, working directory, file descriptors, exit status, and environment. Do not rewrite shell semantics, replace commands globally on `PATH`, or impose a new PTY on all programs as part of this RFC.
+For normal-command integration, verify pipelines, job control, terminal ownership, signals, working directory, file descriptors, exit status, and environment separately. Do not rewrite shell semantics, replace commands globally on `PATH`, or impose a PTY on every program.
 
 ### 8.3 Work submitted to another service
 
-Resource policy follows the execution domain, not the causal chain of user requests. Nix's cgroup integration test, for example, places daemon-managed builders beneath the daemon service rather than the invoking client's user unit. [15]
+Resource policy follows where work runs, not who requested it. Nix's cgroup integration test places daemon-managed builders under the daemon service, not the invoking client's user unit. [15]
 
-A real OpenCode evaluation should therefore distinguish its own process, ordinary descendants, an independently running backend, and builds requested through Nix or another broker. Record which part is governed and which is not; do not infer whole-application containment from the client PID alone.
+Evaluate OpenCode's own process, ordinary descendants, independent backend, and builds requested through Nix or another broker separately. Record what policy covers and what runs outside it; the client PID alone cannot establish whole-application containment.
 
-A broker may have its own aggregate policy. It does not automatically become safe to kill every job in that broker when one client overloads it. Per-request budgeting or context propagation needs a broker-owned design and is deferred. Any Nix daemon-pool cap should remain a separate, explicit experiment, not part of the desktop default.
+A broker may have its own aggregate policy, but one client's overload does not make it safe to kill all jobs in the broker. Defer per-request budgeting and context propagation to a broker-owned design. Keep any Nix daemon-pool cap a separate, explicit experiment, not a desktop default.
 
 ## 9. Diagnostics and prototype shape
 
-Start with the existing service manager's status, configuration, accounting, and journal interfaces. Useful evidence includes unit names and aliases, fragment/drop-in paths, effective limits, cgroup path and ancestry, pressure, and termination result. Read cgroup information when necessary; do not write manager-owned files to reconcile a competing policy model. [6][9]
+Start with manager status, configuration, accounting, and journal interfaces. Useful evidence includes unit names and aliases, fragment/drop-in paths, effective limits, cgroup path and ancestry, pressure, and termination result. Read cgroup data as needed; do not write manager-owned files to enforce competing policy. [6][9]
 
-An optional `amc explain` or `amc inspect` should distinguish requested settings from effective settings, present unavailable information as unknown, and identify known external execution domains. It need not discover arbitrary IPC causality. Do not log complete argument vectors, environment values, API credentials, or command contents by default.
+Optional `amc explain` or `amc inspect` should separate requested from effective settings, mark unavailable information unknown, and identify known external execution domains. Arbitrary IPC causality need not be traced. Do not log complete argument vectors, environment values, API credentials, or command contents by default.
 
-A small Rust test/helper program is acceptable. Rust is an implementation choice, not an upstream requirement. Reuse `systemd-run` for a proof where it meets the needed semantics; use a direct manager API only when it materially simplifies the integration or fixes a measured limitation. Do not build both backends initially.
+A small Rust test/helper is fine; Rust is not an upstream requirement. Use `systemd-run` for the proof if it meets the required semantics. Use a direct manager API only if it materially simplifies integration or fixes a measured limitation. Do not build both initially.
 
-The prototype needs no additional resident policy daemon. This does not mean the operating system has no resident managers, or that testing, PTY forwarding, kernel accounting, and existing monitoring have zero cost. Measure added memory, CPU, launch latency, and dependency cost instead of claiming “zero overhead”.
+The prototype needs no additional resident policy daemon; OS managers still run, and testing, PTY forwarding, kernel accounting, and monitoring still cost resources. Measure added memory, CPU, launch latency, and dependency cost rather than claiming “zero overhead”.
 
 ## 10. Evaluation: separate mechanism, integration, and user benefit
 
 ### 10.1 Begin with a controlled, inexpensive experiment
 
-Use one pinned NixOS configuration, a small disposable VM, and one representative application. A multi-machine hardware survey is not required before the first result. Keep costly VM and stress runs separately invocable from routine formatting, unit tests, and ordinary flake checks.
+Start with one pinned NixOS configuration, one small disposable VM, and one representative application. No multi-machine hardware survey is needed for the first result. Keep costly VM and stress tests separately invocable from routine formatting, unit tests, and ordinary flake checks.
 
-Record kernel and systemd versions, relevant capabilities, VM limits, swap/zram configuration, ancestor policy, and active OOM managers. Preserve host policy; any controlled isolation of an OOM mechanism belongs inside the disposable VM. Avoid unbounded allocation or global swap changes on the working machine. The harness needs finite workloads, a watchdog outside the tested failure domain, cleanup, and a host resource budget.
+Record kernel and systemd versions, relevant capabilities, VM limits, swap/zram settings, ancestor policy, and active OOM managers. Preserve host policy: isolate OOM mechanisms only in the disposable VM. Avoid unbounded allocation or global swap changes on the working machine. Require finite workloads, a watchdog outside the tested failure domain, cleanup, and a host resource budget.
 
 ### 10.2 Compare against the correct baselines
 
-Compare **A**, the unchanged launch path; **B**, an equivalent native unit or direct `systemd-run` invocation with explicit settings; and **C**, the proposed integration applying the same settings. Test additional high/max or existing pressure-policy configurations separately rather than changing multiple variables and attributing the result to the helper.
+Compare **A**, unchanged launches; **B**, an equivalent native unit or direct `systemd-run` with explicit settings; and **C**, the integration applying those same settings. Test additional high/max or existing pressure-policy settings separately so effects of other changes are not attributed to the helper.
 
-B establishes what existing mechanisms already achieve. C is justified only by easier normal launching, correct coverage, clearer diagnostics, or a specific compatibility fix—not by claiming to invent B's enforcement.
+B shows what already works. Justify C only through easier normal launches, correct coverage, clearer diagnostics, or a specific compatibility fix, not by claiming B's enforcement as new.
 
 ### 10.3 Required evidence
 
@@ -225,25 +225,25 @@ B establishes what existing mechanisms already achieve. C is justified only by e
 | Are limitations visible? | Missing capability and brokered-work cases fail or report reduced coverage without a false success claim. |
 | Is the user experience better? | Repeated latency measurements in an unrelated interactive workload, task completion/throughput, and lost-work or unnecessary-termination counts. |
 
-Use realistic touched working sets, not only virtually reserved address space or a tiny heartbeat. A heartbeat can detect gross scheduling stalls but cannot establish compositor or OpenCode responsiveness. PSI complements application measurements rather than replacing them. [1]
+Use realistic touched working sets, not just virtual reservations or a tiny heartbeat. A heartbeat can detect gross scheduling stalls but cannot establish compositor or OpenCode responsiveness. PSI complements but cannot replace application measurements. [1]
 
-Record raw observations, repetitions, relevant percentiles and worst observed pauses, and the tested workload sizes. Predetermine experiment-specific acceptance thresholds and publish them; do not promote a threshold into a system-wide guarantee or tune it after seeing the results to obtain a pass.
+Record raw observations, repetitions, relevant percentiles, worst observed pauses, and tested workload sizes. Set experiment-specific acceptance thresholds in advance and publish them. Do not treat them as system-wide guarantees or tune them after seeing results to get a pass.
 
 ### 10.4 Capture evidence before cleanup
 
-Transient units and their cgroups may be removed after termination. Omitting `--collect` does not guarantee retention of every cgroup counter, and normal successful units may still be collected. Capture required state while available and preserve journal evidence before cleanup. [7][9]
+Transient units and cgroups can disappear after termination. Omitting `--collect` does not guarantee retention of every counter; successful units can still be collected. Capture required state while available and preserve journal evidence before cleanup. [7][9]
 
-A killed workload is not, by itself, a successful user-experience test. Nor is the absence of global OOM sufficient if useful work is repeatedly discarded. Report mechanism conformance, launch compatibility, measured responsiveness, and resource efficiency as separate results.
+Killing a workload does not prove a better user experience. Avoiding global OOM is not enough if useful work is repeatedly lost. Report mechanism conformance, launch compatibility, measured responsiveness, and resource efficiency separately.
 
 ## 11. Incremental upstream path
 
-**First submission:** a focused discussion and, where useful, a documentation/test patch describing an actual supported launch path, its policy precedence, and observed gaps. No new public API is needed to begin this work.
+**First submission:** a focused discussion and, where useful, a documentation/test patch on a supported launch path, policy precedence, and observed gaps. Starting this work requires no new public API.
 
-**Integration fixes:** send small patches to the component that owns the defect—application service, launcher, service manager, or distribution configuration. Each should include a reproducer and a regression test. Keep default-policy experiments opt-in until normal workload regressions are understood.
+**Integration fixes:** send small patches with a reproducer and regression test to the owner: application service, launcher, manager, or distribution configuration. Keep default-policy experiments opt-in until normal workload regressions are understood.
 
-**Additional metadata or APIs:** propose one only after independent consumers demonstrate the same unmet requirement. Specify the owner, lifecycle, authorization, versioning, and fallback behavior. Do not reserve a future portal or require all launchers to adopt a common library in advance.
+**Additional metadata or APIs:** propose one only when independent consumers show the same unmet need. Specify owner, lifecycle, authorization, versioning, and fallback. Do not reserve a portal or mandate a common launcher library in advance.
 
-For systemd, use its contribution guidance: concrete reproduction and versions for bugs/RFEs, tested changes, and the receiving project's coding and compatibility conventions. A Rust helper does not obligate another project to accept Rust dependencies or its configuration model. [16]
+Follow systemd contribution guidance: concrete reproduction and versions for bugs/RFEs, tested changes, and the receiving project's coding and compatibility conventions. A Rust helper does not oblige another project to adopt Rust dependencies or its configuration model. [16]
 
 ## 12. Questions for upstream reviewers
 
@@ -251,11 +251,11 @@ For systemd, use its contribution guidance: concrete reproduction and versions f
 2. Where should an identified placement or policy-precedence defect be fixed, and what regression test would demonstrate the fix without changing application semantics?
 3. Is there a demonstrated information gap that requires new application metadata, rather than better use of existing units, pressure handling, or lifecycle ownership?
 
-There is deliberately no request to approve universal memory budgets, a new manifest, automatic restart safety, or a new Linux application resource standard in this revision.
+This revision seeks no approval for universal memory budgets, a new manifest, automatic restart safety, or a new Linux application resource standard.
 
 ## Appendix A. Illustrative hard-limit fixture
 
-The following is a resource/lifecycle fragment for a **disposable test service**, not a complete unit or desktop default:
+This resource/lifecycle fragment is for a **disposable test service**, not a complete unit or desktop default:
 
 ```ini
 [Service]
@@ -266,13 +266,13 @@ OOMPolicy=kill
 Restart=no
 ```
 
-Supply the actual fixture executable through the test's existing launch mechanism. Verify controller availability, effective settings, and ancestor behavior before fault injection. The figures isolate a hard-limit test and are not proposed limits for OpenCode or any other real application.
+Launch the actual fixture executable through the test's existing mechanism. Verify controller availability, effective settings, and ancestor behavior before fault injection. These values isolate hard-limit behavior; they are not proposed limits for OpenCode or other real applications.
 
-Test an independently selected `MemoryHigh=` configuration in a separate run. Do not conclude from this fixture that swap should be disabled globally, that every application should be killed as a group, or that a max-only policy is generally optimal.
+Test independently chosen `MemoryHigh=` settings in a separate run. This fixture does not justify disabling swap globally, killing every application as a group, or preferring max-only policy in general.
 
 ## References
 
-References document existing behavior; recommendations and test requirements in this RFC are proposals. systemd source references below are pinned to inspected commit `9457f81485bfe8e09d45c0376fe02ebce7c15872` where used. That development snapshot is not a minimum runtime requirement. Documentation pages can change; record actual deployed versions in every experiment.
+References document existing behavior; this RFC proposes recommendations and test requirements. The systemd source references below are pinned to inspected commit `9457f81485bfe8e09d45c0376fe02ebce7c15872` where used. That development snapshot sets no minimum runtime. Documentation can change; record deployed versions in every experiment.
 
 1. [Linux Pressure Stall Information](https://docs.kernel.org/accounting/psi.html).
 2. [systemd Desktop Environment Integration](https://systemd.io/DESKTOP_ENVIRONMENTS/).

@@ -15,8 +15,9 @@ Last local run: 2026-09-04T12:35:05Z on `atlas`.
 - Heartbeat p99 delay: 63 us
 - Artifacts: `/data/nvme0/can/canix/projects/repos/owned/amc/proof-artifacts/20260904T123454Z`
 
-The heartbeat survived and no `amc` process remained after cleanup. This proves only
-the bounded local application-cgroup case; it does not attribute Nix daemon builders.
+The heartbeat survived and cleanup left no `amc` process. This proves only the
+bounded local application-cgroup case; it does not attribute Nix daemon
+builders.
 
 ## VM acceptance
 

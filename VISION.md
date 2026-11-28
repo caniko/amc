@@ -1,50 +1,47 @@
 # AMC vision
 
-AMC keeps a Linux workstation usable while memory-hungry work runs on it. It
-does three related things: pass through cooperative memory admission for
-applications that ask for a grant (`amc-runner`), observe systemd
-services and scopes with passive telemetry (`amc-telemetry`, `amc inspect`,
-`amc watch`, `amc report`), and optionally supervise enrolled native backends
-with bounded restart or termination authority. Operators, agent harnesses and
-application authors are the users: the Canix fleet consumes it to keep batch
-analysis and editors alive next to each other.
+AMC keeps Linux workstations usable during memory-hungry work. It passes through
+cooperative memory admission requests for applications (`amc-runner`), passively
+observes systemd services and scopes (`amc-telemetry`, `amc inspect`, `amc watch`,
+`amc report`), and optionally supervises enrolled native backends with bounded
+restart or termination authority. It's for operators, agent harnesses and
+application authors. The Canix fleet uses it to keep batch analysis and editors
+running side by side.
 
 ## Problem
 
-A workstation has one memory budget shared by a foreground session and any
-number of compilers, browsers and batch jobs. Without coordination the kernel
-chooses a victim at the worst moment - usually the editor, the terminal or the
-agent. AMC makes that choice explicit: cooperative workloads reserve capacity
-before they grow, observation stays passive and honest about what it did not
-see, and any intervention is scoped to a named native unit rather than a
-heuristic kill.
+The foreground session shares one memory budget with compilers, browsers and
+batch jobs. Without coordination, the kernel picks a victim at the worst moment,
+usually the editor, terminal or agent. AMC makes that choice explicit: cooperative
+workloads reserve capacity before growing, passive observation reports gaps,
+and interventions target named native units rather than killing by heuristic.
 
 ## Principles
 
-- Observation is passive. `inspect` and `watch` never start, stop, move or
-  reconfigure the target; `doctor` and the fixture tools are explicitly marked
-  as not passive and run only deliberately.
+- Observation is passive: `inspect` and `watch` never start, stop, move or
+  reconfigure the target. `doctor` and fixture tools are marked non-passive;
+  run them only deliberately.
 - Unknown is not zero. Missing, malformed, unreadable or disappeared
-  measurements carry a null value and a reason; completion is earned from
-  verified lifetime continuity, never from matching paths alone.
-- Real applications keep their native lifecycle owner. systemd retains
+  measurements carry null and a reason; completion requires verified lifetime
+  continuity, and matching paths alone never suffice.
+- Real applications keep their native lifecycle owner. Systemd owns
   execution, cgroup placement, hard limits and descendant cleanup; AMC's
   fixture and `run`/`launch` paths are compatibility tools, not a policy
-  standard and not a sandbox.
+  standard or sandbox.
 - Reservations are conservative and non-revocable during a bounded task.
-  Committed weight is added on top of observed usage, and pressure stops new
+  Accounting adds committed weight to observed usage. Pressure stops new
   admission instead of reclaiming memory in use.
 - Authority is enumerated, not implied. Supervision policy version 1 offers
   `restart`, `terminate` and `observe`, and the read-only routes (`status`,
   `replay`) never signal or start anything.
-- An outcome that was not observed is reported as UNKNOWN and requires manual
-  inspection of the recorded identity; there is no blind replay.
+- AMC reports unobserved outcomes as UNKNOWN. Inspect the recorded identity
+  manually; AMC doesn't replay blindly.
 
 ## Scope
 
 - `amc-runner`: embeddable admission for cooperative applications, including
   grants, persistent per-user admission, shared host broker and bounded queues.
-- `amc-admission`: the client and broker contract, deadlines and entry
+- `amc-admission`: client and broker contract, deadlines and entry
   acknowledgment.
 - `amc-telemetry` and the CLI: bounded inspection, finite capture, offline
   reports and diffs for native services and scopes.
@@ -56,7 +53,7 @@ heuristic kill.
 
 ## Non-goals
 
-- A general policy standard, sandbox, or transparent replacement for normal
+- A general policy standard, sandbox or transparent replacement for normal
   launching.
 - Reclaiming memory already in use, whole-daemon caps for the Nix builder, or
   restarting a broker to recover capacity (`nixBuildPool` remains blocked).
@@ -73,7 +70,7 @@ heuristic kill.
 The corrective ledger is the active roadmap: native request-age clocks, bounded
 patient queues, protected small-call pools, advance foreground preparation,
 finite completion lanes, swap-return recovery and supervision replay binding
-landed or are landing, each with a qualification gate. Remaining work is
+have landed or are underway, each with a qualification gate. Remaining work is
 measurement and native evidence before any feature is presented as
 production-ready.
 

@@ -1,44 +1,44 @@
 # Gaming-first workstation use
 
-The objective is a stable, usable foreground gaming session while selected
-background jobs remain bounded and make useful progress under shared resource
-pressure. AMC supplies admission and diagnostics; systemd owns execution and
-cgroups. The consumer selects budgets, priorities, enrolled jobs and deployment.
-Fleetix integration is optional. The game keeps its ordinary launch path.
+Keep foreground gaming stable and usable under shared resource pressure while
+selected background jobs stay within bounds and make useful progress. AMC
+handles admission and diagnostics; systemd owns execution and cgroups. You
+choose budgets, priorities, enrolled jobs and deployment. Fleetix integration
+is optional. Launch the game as usual.
 
 ## Choose the resource domains
 
-Use a native aggregate memory/swap ceiling for each enrolled background pool,
-per-job ceilings, a concurrency bound, and a host safety reserve. Give background
-parents **and** their children lower CPU/I/O weights than the foreground domain.
-Lower leaf weights alone do not lower an equally weighted ancestor's share.
-These are scheduling preferences, not fixed latency guarantees.
+Set a native aggregate memory/swap ceiling for each enrolled background pool,
+per-job ceilings, a concurrency bound and a host safety reserve. Assign lower
+CPU/I/O weights than the foreground domain to background parents **and**
+children. Lower leaf weights alone won't reduce an equally weighted ancestor's
+share. Weights guide scheduling; they don't guarantee fixed latency.
 
-Admission checks live headroom before starting participating jobs. Existing jobs
-keep their grants until confirmed termination. Other users, native application
-backends, daemon builders, inference and remote workers need their own consumer
-budgets and native boundaries. A capped `nix build` client does not cap builders
-owned by the Nix daemon. Budget shares and hard ceilings are not preallocated RAM.
+Admission checks live headroom before starting participating jobs and holds
+existing grants until it confirms termination. Set separate budgets and native
+boundaries for other users, native application backends, daemon builders,
+inference and remote workers. Capping a `nix build` client doesn't cap the Nix
+daemon's builders. Budget shares and hard ceilings don't preallocate RAM.
 
-Useful work can continue at lower priority throughout gaming. Optional maintenance
-may be deferred separately. Setting `pause_file` blocks **new** admissions for
-that contract while the marker exists; it neither frees memory nor stops existing
-jobs. Do not pause every pool when continued useful progress is the selected goal.
+Useful work can run at lower priority throughout gaming. Defer optional
+maintenance separately if needed. Setting `pause_file` blocks **new** admissions
+for that contract while the marker exists; it neither frees memory nor stops
+existing jobs. To keep useful work going, don't pause every pool.
 
 ## Standalone systemd setup
 
-Install the CLI using the [README](../README.md#install-and-first-report). Linux,
-systemd user services and delegated cgroup v2 memory controls are required for
-managed execution. The embeddable gates and offline reports remain independent.
+Install the CLI using the [README](../README.md#install-and-first-report).
+Managed execution requires Linux, systemd user services and delegated cgroup v2
+memory controls. Embeddable gates and offline reports don't depend on this setup.
 
-The checkout supplies [three example units](../examples/systemd/) and a
-[JSON policy](../examples/admission.json). Nix installations also provide these
-under `share/amc/examples` in the package output. This example has a 2 GiB native
+Find [three example units](../examples/systemd/) and a
+[JSON policy](../examples/admission.json) in the checkout or under
+`share/amc/examples` in the Nix package output. The example sets a 2 GiB native
 aggregate ceiling, no swap, a 1 GiB shared admission budget, two concurrent
 512 MiB jobs and a 2 GiB host reserve. **Choose values for your machine and work**;
-the example is a small starting configuration, not a universal workstation policy.
+this small example isn't a universal workstation policy.
 
-The following commands explicitly use Bash, from the checkout:
+Run these commands in Bash from the checkout:
 
 ```bash
 install -d -m 700 "$HOME/.config/amc" "$HOME/.config/systemd/user"
@@ -50,10 +50,10 @@ command -v amc
 ```
 
 The service's `ExecStart` defaults to `%h/.cargo/bin/amc`, the normal Cargo
-installation. For another installation, edit that line in the copied service to
-the absolute executable path printed above. Preserve the arguments and policy
-path. On distributions with systemd outside `/usr/bin`, include its directory in
-the service's `Environment=PATH`; the Nix AMC wrapper supplies its own tools.
+installation. For other installations, set the executable in the copied service
+to the absolute path printed above. Keep the arguments and policy path. If your
+distribution puts systemd outside `/usr/bin`, add its directory to the service's
+`Environment=PATH`; the Nix AMC wrapper supplies its own tools.
 
 ```bash
 systemctl --user daemon-reload
@@ -64,12 +64,13 @@ systemctl --user show amc.slice amc-background.slice \
 ```
 
 Confirm both slices are active with the intended effective limits. `amc inspect`
-additionally reads kernel limits for the actual job service. An unavailable
-controller or unknown native headroom refuses admission rather than bypassing it.
+also reads kernel limits for the actual job service. Managed admission fails
+closed and refuses entry if a controller is unavailable or native headroom is
+unknown.
 
 ## Enroll a finite useful job
 
-For example, archive a selected source directory into a **new** output file:
+For example, archive a source directory to a **new** output file:
 
 ```bash
 amc admission exec --contract background --timeout 120 --runtime-max-sec 300 -- \
@@ -77,21 +78,22 @@ amc admission exec --contract background --timeout 120 --runtime-max-sec 300 -- 
 tar -tf /absolute/new/source.tar
 ```
 
-Replace the paths and verify the output of your actual job. Use distinct output
-paths so a previous artifact cannot be mistaken for completed work.
+Replace the paths and verify your job's output. Use distinct output paths so old
+artifacts can't pass for completed work.
 
-`--timeout` bounds admission waiting (1–3600 seconds). `--runtime-max-sec`
-optionally requests systemd's execution deadline (1–86400 seconds); its stop
-timeout also applies, so it is not an exact wall-clock completion promise.
-The native deadline survives submitting-client and coordinator death. It is
-omitted by default for explicitly enrolled long-lived services. SIGINT/SIGTERM
-requests cancellation of this client's owned job and its descendants.
+`--timeout` bounds admission waiting (1–3600 seconds). `--runtime-max-sec` can
+request a systemd execution deadline (1–86400 seconds). Systemd's stop timeout
+still applies, so the deadline doesn't promise exact wall-clock completion.
+The native deadline survives the submitting client and coordinator dying. AMC
+omits the request by default for explicitly enrolled long-lived services.
+SIGINT/SIGTERM requests cancellation of this client's owned job and its
+descendants.
 
-While work is queued, `amc admission status` shows the reason: concurrency,
+`amc admission status` explains queued work: concurrency,
 budget, shared/slice headroom, pause, FIFO order or unavailable native evidence.
-Entered jobs remain charged until native termination is confirmed. A timeout,
-client death or missing socket is not permission to delete the ledger or replay
-an uncertain command. See [persistent admission](persistent-admission.md).
+Entered jobs stay charged until confirmed native termination. A timeout, client
+death or missing socket does not by itself authorize deleting the ledger or
+replaying an uncertain command. See [persistent admission](persistent-admission.md).
 
 ## Upgrade, disable and remove
 
@@ -100,8 +102,8 @@ policy, restart `amc-admission.service`, and inspect status. Entered work retain
 its old contract until termination; queued/unentered requests are invalidated.
 For Home Manager use the [module lifecycle](persistent-admission.md#installation-and-removal).
 
-For a standalone installation, stop enrolling new work and let entered jobs
-finish, or cancel their exact owned invocations. Require zero commitments and no
+For standalone installs, stop enrolling new work. Let entered jobs finish or
+cancel their exact owned invocations. Require zero commitments and no
 unreconciled entries before disabling the service:
 
 ```bash
@@ -109,34 +111,33 @@ amc admission status --json
 systemctl --user disable --now amc-admission.service
 ```
 
-To remove it, remove the three unit files copied above, run `daemon-reload`, and
-stop the now-unused `amc-background.slice` and `amc.slice`. Remove the policy and
-CLI through their original installation path. Preserve the ledger until all
-recorded workloads are confirmed terminated. Disabling the coordinator refuses
-new managed starts; it does not remove limits from existing native jobs.
+To uninstall, remove the three unit files copied above, run `daemon-reload`,
+then stop the unused `amc-background.slice` and `amc.slice`. Remove the policy
+and CLI through their original installation path. Keep the ledger until you
+confirm all recorded workloads have terminated. Disabling the coordinator blocks
+new managed starts without lifting limits on existing native jobs.
 
 ## Operational acceptance
 
-A usable profile has a short functional acceptance path:
-
 1. Start the ordinary foreground session and one intended useful background job.
    Inspect its actual unit, ancestry and limits; verify its output.
-2. Offer more work than the configured capacity. Check that excess work queues
-   with a reason or times out clearly, and drains when capacity returns.
+2. Submit more work than configured capacity allows. Check that excess work
+   queues with a reason or times out clearly, and that the queue drains when
+   capacity returns.
 3. Check foreground exit and interrupted hooks restore the intended maintenance
    policy without leaving a stale freeze or pause marker.
 4. Check cancellation, a bounded-job failure, coordinator restart and subsequent
    work. Unknown identities stay accounted for until reconciled.
 5. Check installation, upgrade, disable and removal for the shipped module.
 
-The explicit native fixtures `tests/admission-systemd.py` and
-`tests/admission-install-systemd.py` exercise these lifecycle mechanisms with
-small isolated jobs. The latter installs uniquely named copies of the shipped
-units and preserves its logs and ledger in a new `--output` directory.
-Its policy-upgrade check retains the old entered reservation across restart and
-verifies that subsequent useful work receives the new kernel memory ceiling.
-The two-user admission VM invokes both fixtures.
+The two-user admission VM runs both explicit native fixtures:
+`tests/admission-systemd.py` and `tests/admission-install-systemd.py`. They test
+these lifecycle mechanisms with small isolated jobs. The latter installs
+uniquely named copies of the shipped units and keeps its logs and ledger in a new
+`--output` directory. Its policy-upgrade check retains the old entered
+reservation across restart and verifies that subsequent useful work receives
+the new kernel memory ceiling.
 
-Comparative frame-time results are optional diagnostics. The
-[CS2 guide](gaming-comparison.md) retains recording and measurement instructions
-for users who want them; they are not prerequisites for this operational profile.
+Comparative frame-time results are optional diagnostics, not prerequisites for
+this profile. The [CS2 guide](gaming-comparison.md) explains how to record and
+measure them.

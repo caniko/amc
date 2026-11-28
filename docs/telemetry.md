@@ -1,47 +1,44 @@
 # AMC Telemetry
 
-Shared core: `crates/amc-telemetry` (bounded readers including pinned
-multi-sample handles, strict digits-only parsers, identity, comparison).
-Used by `amc inspect`, `amc watch`/`amc diff`, and the `amc-runner`
-cgroup provider (strict current/cache parsing). No systemd transport,
-Tokio runtime, subscribers, or exporters in the core. No `unsafe`.
+`amc inspect`, `amc watch`/`amc diff`, and the `amc-runner` cgroup provider
+(strict current/cache parsing) share `crates/amc-telemetry`: bounded readers
+with pinned multi-sample handles, strict digits-only parsers, identity, and
+comparison. No systemd transport, Tokio runtime, subscribers, exporters, or
+`unsafe` in the core.
 
 ## What each surface answers
 
 - `amc inspect UNIT`: manager-reported settings (`systemctl show`
   allowlist) vs kernel observations (leaf through visible root) vs
   requested policy (always `unknown`: TOML is not effective policy).
-- `amc watch UNIT --seconds N --interval-ms M --output DIR`: finite
-  read-only observation of one unit. Writes `samples.jsonl`,
-  versioned `summary.json` (atomic; `complete` earned, see below),
-  `manifest.json` (real `systemctl --version`, not a resolver probe),
-  `ready` (only after a persisted valid baseline), `done` (only after the
-  summary persists). Handles SIGINT/SIGTERM with an explicit `cancelled`
-  reason; an unhandled kill leaves no summary, which is itself
-  recognizable as incomplete.
+- `amc watch UNIT --seconds N --interval-ms M --output DIR`: finite, read-only
+  observation of one unit. Writes `samples.jsonl`, versioned atomic
+  `summary.json` (`complete` requires checks below), `manifest.json` (real
+  `systemctl --version`, not a resolver probe), `ready` after persisting a valid
+  baseline, and `done` after persisting the summary. SIGINT/SIGTERM records
+  `cancelled`; an unhandled kill leaves no summary and thus incomplete evidence.
 - `amc diff BEFORE AFTER`: offline comparison of two Snapshot files with
-  per-field supported/unsupported outcomes. Inputs are size-checked
-  before reading; identity comes only from fields the files carry.
+  per-field supported/unsupported outcomes. Inputs are size-checked before
+  reading; only file fields establish identity.
 - `amc report CAPTURE_DIR [--json]`: offline validation and summary of one
-  watch capture. Markdown is the default; JSON includes coverage, suppressed
-  metrics, and collection integrity. Requires Python 3.11+ at runtime;
-  the Nix package supplies it. Malformed artifacts exit 2, while structurally
-  valid but incomplete captures remain explicitly incomplete in the report.
-  It reuses `scripts/validate-capture.py` rather than independently parsing
-  sample lifetimes. It never queries or changes the target.
+  watch capture. Markdown by default; JSON includes coverage, suppressed
+  metrics, and collection integrity. Requires Python 3.11+ at runtime (supplied
+  by the Nix package). Malformed artifacts exit 2; structurally valid but
+  incomplete captures are reported as incomplete. Reuses `scripts/validate-capture.py`
+  for sample lifetimes and never queries or changes the target.
 - `amc-runner` diagnostics: structured `tracing` events with stable names
   (`amc.admission.*`) and reason codes, plus `diagnostics()` snapshots
-  with real timeout/waiter/transition counters. The library never
-  installs a subscriber; see
+  with real timeout/waiter/transition counters. The library installs no
+  subscriber; see
   `crates/amc-runner/examples/admission-diagnostics.rs`.
 
 ## Production capture
 
-Production observation is opt-in and passive. It uses the same identity-aware
-collector and never starts, stops, freezes, moves, or changes the target.
-Select the actual native service/scope that owns the work, not an activation
-client or an assumed universal Steam unit. The output directory must be new,
-its parent must exist, and symlink parents are rejected.
+Production observation is opt-in and passive: the same identity-aware
+collector never starts, stops, freezes, moves, or changes the target.
+Select the native service/scope that owns the work, not an activation client
+or assumed universal Steam unit. The output directory must be new and its parent
+must exist; the collector rejects symlink parents.
 
 ```sh
 # Run alongside normal work; this command does not start the workload.
@@ -57,98 +54,94 @@ jq -c '{time: .host.observedUnixMs, available: .host.files["meminfo.MemAvailable
   /tmp/amc-session-02/samples.jsonl
 ```
 
-Replace the illustrative unit with the discovered owner. Choose the actual
-output location deliberately; local logs still contain unit/cgroup identifiers,
-timestamps, boot identity, and aggregate resource activity. Nothing is uploaded.
-No special privileges are granted; inaccessible measurements remain unknown.
+Replace the example unit with the discovered owner. Choose the output location
+deliberately: logs contain unit/cgroup identifiers, timestamps, boot identity,
+and aggregate resource activity. Nothing uploads. The observer grants no special
+privileges; inaccessible measurements stay unknown.
 
 | Mode | Default | Allowed duration / interval | Sample storage ceiling |
 |---|---|---|---|
 | Ordinary `watch` | 40 seconds / 20 ms | 1-60 seconds / 10-1000 ms | 5000 samples, 8 MiB |
 | `watch --production` | 1800 seconds / 1000 ms | 1-86400 seconds / 1000-60000 ms | 86,400 samples, 256 MiB |
 
-Duration, sample count, and bytes are independent limits. Reaching a storage
-limit ends collection with an explicit incomplete reason; there is no rotation,
-automatic deletion, or silent overwrite. The byte ceiling covers `samples.jsonl`;
-bounded manifest/summary/marker files add a small amount. It is not a disk-space
-reservation. Longer duration does not guarantee that the byte cap will suffice.
+Duration, sample count, and bytes are independent limits. Hitting a storage
+limit ends collection with an explicit incomplete reason: no rotation,
+automatic deletion, or silent overwrite. The byte cap covers `samples.jsonl`;
+bounded manifest/summary/marker files add a little. It reserves no disk space
+and may not suffice for longer runs.
 
-Ctrl-C or SIGTERM stops the observer only, persists the readable prefix when
-possible, and records `cancelled`/`complete:false`. Sleeps check cancellation at
-most every 100 ms and never sleep past the sampling deadline. Manager queries
-still have their existing timeout/grace bounds; arbitrary blocked kernel I/O
-cannot be given a hard cancellation deadline. SIGKILL can leave no summary.
-No policy rollback is needed because observation changes no policy.
+Ctrl-C or SIGTERM stops only the observer, saves the readable prefix if
+possible, and records `cancelled`/`complete:false`. Sleep checks cancellation
+at most every 100 ms and never passes the sampling deadline. Manager queries
+keep their timeout/grace bounds; arbitrary blocked kernel I/O has no hard
+cancellation deadline. SIGKILL can leave no summary. No policy changes or
+rollback.
 
-Production samples are flushed to the OS on each tick for live readers. `ready`
-still requires a synced valid target baseline; sample durability is claimed only
-after the final flush/sync succeeds. A flush is not a crash-durability guarantee.
-The process exits when this target disappears or changes lifetime; it does not
-follow restarts or collect an unbounded series of sessions. Missing `done` or
-summary is incomplete evidence. Exit zero alone is not a completeness check.
+Each tick flushes production samples to the OS for live readers. `ready`
+requires a synced valid target baseline; claim sample durability only after the
+final flush/sync succeeds, not a flush alone. The process exits on target
+disappearance or lifetime change: no following restarts or collecting unbounded
+sessions. Missing `done` or summary means incomplete evidence, even with exit
+zero.
 
 ### Host context
 
-Production sample lines add `host`, with its own wall-clock and observer-relative
-monotonic capture-start timestamps and a map of `{value, unknown}` measurements:
+Production adds `host` per sample: its own wall-clock and observer-relative
+monotonic capture-start timestamps, plus a map of `{value, unknown}` measurements:
 
 - `meminfo.MemTotal`, `MemAvailable`, `SwapTotal`, `SwapFree`, `Buffers`, `Cached`,
-  `Dirty`, and `Writeback` (each key has the `meminfo.` prefix): **bytes**, converted
-  from procfs `kB` with checked multiplication by 1024.
+  `Dirty`, and `Writeback` (all prefixed `meminfo.`): **bytes** from procfs `kB`
+  via checked multiplication by 1024.
 - `vmstat.pswpin` and `vmstat.pswpout`: cumulative **pages**, not bytes.
-  `vmstat.pgmajfault`: cumulative major-fault count. These are not per-interval
-  deltas and must not be attributed to the target unit.
+  `vmstat.pgmajfault`: cumulative major faults. None of these counters is a
+  per-interval delta or attributable to the target unit.
 - `pressure.memory`, `pressure.cpu`, and `pressure.io`: PSI averages in percent
-  and cumulative `total` in microseconds. Older CPU PSI may omit `full`; an absent
-  row stays absent, never zero. System-level CPU `full` is not an application
-  responsiveness metric.
+  and cumulative `total` in microseconds. Older CPU PSI may omit `full`;
+  absent stays absent, never zero. System-level CPU `full` does not measure
+  application responsiveness.
 
 The module allowlists fields, rejects duplicate keys and invalid units/numbers,
-bounds meminfo/vmstat input to 64 KiB each and pressure files to 4 KiB each, and
-never emits malformed input or unrelated fields. Missing fields are individually
-unknown. Existing strict memory/IO PSI parsing is not relaxed for older CPU PSI.
-There are no process listings, argv, environment, device identifiers, or journal
-messages in this host context.
+and caps meminfo/vmstat input at 64 KiB each and pressure files at 4 KiB each.
+It emits neither malformed input nor unrelated fields. Each missing field is
+unknown. Older CPU PSI does not relax strict memory/IO PSI parsing. No process
+listings, argv, environment, device identifiers, or journal messages.
 
-`host` means the observer's `/proc` view, which may be restricted or virtualized.
-It is not a promise of full machine visibility and is not the target's cgroup
-budget. Measurements are sequential, not atomic. `complete` continues to describe
-target collection; it does not certify every host metric as present. Inspect
-each measurement's unknown reason. `amc diff` still compares the target snapshot,
-not these aggregate host values.
+`host` is the observer's potentially restricted or virtualized `/proc` view,
+not necessarily the whole machine and not the target's cgroup budget. Reads
+are sequential, not atomic. `complete` describes target collection, not host
+metric presence. Check each unknown reason. `amc diff` compares target
+snapshots, not host aggregates.
 
 ### Timing and interpretation
 
-Every sample adds `captureDurationUs` (wall time for target/optional host reads,
+Samples add `captureDurationUs` (wall time for target/optional host reads,
 not total observer CPU time) and `scheduleLagMs`. Summary `collection` adds
-`bytesWritten`, `missedIntervals`, and `maxCaptureDurationUs`. Missed scheduling
-slots are skipped rather than collected in bursts. Manager identity checks run
-at most once per second and only at sample ticks; a 60-second sample interval
-can therefore also delay restart detection. The pinned-reader and final-query
-guards still prevent claiming continuity from a matching pathname alone.
+`bytesWritten`, `missedIntervals`, and `maxCaptureDurationUs`. Skip missed
+slots rather than sampling in bursts. Manager identity checks run only at
+ticks, at most once per second; a 60-second interval can delay restart detection.
+Pinned-reader and final-query guards prevent pathname matches alone from
+establishing continuity.
 
 Manifest fields `production`, `maxSamples`, `maxOutputBytes`, and `hostScope`
-record the selected collection contract. Existing defaults and field meanings
-are retained; additions do not select a memory priority profile. Multiple unit
-observers are separate captures with separate budgets/host reads. Do not equate
-their relative monotonic timestamps: each starts at zero independently. Retain
-wall-clock timestamps and boot IDs, and account for clock adjustments and sample
-duration when correlating captures.
+record collection settings without changing defaults or field meanings, and
+select no memory priority profile. Unit observers capture separately, with their
+own budgets/host reads and relative monotonic clocks starting at zero; do not
+equate relative timestamps across observers. Correlate using retained wall-clock
+timestamps and boot IDs; account for clock adjustments and sample duration.
 
-For gaming, record frame times separately using an existing tool such as
-MangoHud and retain its clock/logging configuration. AMC does not measure frame
-times, VRAM, background useful-work completion, or causality. Capture game,
-driver, kernel, swap/zram, effective ancestry, and binary/source identity with
-the experiment record. Low PSI is not proof of good frame times; a frame stall
-is not proof that memory caused it. This mode enables observation, not a validated
-A/B/C experiment or a claim of low overhead on every workstation.
+For gaming, record frame times separately (e.g. with MangoHud) and keep its
+clock/logging configuration. AMC measures neither frame times, VRAM, background
+useful-work completion, nor causality. Record game, driver, kernel, swap/zram,
+effective ancestry, and binary/source identity. Low PSI does not prove good
+frame times; a stall does not prove memory caused it. Observation alone is
+not a validated A/B/C experiment or proof of low overhead on every workstation.
 
 ### Accounted observation
 
-`scripts/capture-accounted.py` is a stdlib-only Python 3.11+ pilot runner. It
-starts only an observer in a uniquely named transient **user** service. The
-target must already exist; its placement, limits, swap, and OOM policy are not
-changed. Use a validated release build before capturing normal work:
+`scripts/capture-accounted.py`, a stdlib-only Python 3.11+ pilot runner, starts
+only an observer in a uniquely named transient **user** service. The target
+must exist; its placement, limits, swap, and OOM policy stay unchanged. Use a
+validated release build to capture normal work:
 
 ```sh
 python3 scripts/capture-accounted.py actual-workload.scope \
@@ -157,9 +150,9 @@ python3 scripts/validate-capture.py /tmp/amc-accounted-01/capture --markdown
 ```
 
 `--system` selects a system-manager **target**, not a privileged observer.
-The output parent must exist, the session directory must be new, and its
-filesystem must permit executing the binary copy. The runner makes a private
-0700 directory, copies/checksums the binary, and writes 0600 JSON records:
+Use a new session directory under an existing parent on a filesystem that
+can execute the binary copy. The runner creates a private 0700 directory,
+copies/checksums the binary, and writes 0600 JSON records:
 
 - `session.json`: observer name, target manager/unit, requested sampling,
   binary SHA-256, and accounting scope.
@@ -168,192 +161,174 @@ filesystem must permit executing the binary copy. The runner makes a private
   process start/exit timestamps, and manager result.
 - `cleanup.json`: successful stop of the observer after durable accounting export.
 
-The observer uses native CPU/memory/IO accounting and `RemainAfterExit=yes`.
-The runner does **not** use immediate `--collect`: it reads the retained final
-counters, flushes and syncs the export, then stops its own unit. An invocation
-change observed during polling aborts control. Do not independently restart or
-replace the observer unit while a capture is running.
+The runner configures the observer with native CPU/memory/IO accounting and
+`RemainAfterExit=yes` rather than immediate `--collect`. The runner reads
+retained final counters, flushes and syncs the export, then stops its own unit.
+An invocation change during polling aborts control. Do not restart or replace
+the observer during capture.
 
-CPU time is nanoseconds, peak memory is bytes, and IO fields are block-IO bytes
-or operation counts. A missing field, unsupported counter, or systemd's
-`UINT64_MAX` sentinel becomes `value:null` with `unknown:unavailable`; zero stays
-known. IO byte counts are not JSON file lengths. Start/exit timestamps use
-systemd's monotonic microsecond clock, not the capture's relative millisecond
-clock. Final counters can remain available after `ControlGroup` becomes empty.
+CPU time is in nanoseconds, peak memory in bytes, and IO in block-IO bytes
+(not JSON file lengths) or operation counts. Missing fields, unsupported
+counters, and systemd's `UINT64_MAX` become `value:null` with
+`unknown:unavailable`; zero stays known. Start/exit timestamps use systemd's
+monotonic microseconds, not capture-relative milliseconds. Final counters
+can outlast `ControlGroup` becoming empty.
 
-The accounting boundary includes the observer and its child query processes.
-It excludes the outer Python launcher, the service manager, and other services
-performing work on their behalf. It is not a measurement of total host overhead
-caused by observation, nor proof of no frame-time impact. The copied executable
-and session metadata remain local; review them before sharing an artifact bundle.
+Accounting covers the observer and its child queries, not the outer Python
+launcher, service manager, or other services working on their behalf. It
+neither measures total host overhead caused by observation nor rules out
+frame-time impact. The copied executable and session metadata remain local;
+review them before sharing artifacts.
 
-Ctrl-C/SIGTERM asks only the observer's main process to finish via SIGINT, then
-exports its retained counters before cleanup. A manager runtime limit bounds
-the running observer to the requested duration plus 60 seconds, with a 10-second
-stop timeout. Each manager command has a 20-second timeout. Ambiguous submission,
-identity, timeout, or export failures do not trigger resubmission or blind
-cleanup. Inspect `session.json` and the named unit; a failed export may leave a
-partial JSON file and a retained unit that needs manual recovery. Do not assume
-an accounting export is present merely because the observer has exited.
+On Ctrl-C/SIGTERM, the runner sends SIGINT only to the observer's main process
+and exports retained counters before cleanup. The manager bounds the running
+observer to the requested duration plus 60 seconds, with a 10-second stop
+timeout. Each manager command has a 20-second timeout. Ambiguous submission, identity,
+timeout, or export failures trigger neither resubmission nor blind cleanup.
+Inspect `session.json` and the named unit: a failed export can leave partial
+JSON and a retained unit needing manual recovery. Observer exit does not
+imply export.
 
-The runner's successful exit means its process/accounting lifecycle completed;
-check the capture's own completeness separately with the validator. Long-session
-overhead and broad distribution/version compatibility remain unvalidated.
+Runner success confirms its process/accounting lifecycle only; validate
+capture completeness separately. Long-session overhead and broad
+distribution/version compatibility remain unvalidated.
 
 ## Classification and comparison
 
-- `memory.events*`: counters with scope; deltas require compatible
-  identity/lifetime and monotonic counters (decrease → explicit reason).
-- `cgroup.events`: state transitions (`populated`/`frozen`), never
-  blanket-differenced.
-- Usage/limits: sampled gauges (before/after with timing, never budget
-  accounting).
-- `memory.peak*`: kernel high-water marks; interval peak is not
-  `after - before`. Sampled maxima (`maxObservedSwap`,
-  `maxObservedCurrent`) are reported separately.
-- `memory.pressure`: reported avg10/60/300 retained; interval stall
-  fractions (`pressureStall.some/full`) derive from `total`
-  microseconds over valid elapsed microseconds, strict: a delta larger
-  than the elapsed interval is `incompatible-clocks`, never clamped.
+- `memory.events*`: scoped counters. Deltas require compatible
+  identity/lifetime and monotonic counters; decreases get an explicit reason.
+- `cgroup.events`: state transitions (`populated`/`frozen`), no blanket deltas.
+- Usage/limits: sampled gauges (timed before/after, not budget accounting).
+- `memory.peak*`: kernel high-water marks. An interval peak is not
+  `after - before`; sampled maxima (`maxObservedSwap`, `maxObservedCurrent`)
+  are separate.
+- `memory.pressure`: retain reported avg10/60/300. Interval stall fractions
+  (`pressureStall.some/full`) divide the `total` delta by valid elapsed
+  microseconds (both in microseconds). A delta larger than elapsed time is
+  `incompatible-clocks`, never clamped.
 
-Identity: observation ID names a session, not a workload. A `Compatible`
-verdict requires positive continuity evidence — equal invocation IDs on
-both sides **and** no contradictory inode (a recycled path under a stale
-ID is `replacement-suspected`, never one lifetime). A reboot ends the
-lifetime even with agreeing IDs. Path match alone is never sufficient;
-one-sided or missing invocation evidence compares as
-`missing-identity`; boot/manager-context/UID disagreement is
+An observation ID names a session, not a workload. `Compatible` requires
+positive continuity evidence: equal invocation IDs **and** no contradictory
+inode. A recycled path under a stale ID is `replacement-suspected`, not
+one lifetime; reboot ends the lifetime even with equal IDs. A path match
+alone never suffices. One-sided or missing invocation evidence gives
+`missing-identity`; boot/manager-context/UID disagreement gives
 `context-mismatch` or `restart-detected`. Snapshots carry
-`invocationId`/`bootId`/`inode` when the collector verified them; files
-without them are never differenced by path. Overlong identities are
-rejected, never truncated into a possible collision. `InvocationID`
-is collected when the manager reports it; `boot_id` is best-effort.
+`invocationId`/`bootId`/`inode` only when the collector verified them; never
+diff files by path in their absence. Reject overlong identities rather than
+risk collisions by truncating them. Collect `InvocationID` if the manager
+reports it; `boot_id` is best-effort.
 
 ## Completion and coverage (watch)
 
-`complete` is earned: valid baseline, persisted outputs, and a clean
-terminal state (`deadline` or `disappeared-or-empty`). Anything else —
+`complete` requires a valid baseline, persisted outputs, and a clean terminal
+state (`deadline` or `disappeared-or-empty`). All other exits—including
 missing baseline (`observer-not-ready`), restart (`invocation-changed`),
-same-path replacement (`replacement-suspected`), output-budget or
-sample-budget exhaustion, write failure, cancellation — is incomplete
-evidence with explicit `coverage` flags (`attachedLate` for passive
-attachment after workload start, `baselineDelayed` when the baseline
-arrived after the first tick, `finalCountersUnavailable`,
-`incompletePersistence`) and a `deltaUnsupportedReason` instead of a
-dressed-up number. A last-readable delta never masquerades as lifetime
-accounting. Termination result and endpoint identity come from an
-independent final leaf query; unavailable final results remain unknown,
-so a restart in the final gap rewrites `deadline` rather than producing
-cross-lifetime deltas. When the pathname disappears, a verified readable
-prefix from the held object is still reported (with
-`finalCountersUnavailable` set), but positive evidence of a different
-lifetime — restart, replacement, or context mismatch — always wins over
-the disappearance. Each derived field uses its own capture time:
-stale counters and PSI totals are never divided by a newer tick's
-clock, and stall fractions additionally require a compatible lifetime.
-Readiness (`ready`) is published only after the baseline sample itself
-is flushed and synced. The observer opens metric files relative to a held
-directory handle through Linux `/proc/self/fd`, including files that
-were initially unavailable, then reads through pinned file descriptions
-(a check-to-read race can only serve the original object), checks inode
-continuity every tick, polls the manager at most once per second with a
-leaf-only query bounded by the remaining sampling budget (never the
-full ancestor traversal), and never touches the target on cleanup.
-`samples.jsonl` carries the shared Snapshot envelope, so `amc diff`
-consumes watch output directly; diff inputs are byte-limited while
-reading, not via metadata size.
+same-path replacement (`replacement-suspected`), exhausted output or sample
+budget, write failure, and cancellation—are incomplete, with explicit
+`coverage` flags (`attachedLate` for passive attachment after workload start,
+`baselineDelayed` for a baseline after the first tick,
+`finalCountersUnavailable`, and `incompletePersistence`) and
+`deltaUnsupportedReason` instead of an unsupported number; a last-readable
+delta is not lifetime accounting.
 
-`eventDeltaCoverage` describes the baseline-to-last-readable interval,
-including its elapsed endpoints and whether final counters were available.
-A vanished pathname does not erase already captured counters from the
-held object: a supported prefix may remain while final coverage is unknown.
-`complete` describes collection completion, not full workload accounting;
+An independent final leaf query supplies termination result and endpoint
+identity. Unavailable results stay unknown; a restart in the final gap
+rewrites `deadline` instead of producing cross-lifetime deltas. If the path
+vanishes, the observer still reports any verified readable prefix from the held
+object (with `finalCountersUnavailable`), but positive evidence of restart,
+replacement, or context mismatch overrides disappearance. Each derived field
+uses its own capture time, never a newer tick's clock for stale counters or PSI
+totals. Stall fractions also need a compatible lifetime.
+
+Publish `ready` only after flushing and syncing the baseline sample. The
+observer opens metric files, including initially unavailable ones, relative
+to a held directory handle via Linux `/proc/self/fd`. Pinned file descriptions
+ensure a check-to-read race can only read the original object. It checks inode
+continuity each tick and polls the manager at most once per second, using a
+leaf-only query bounded by the remaining sampling budget (no ancestor
+traversal). Cleanup never touches the target. `samples.jsonl` uses the shared
+Snapshot envelope: `amc diff` reads watch output directly and byte-limits
+inputs while reading rather than by metadata size.
+
+`eventDeltaCoverage` gives the baseline-to-last-readable interval, its elapsed
+endpoints, and final counter availability. A vanished path does not erase
+captured counters: a supported prefix can survive unknown final coverage.
+`complete` means collection completion, not full workload accounting.
 `eventDeltaCoverage.lifetimeComplete` is always false for passive attachment.
-Loaded JSON is checked for supported schema, bounded nonempty identities,
-measurement coherence and metric shape before comparison.
+`amc diff` checks loaded JSON before comparison for supported schema, bounded
+nonempty identities, coherent measurements, and metric shape.
 
-`amc report` preserves these distinctions in both output formats. JSON exposes
-`metrics.targetCoverage` (`knownPoints`/`totalPoints`) alongside
-`targetSampledMax`: a maximum uses known readings only, and an absent maximum
-is unavailable rather than zero. Markdown shows the sample counts and flags
-partial coverage. Collection flags, missed intervals, durability, and the
-summary-reported event interval and delta limitation are also visible. Event
-endpoints are normalized from the producer's flat or nested representation;
-conflicting endpoints are rejected. Valid Unicode stays readable; escaped lone
-surrogates are rendered as literal escapes so a report remains valid UTF-8.
+Both `amc report` formats preserve these distinctions. JSON pairs
+`metrics.targetCoverage` (`knownPoints`/`totalPoints`) with `targetSampledMax`,
+which uses only known readings; absence means unavailable, not zero.
+Markdown shows sample counts and flags partial coverage. The report also
+shows collection flags, missed intervals, durability, and the summary's
+event interval and delta limitation. It normalizes flat or nested producer
+endpoints and rejects conflicts. Valid Unicode stays readable; escaped lone
+surrogates render as literal escapes to keep the report valid UTF-8.
 
-The summary path is structural, not string-driven. The collection loop
-records a `LoopOutcome` at each exit site; the terminal verdict combines
-it with the independent endpoint comparability (`Intact`, `Restarted`,
-`Replaced`, `Disappeared`, `EndpointUnknown`) without consulting reason
-strings. Prefix deltas derive from the freshest map for intact,
-disappeared, or unconfirmed endpoints, and from the verified pre-change
-snapshot (last successful invocation poll) once a restart or replacement
-is known — post-change ticks still carry old labels until the next poll,
-so they never feed a delta. Each derived quantity carries its own start
-and end marks (elapsed time and sample sequence); `pressureStallCoverage`
-mirrors the counter coverage. A failed final query yields the additive
-`endpoint-query-failed` reason: collection finished, confirmation did
-not. `collection` tracks attempted samples separately from buffered
-(`persistedSamples`) and synced (`storageDurable`) ones; last-readable
-values keep their own per-field capture marks and never acquire the
-newer tick's timestamp. Final counters are available only with an
-intact terminal, a live endpoint, readable last-persisted counters,
-and durable persistence — a stale previously-persisted value after a
-failed final write stays unavailable. If the `done`
-marker itself fails, the summary is repaired to incomplete and the
-original error is returned; a missing `done` is incomplete evidence,
-never success. New fields are additive (`collection`,
-`pressureStallCoverage`, `endpoint-query-failed`); existing
-`summary.json` consumers ignore unknown fields. One semantic
-tightening on an existing field: `finalCountersAvailable` now
-requires durable persistence, so it can flip `true`→`false` in
-persistence-failure cases where a stale previously-persisted value
-was previously reported available.
+Each loop exit records a `LoopOutcome`. The terminal verdict combines it
+with independent endpoint comparability (`Intact`, `Restarted`, `Replaced`,
+`Disappeared`, `EndpointUnknown`), not reason strings. Prefix deltas use the
+freshest map for intact, disappeared, or unconfirmed endpoints. A confirmed
+restart or replacement uses the verified pre-change snapshot (last successful
+invocation poll); post-change ticks retain old labels until the next poll and
+never feed those deltas. Each derived quantity has its own start and end
+marks (elapsed time and sample sequence); `pressureStallCoverage` mirrors
+counter coverage. A failed final query adds `endpoint-query-failed`:
+collection finished, confirmation did not.
+
+`collection` separates attempted samples from buffered (`persistedSamples`)
+and synced (`storageDurable`) ones. Last-readable values keep their per-field
+capture marks, not a newer tick's timestamp. Final counters require an intact
+terminal, live endpoint, readable last-persisted counters, and durable
+persistence. A failed final write leaves stale earlier values unavailable.
+If writing `done` fails, the observer repairs the summary to incomplete and
+returns the original error. Missing `done` is never success. Existing
+`summary.json` consumers ignore unknown additive fields (`collection`,
+`pressureStallCoverage`, `endpoint-query-failed`).
+`finalCountersAvailable` now requires durability and can flip `true`→`false`
+where a persistence failure previously left a stale value marked available.
 
 ## Admission diagnostics
 
-- State is assigned under the admission lock; formatting and subscriber
-  work run after it is dropped. Weighted provider I/O runs under a
-  separate cache publication protocol, never under the admission mutex.
-- Waiters are counted with RAII guards, so async cancellation converges
-  the count; timeouts and wait milliseconds are recorded on every exit.
-- A deliberately disabled gate reports `Disabled`; only runtime
-  fail-open degradation reports `ThreadCapOnly`.
-- `WaitReason` distinguishes global `Pressure` from request-specific
-  `Budget`/`Exclusivity`/`PageCache`; resume is emitted only with an
-  actual admission.
+- Assign state under the admission lock, then format and run subscribers
+  after releasing it. Weighted provider I/O uses separate cache publication,
+  never the admission mutex.
+- RAII guards reconcile waiter counts on async cancellation. Record
+  timeouts and wait milliseconds on every exit.
+- A deliberately disabled gate reports `Disabled`; only runtime fail-open
+  degradation reports `ThreadCapOnly`.
+- `WaitReason` separates global `Pressure` from request-specific
+  `Budget`/`Exclusivity`/`PageCache`. Emit resume only on admission.
 - Page-cache fractions divide by the cache's own domain total (leaf
   limit, else host total) — never by a minimum aggregated across
-  independently limited domains. Host `Buffers`/`Cached` lines that are
-  missing or malformed are unknown, never zero; sysinfo reports no cache
-  accounting at all. Unknown accounting skips the check, keeps the
-  observation usable, and sets `cacheUnknown` explicitly — unless the
-  deployment sets `requirePageCacheBytes`, which turns it into an
-   explicit policy failure honoring fail-open/closed. A missing denominator
-   is inferred only for a single-domain observation, never across domains.
-- Waiter counts cover parked requests only (probing iterations are not
-  waiters), split by reason in `waitersByReason`; `waitReason` is
-  reported only while requests are parked and is never cleared by
-  another request's admission. Durations converge via RAII guards,
-  including async cancellation. Permits are constructed before any
-  subscriber code runs, so a panicking subscriber unwinds through a
-  live permit instead of leaking the reservation. Weighted provider I/O
-   uses an epoch-ordered probe cache: releases invalidate
-   by epoch, concurrent probes publish only when unsuperseded, admission
-   rechecks that generation under the state/cache locks, and
-  disabled/degraded gates never probe at all.
-- Thresholds, fail-open policy, hysteresis, and conservative reservation
-  accounting are unchanged by this refactor.
+  independently limited domains. Missing or malformed host `Buffers`/`Cached`
+  lines are unknown, not zero; sysinfo has no cache accounting. Unknown
+  accounting skips the check, keeps the observation usable, and sets
+  `cacheUnknown`, unless `requirePageCacheBytes` makes it an explicit policy
+  failure honoring fail-open/closed. Infer a missing denominator only for
+  single-domain observations.
+- All waiter counts exclude probing iterations; `waitersByReason` breaks down
+  parked requests by reason. Report `waitReason` only while requests are parked;
+  another request's admission never clears it. RAII guards reconcile durations even on async cancellation.
+  Construct permits before subscriber code so a panic unwinds through a live
+  permit without leaking the reservation. Weighted provider I/O uses an
+  epoch-ordered probe cache: releases invalidate by epoch, concurrent probes
+  publish only if unsuperseded, and admission rechecks that generation under
+  state/cache locks. A disabled/degraded gate never probes.
+- The refactor leaves thresholds, fail-open policy, hysteresis, and
+  conservative reservation accounting unchanged.
 
 ## Privacy
 
-Unknown is never zero; malformed bytes are never reprinted. No journal
+Unknown is never zero; never reprint malformed bytes. No journal
 bodies, `ExecStart`, argv, environment values, command contents, or raw
 provider/subprocess text in diagnostics. `ProviderError::Source` maps to
 `provider-source-unavailable` / `provider-unsupported`, including inside
-formatted error chains. Regression-tested with a sensitive provider
-under an enabled subscriber that captures every event field.
+formatted error chains. A regression test uses a sensitive provider and an
+enabled subscriber that captures every event field.
 
 ## Limits and overhead
 
@@ -367,16 +342,15 @@ directory-handle fixes):
 - Weighted admission: ~0.8µs per acquire+diagnostics+release (fail-open
   provider, debug build).
 
-These are order-of-magnitude smoke numbers, not production profiles:
-no peak-RSS measurement, no diagnostics-enabled-vs-disabled split, no
-release-build or latency distribution. Treat them as such.
-They also predate production host-context capture and do not estimate its cost.
-- Sampling is sequential, not atomic. No implementation can guarantee
-  readable counters after cgroup destruction, recover unwritten evidence
-  after SIGKILL, or impose a hard deadline on arbitrary blocking
-  kernel/filesystem operations: those stay explicit unknown/incomplete
-  outcomes, not success claims. The observer never bridges restarts with
-  one baseline.
+These order-of-magnitude smoke results are not production profiles: no
+peak-RSS, enabled-vs-disabled diagnostics split, release-build data, or
+latency distribution. They predate production host context and do not
+estimate its cost.
+
+Sampling is sequential, not atomic. No implementation can guarantee
+readable counters after cgroup destruction, recover unwritten evidence after
+SIGKILL, or hard-bound arbitrary blocking kernel/filesystem operations. Report
+these as unknown/incomplete, not success. No baseline bridges restarts.
 
 ## Compatibility
 
@@ -385,16 +359,13 @@ They also predate production host-context capture and do not estimate its cost.
   `manifest` fields, `deltaUnsupportedReason`, `pressureStall*`). Legacy
   consumers ignore unknown fields; legacy files without identity fields
   compare as `missing-identity`.
-- The Python `scripts/watch-cgroup.py` parser is deprecated and matches
-  the Rust core byte-for-byte (digits-only u64, strict keys, finite
-  PSI ranges) until deletion. VM OOM evidence now comes from
-  `amc watch`; the driver asserts `eventDeltas.oom > 0`,
-  `maxObservedSwap == 0`, and `Result == oom-kill`. The `oom` event
-  delta is asserted rather than `oom_kill` because the observed kernel
-  reports the group OOM as an event without charging either kill
-  counter to the unit cgroup; asserting `oom_kill` would encode an
-  unverified kernel-accounting assumption.
-- A per-tick lookup that finds no directory is disappearance
-  (`disappeared-or-empty`), never suspected replacement: only a
-  different present inode describes a new object. Collected cgroups
-  therefore keep the disappearance verdict and their readable prefix.
+- The deprecated Python `scripts/watch-cgroup.py` parser matches the Rust
+  core byte-for-byte until deletion (digits-only u64, strict keys, finite PSI
+  ranges). VM OOM evidence now comes from `amc watch`: the driver asserts
+  `eventDeltas.oom > 0`, `maxObservedSwap == 0`, and `Result == oom-kill`.
+  It asserts the `oom` delta, not `oom_kill`: the observed kernel reports the
+  group OOM event without charging either kill counter to the unit cgroup.
+  Asserting `oom_kill` would assume unverified kernel accounting.
+- If a tick's lookup finds no directory, report `disappeared-or-empty`,
+  never suspected replacement. Only a different present inode identifies
+  a new object. Collected cgroups keep the verdict and readable prefix.

@@ -2,18 +2,18 @@
 
 Historical record only. Current status is in `../migration-checklist.md`.
 
-**2026-09-08 direnv follow-up:** the environment blocker below is resolved for
-cheap checks. All 18 unit and 4 isolated CLI tests, Python fixture regressions,
-formatting and Clippy now pass through `direnv exec .`. Rows naming those tests
-are implemented and executed in isolation. Live cgroup observation, real native
-precedence, OOM attribution and other VM-only rows remain unexecuted. See
-`proof-results.md` for exact commands and the follow-up artifact. The table below
-preserves the initial milestone status; its environment-blocked entries are
-superseded by this update, not by a claim that the VM passed.
+**2026-09-08 direnv follow-up:** the environment no longer blocks cheap checks.
+All 18 unit and 4 isolated CLI tests, Python fixture regressions, formatting and
+Clippy now pass through `direnv exec .`. Rows naming those tests were
+implemented and executed in isolation. Live cgroup observation, real native
+precedence, OOM attribution and other VM-only checks did not run. See
+`proof-results.md` for exact commands and the follow-up artifact. The table
+preserves the initial milestone status. This update supersedes its
+environment-blocked entries without claiming a VM pass.
 
 RFC 0.4 supersedes the earlier build brief. The previous "Done" ledger overstated
-coverage; this ledger separates implemented, executed, demonstrated, blocked and
-deferred. No new application architecture is being introduced.
+coverage; this one separates implemented, executed, demonstrated, blocked and
+deferred work. The corrective work introduces no new application architecture.
 
 | Defect / requirement | Implementation or exact test | Status |
 |---|---|---|
@@ -32,15 +32,15 @@ deferred. No new application architecture is being introduced.
 | Missing/malformed/disappeared measurements | `unknown_is_not_zero_and_malformed_text_is_not_reprinted`, observer regressions | Implemented; execution blocked |
 | Observer readiness and finite collection | `watch-cgroup.py`, VM `attributed-memcg-oom-and-disappearing-evidence` | Implemented; execution blocked |
 | Native settings, lifecycle and lookup | `pinned-nixos-dropin-preserves-package-unit` | NixOS fragment generation evaluated; runtime blocked |
-| Conflicting transient/drop-in settings | `transient-versus-targeted-dropin-precedence` reverses the two values and records the actual winner | Implemented; precedence not yet measured |
-| Actual Home Manager module evaluation | No pinned Home Manager input in this repository | Blocked; per-user symlink test is not a substitute |
+| Conflicting transient/drop-in settings | `transient-versus-targeted-dropin-precedence` reverses the two values and records which wins | Implemented; precedence not yet measured |
+| Actual Home Manager module evaluation | This repository lacks a pinned Home Manager input | Blocked; per-user symlink test is not a substitute |
 | Attributed OOM, unrelated-unit survival and owned cleanup | `attributed-memcg-oom-and-disappearing-evidence` uses event delta plus `Result=oom-kill` | Implemented; VM not executed |
 | Broker boundary | `nix-broker-boundary`; existing pool remains blocked | Implemented; new run not demonstrated |
 | Formatting/tests/Clippy/Python fixture checks | Pinned `nix develop` gate denied by tool policy | Blocked; old test counts do not apply |
 | Targeted VM derivation and no-build flake checks | Commands in `proof-results.md` | Executed; evaluation only |
-| A/B/C pressure, actual high crossing, aggregate parent pressure, overhead | Existing small exercises explicitly labeled smoke tests; invalid two-leaf aggregate test removed | Deferred until mechanism gates pass |
+| A/B/C pressure, actual high crossing, aggregate parent pressure, overhead | Labeled existing small exercises smoke tests; removed invalid two-leaf aggregate test | Deferred until mechanism gates pass |
 | OpenCode activation/UX benefit | No production activation, restarts or paid/state-changing trial | Deferred; not measured |
 
-No historical proof report is rewritten by the scripts. New result records are
-run-specific. No signal exit code, missing counter, evaluation success, or
-surviving heartbeat is treated as proof of OOM attribution or usable OpenCode.
+The scripts record results per run without rewriting historical proof reports.
+They do not treat signal exit codes, missing counters, successful evaluation or
+surviving heartbeats as proof of OOM attribution or OpenCode usability.

@@ -10,17 +10,17 @@ caller -> amc -> systemd-run -> user systemd -> transient .service -> target
                                       +-- cgroup v2 -------+
 ```
 
-The contract is deliberately only `MemoryMax`, `MemorySwapMax`,
-`OOMPolicy=kill`, `KillMode=control-group`, and memory accounting. There is no
+The contract covers only `MemoryMax`, `MemorySwapMax`, `OOMPolicy=kill`,
+`KillMode=control-group`, and memory accounting. There is no
 `MemoryHigh`, soft protection, oomd policy, restart, CPU/I/O control, dynamic
 policy, or monitor.
 
-`systemd-run` is used instead of a Rust D-Bus client because it already handles
+AMC uses `systemd-run` instead of a Rust D-Bus client because it already handles
 PTY and pipe attachment, environment transfer, transient units, and startup
-errors. Replace it only if measured launch overhead, missing diagnostics, or a
-required integration cannot be met through the CLI.
+errors. Replace it only if the CLI cannot address measured launch overhead,
+missing diagnostics, or a required integration.
 
 Systemd 261 does not expose the proposed `MemoryOOMGroup=` property.
 `OOMPolicy=kill` sets the kernel's `memory.oom.group` to `1`; `amc doctor` probes
-that cgroup file directly. Supporting a systemd version where this implication
-does not hold is a hard failure, not a degraded mode.
+that cgroup file directly. Failure of this capability probe is a hard failure,
+not a degraded mode.
