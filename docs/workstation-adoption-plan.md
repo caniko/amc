@@ -2,60 +2,59 @@
 
 Recorded: 2026-09-20.
 
-Status: implementation and rollout record. Historical comparison proposals below
-are optional diagnostics, not delivery dependencies.
-At plan creation the user requested that this discussion be preserved. That authorized this
-document, not deployment, stress testing, or every proposed architectural choice.
-The user is the decision owner; implementation owners and dates are unassigned.
+Status: implementation and rollout record. Historical comparison proposals are
+optional diagnostics, not delivery dependencies. At plan creation, the user's
+request to preserve the discussion authorized this record, not deployment,
+stress testing or every architectural proposal. The user owns decisions; no
+implementation owners or dates are assigned.
 
-Implementation update: the user subsequently requested "implement telemetry so
-we can test in production". The [telemetry prerequisite](#telemetry-prerequisite-2026-09-20)
-below records that narrower delivered slice. It does not by itself deliver
-consumer policy or broader adoption.
+The user later requested "implement telemetry so we can test in production".
+The delivered [telemetry prerequisite](#telemetry-prerequisite-2026-09-20)
+doesn't by itself deliver consumer policy or broader adoption.
 
-Diagnostic-preview update (2026-09-29): `amc report CAPTURE_DIR` now exposes the
-existing offline validator through the installed CLI, with a Markdown default,
-JSON option, and an [install-to-report walkthrough](../README.md#install-and-first-report).
+Diagnostic preview (2026-09-29): `amc report CAPTURE_DIR` exposes the existing
+offline validator in the installed CLI with Markdown by default, a JSON option,
+and an [install-to-report walkthrough](../README.md#install-and-first-report).
 The Nix package supplies Python; Cargo installations need Python 3.11+ on
-`PATH`. A Nix package build and read-only report against the recorded Atlas
-capture passed. An Ubuntu 24.04.5 LTS rootless Podman container (amd64 image
+`PATH`. The Nix build and read-only report on the recorded Atlas capture passed.
+A rootless Podman container ran Ubuntu 24.04.5 LTS (amd64 image
 digest `sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4`,
-4 GiB memory and 2 CPU limit) compiled the checkout with Rust 1.97.1,
+4 GiB memory and 2 CPU limit) and built the checkout with Rust 1.97.1,
 `cargo install --path /src --locked`, and Python 3.12.3. Validator regressions
-passed, and the installed CLI reported the recorded 1,800-sample Atlas capture
-in Markdown and JSON. This verifies source installation and offline reporting
-on that Ubuntu image. A subsequent [booted Ubuntu diagnostic smoke](ubuntu-diagnostics-20260930.md)
-passed source installation, live inspection, completed and interrupted
-captures, unavailable measurements, and both report formats on Ubuntu 24.04.5
-with systemd 255 and kernel 6.8. No gaming benefit has been verified.
+passed. The installed CLI reported the recorded 1,800-sample Atlas capture in
+Markdown and JSON, verifying source installation and offline reporting on that
+image. The later [booted Ubuntu diagnostic smoke](ubuntu-diagnostics-20260930.md)
+passed source installation, live inspection, completed and interrupted captures,
+unavailable measurements, and both formats on Ubuntu 24.04.5 with systemd 255
+and kernel 6.8. No verified gaming benefit.
 
-Harness update (2026-09-30): the [CS2 comparison guide](gaming-comparison.md)
-now gives operator-run recording, playback and per-present logging steps. The
-release `workstation-batch` example implements matched native B/C finite batches
-with one shared weighted runner for C, output verification and retained failures.
-A live small-hash smoke passed byte-budget serialization, literal argv, useful
+Harness (2026-09-30): the [CS2 comparison guide](gaming-comparison.md) covers
+operator-run recording, playback and per-present logging. The release
+`workstation-batch` example runs matched native B/C finite batches, with one
+shared weighted runner for C, output verification and retained failures. The
+live small-hash smoke passed byte-budget serialization, literal argv, useful
 output checks, negative verification, native-limit mismatch and termination.
-The offline frame reporter is covered by fixture regressions. These mechanisms
-do not establish comparative performance results.
+Fixture regressions cover the offline frame reporter. None establishes
+comparative performance.
 
-Stability-first update (2026-09-30): the selected objective is **maintain a stable,
+Stability-first (2026-09-30): the selected objective is **maintain a stable,
 usable foreground gaming session while bounded background tasks make useful
-progress under shared resource pressure**. Delivery uses operational acceptance:
+progress under shared resource pressure**. Operational acceptance covers
 native limits/placement, visible admission, useful outputs, overload, recovery and
 installation lifecycle. A calibrated A/B/C benchmark is optional. The
-[workstation guide](workstation-policy.md) now supplies standalone units/policy,
-enrollment and removal. Disposable jobs can request a native execution deadline;
-the native fixture covers client/coordinator loss, and a separate fixture checks
-installation, restart with entered work, useful progress, disable and removal.
-Canix's consumer profile keeps useful jobs running at lower priority, separately
-defers maintenance, increases Atlas admission headroom, and bounds system
-background work and daemon builds. Fresh package/consumer rollout checks remain
-distinct from source implementation and from active host policy.
+[workstation guide](workstation-policy.md) supplies standalone units/policy,
+enrollment and removal. Disposable jobs can request a native execution deadline.
+The native fixture covers client/coordinator loss; a separate fixture checks
+install, restart with entered work, useful progress, disable and removal.
+Canix's consumer profile keeps useful jobs running at lower priority, defers
+maintenance separately, raises Atlas admission headroom, and bounds system
+background work and daemon builds. Distinguish fresh package/consumer rollout
+checks from source implementation and active host policy.
 
 ## Goal And Confirmed Decisions
 
-The user's goal is general adoption in prosumer/workstation situations and to
-make AMC "the best memory manager". The following choices were explicit:
+The user wants broad prosumer/workstation adoption and AMC to be "the best memory
+manager". Explicit choices:
 
 - "Modular design in every direction", rather than choosing an exclusively
   automatic, opt-in, or diagnostic product.
@@ -63,107 +62,103 @@ make AMC "the best memory manager". The following choices were explicit:
   work, and maximizing useful throughput.
 - Gaming plus background work is the first end-to-end operational scenario.
 
-Product goal: a composable memory-management toolkit that lets users select
-their tradeoff and operate bounded workloads with understandable overload and
-recovery. It complements native memory management rather
-than replacing the kernel allocator or the application's lifecycle owner.
+Product goal: a composable memory-management toolkit for choosing tradeoffs and
+running bounded workloads with clear overload and recovery behavior. It
+complements native memory management without replacing the kernel allocator or
+application lifecycle owner.
 
-"Best" is not maximum feature count, minimum reported RAM usage, or killing an
-offender fastest. Evaluate results for an explicitly selected objective, subject
-to safety and resource constraints. Report tradeoffs instead of hiding them in
-one weighted score. No numerical rankings or universal weights were agreed.
+"Best" doesn't mean most features, least reported RAM usage, or fastest kill.
+Evaluate results against the selected objective within safety and resource
+constraints. Don't hide tradeoffs in one weighted score. No agreed numerical
+rankings or universal weights.
 
-The first opt-in pilot does not limit the eventual product to opt-in operation.
-Optional automation remains a candidate, not an approved whole-desktop daemon.
+The opt-in pilot doesn't preclude other modes. Optional automation is a
+candidate, not an approved whole-desktop daemon.
 
 ## Authority And Scope
 
 The current [README](../README.md) and [RFC 0.4](rfc-v0.4/rfc-application-memory-policy-v0.4.md)
-describe a narrower diagnostic, integration, and fixture project. This plan
-records a proposed expansion; it does not silently supersede that contract.
-Revise the product contract deliberately before implementing the expansion.
+define a narrower diagnostic, integration, and fixture project. This proposal
+doesn't override that contract; revise it explicitly before expanding.
 
 Working assumption: Linux with cgroup v2 and systemd is the first enforcement
-backend, because that is the existing implementation. Other platforms and
-backends require demonstrated demand and capability-specific tests. Standalone
-admission must not acquire a mandatory systemd or daemon dependency.
+backend, matching the existing implementation. Other platforms and backends
+need demonstrated demand and capability-specific tests. Standalone admission
+must not require systemd or a daemon.
 
-Initial work was scoped to this AMC repository; Canix policy, launchers,
-restoration and pins were outside that initial scope.
-Cross-repository integration needs a separate scope and authorization.
-The later request to proceed authorized the narrow, read-only Atlas binding
-pilot recorded below; it did not authorize changing active service policy.
-The later request to implement the stability-first review authorizes consumer
-source policy/integration work. Deployment remains the consumer's native workflow.
+Initial scope: this AMC repository, not Canix policy, launchers, restoration or
+pins. Cross-repository integration needs separate scope and authorization.
+The later go-ahead authorized only the read-only Atlas binding pilot below,
+not active service policy changes. The stability-first implementation request
+authorizes consumer source policy/integration work; deployment still uses the
+consumer's native workflow.
 
-Do not install a new policy language, global process-name classifier, desktop
-launch broker, plugin loader, or competing OOM manager merely to make the design
-look modular. New mechanisms must solve a demonstrated requirement.
+Add no policy language, global process-name classifier, desktop launch broker,
+plugin loader, or competing OOM manager just for modularity. Require a
+demonstrated need.
 
 ## Current Foundations And Evidence
 
-These are source/document observations from the planning session, not a fresh
-runtime validation:
+Planning-session source/document observations, not fresh runtime validation:
 
 | Area | Existing foundation | Important limitation |
 |---|---|---|
-| Observation | [amc-telemetry](../crates/amc-telemetry/src/lib.rs) provides bounded readers, identity, comparisons, and explicit unknowns | It is independent of systemd transport, Tokio, subscribers, and exporters; preserve that boundary |
-| Diagnostics | `amc inspect`, finite `amc watch`, offline `amc diff`, and `amc report` | Collection completion is not complete lifetime accounting; missing terminal counters stay unavailable |
-| Admission | [amc-runner](../crates/amc-runner/src/lib.rs) has sync/async gates, providers, weighted admission, and diagnostics | Admission affects participating work; it cannot control every browser, game, broker, or already-running allocation |
-| Managed execution | [Runner](../crates/amc-runner/src/systemd/managed.rs) couples admission to owned systemd attempts and retains uncertain reservations | Native enforcement is verified separately; independent Runner instances do not share one global budget |
-| Coordination | [Coordinator](../crates/amc-runner/src/coordinator.rs) shares a byte budget in-process; the optional [persistent service](persistent-admission.md) adds cross-process coordination | Its recovery/ownership acceptance and consumer rollout need separate evidence; it is not required for the first single-runner comparison |
-| Packaging/checks | [flake.nix](../flake.nix) provides Linux packages, checks, feature-matrix validation, and an explicit VM target | NixOS-focused infrastructure is not evidence of broad distribution/version support |
-| Mechanism evidence | [Recorded VM results](rfc-v0.4/proof-results.md) demonstrate specified containment, lifecycle, and integration behavior | Pressure comparisons, aggregate policy benefit, real gaming outcomes, and general adoption remain unproven |
+| Observation | [amc-telemetry](../crates/amc-telemetry/src/lib.rs): bounded readers, identity, comparisons, explicit unknowns | Preserve independence from systemd transport, Tokio, subscribers and exporters |
+| Diagnostics | `amc inspect`, finite `amc watch`, offline `amc diff`, and `amc report` | Completed collection isn't complete lifetime accounting; missing terminal counters stay unavailable |
+| Admission | [amc-runner](../crates/amc-runner/src/lib.rs): sync/async gates, providers, weighted admission, diagnostics | Participating work only; no blanket control over browsers, games, brokers or existing allocations |
+| Managed execution | [Runner](../crates/amc-runner/src/systemd/managed.rs) links admission to owned systemd attempts and retains uncertain reservations | Native enforcement is verified separately; independent Runner instances don't share a global budget |
+| Coordination | [Coordinator](../crates/amc-runner/src/coordinator.rs) shares an in-process byte budget; optional [persistent service](persistent-admission.md) coordinates across processes | The service's recovery/ownership acceptance and consumer rollout need separate evidence; the first single-runner comparison doesn't require it |
+| Packaging/checks | [flake.nix](../flake.nix): Linux packages, checks, feature-matrix validation, explicit VM target | NixOS-focused infrastructure doesn't establish broad distribution/version support |
+| Mechanism evidence | [Recorded VM results](rfc-v0.4/proof-results.md): specified containment, lifecycle and integration behavior | No proven pressure comparisons, aggregate policy benefit, real gaming outcomes or general adoption |
 
-See [telemetry](telemetry.md), [admission contract](admission-contract.md), and
-[known boundaries](known-boundaries.md) for the behavioral details.
+Behavior: [telemetry](telemetry.md), [admission contract](admission-contract.md)
+and [known boundaries](known-boundaries.md).
 
-Important existing semantics to preserve:
+Preserve these semantics:
 
-- Real applications retain their native lifecycle owner. Controlling an
-  activation client does not control an independently running server.
-- Native unit/drop-in precedence remains authoritative. Requested settings are
-  not effective settings until inspected.
-- Per-workload caps are not aggregate admission control. Identify the relevant
-  ancestor budget and every external execution domain.
-- Grants are permission to grow within a declared ceiling, not reserved physical
-  RAM or an allocation-success guarantee. Current accounting is conservative and
-  can overlap reservations with already observed usage.
-- The grant contract is non-revocable during a bounded task. Release requires
-  confirmed termination; a client disconnect or timeout alone is insufficient.
-- Same-user controls are not a sandbox against a process with equivalent
-  authority. Administrative constraints require the appropriate native owner.
+- Applications keep their native lifecycle owner. Controlling an activation
+  client doesn't control an independently running server.
+- Native unit/drop-in precedence governs. Inspect effective settings rather than
+  assuming requests took effect.
+- Per-workload caps don't control aggregate admission. Identify the relevant
+  ancestor budget and all external execution domains.
+- Grants permit growth within a declared ceiling; they don't reserve physical RAM
+  or guarantee allocations. Conservative accounting can overlap reservations with
+  observed usage.
+- Grants aren't revocable during bounded tasks. Release only after confirmed
+  termination, not a disconnect or timeout alone.
+- Same-user controls don't sandbox processes with equivalent authority.
+  Administrative constraints need the appropriate native owner.
 
 ### Prior Observer Work
 
-The earlier session summary reported completed observer hardening: structural
+The earlier summary reported completed observer hardening: structural
 terminal-state classification; verified-prefix rather than cross-lifetime
 deltas; pinned reads; independent final identity/result queries; per-field
 timing/coverage; persistence-aware readiness/completion; and explicit
-disappearance, restart, replacement, and unknown outcomes. Admission probe
-generation checks and lifecycle/integration regressions were also reported.
+disappearance, restart, replacement, and unknown outcomes. It also reported
+admission probe generation checks and lifecycle/integration regressions.
 
-That summary reported successful formatting, workspace tests, clippy, runner
-feature-matrix tests/docs, fixture checks, and a disposable VM run including
-OOM attribution, restart, and frozen-leaf observation. Its reported VM derivation
-was `/nix/store/rffsmsrph9mg8a8xsf7by5kf6612mq2s-vm-test-run-amc-generic.drv`.
-These results were not rerun or independently reattributed to the current tree
-during brainstorming. Do not use this paragraph as fresh validation evidence.
+Reported passes: formatting, workspace tests, clippy, runner feature-matrix
+tests/docs, fixture checks, and a disposable VM run covering OOM attribution,
+restart and frozen-leaf observation. Reported VM derivation:
+`/nix/store/rffsmsrph9mg8a8xsf7by5kf6612mq2s-vm-test-run-amc-generic.drv`.
+Brainstorming neither reran these checks nor independently attributed them to
+the current tree. Don't cite them as fresh validation.
 
 The VM OOM case uses observed `eventDeltas.oom > 0`, zero observed swap, and
 manager `Result=oom-kill`; it does not assume a positive `oom_kill` counter on
 every tested kernel. Frozen state is not termination or proof of memory relief.
 Retain guards and the deprecated observer until their own removal criteria pass.
 
-At plan creation, six files already had staged changes: weighted admission,
+At plan creation, six files had staged changes: weighted admission,
 telemetry measurement, telemetry documentation, the VM driver, `src/watch.rs`,
 and `tests/observe.rs`. Telemetry documentation also had unstaged changes.
-Preserve that work and staging; do not reset, restage, or commit it implicitly.
+Preserve both; don't implicitly reset, restage or commit.
 
 ## Proposed Modular Boundaries
 
-These are logical responsibilities, not instructions to immediately split the
-repository into additional crates, processes, or services.
+Logical boundaries, not an instruction to split crates, processes or services now.
 
 | Capability | Responsibility | Independence requirement |
 |---|---|---|
@@ -174,18 +169,18 @@ repository into additional crates, processes, or services.
 | Enforcement | Apply supported native controls to authorized resource domains | Backend-specific, capability-checked, with no false containment claim |
 | Integrations/presentation | Application hooks, desktop events, CLI/UI, packaging | Optional consumers rather than alternative policy engines |
 
-Each controlled domain needs a clear decision owner. Modules must not race to
-write the same resource settings. Reject or explicitly resolve conflicting
-requests while respecting administrator constraints and native precedence.
-Do not invent a parallel generic merge engine where native rules suffice.
+Assign a decision owner to each controlled domain. Don't let modules race to
+write resource settings. Reject or explicitly resolve conflicts within
+administrator constraints and native precedence. Use native rules rather than
+a generic merge engine where they suffice.
 
-Distinguish user-facing priority selection from implementation defaults. The
-request for no universal priority profile does not authorize deleting existing
-library safety defaults or changing shipped behavior without review.
+User-facing priorities aren't implementation defaults. Declining a universal
+priority profile doesn't authorize removing library safety defaults or changing
+shipped behavior without review.
 
-Optional automation must have explicit enrollment, action permissions, visible
-decisions, and a disable path. Starting with observation-only onboarding is a
-proposal, not a newly agreed default policy.
+Optional automation needs explicit enrollment, action permissions, visible
+decisions and a disable path. Observation-only onboarding is a proposal, not an
+agreed default.
 
 ## Candidate Research Directions
 
@@ -196,35 +191,33 @@ gain, feasibility, reversibility, overhead, and implementation cost.
 
 | ID | Idea and assumption | Predicted observation | Evidence against advancing |
 |---|---|---|---|
-| G1 | Make native policy easy to configure and inspect; assumes integration friction is a major barrier | Users obtain useful gaming/background tradeoffs without another controller | Native settings cannot express or reliably deliver the selected behavior |
-| G2 | Prevent background overcommit through weighted admission; assumes useful memory-demand estimates | Capacity-bounded starts, visible waits and useful background progress | Estimates cause excessive queuing/starvation or declared native boundaries do not contain execution |
-| G3 | Adapt cooperating workloads to pressure; assumes safe concurrency/cache reductions exist | Better results than static admission under changing demand | Oscillation, delayed response, cache rebuilding, or overhead outweighs the benefit |
+| G1 | Simplify native policy setup and inspection; assumes integration friction is a major barrier | Useful gaming/background tradeoffs without another controller | Native settings can't express or reliably deliver the selected behavior |
+| G2 | Prevent background overcommit with weighted admission; assumes useful memory-demand estimates | Capacity-bounded starts, visible waits, useful background progress | Excessive queuing/starvation from estimates or execution outside declared native boundaries |
+| G3 | Adapt cooperating workloads to pressure; assumes safe concurrency/cache cuts | Better than static admission under changing demand | Oscillation, delayed response, cache rebuilds or overhead outweigh benefits |
 
-Strongest simpler alternative: native controls plus useful configuration,
-diagnostics, and integration tests. If that suffices, ship that result rather
-than treating a new controller as the required outcome.
+Strongest simpler alternative: native controls with useful configuration,
+diagnostics and integration tests. Ship that if sufficient; a new controller
+isn't required.
 
 Current weighted defaults include a 1 GiB reserve, 8 GiB exclusivity threshold,
-and 0.6 page-cache fraction. These are existing implementation defaults, not
-validated gaming recommendations. Test their contribution and calibration;
-do not equate a large cache with harmful pressure or low free RAM with failure.
+and 0.6 page-cache fraction, not validated gaming recommendations. Test their
+contribution and calibration. Large caches don't imply harmful pressure, nor
+does low free RAM imply failure.
 
-After evidence checking, the proposed first slice was narrowed to managing
-enrolled background jobs through one runner while leaving game launch unchanged.
-This avoids assuming a cross-process coordinator or game integration is needed
-to establish the first benefit.
+Evidence checks narrowed the proposed first slice to one runner for enrolled
+background jobs, leaving game launch unchanged. Test for an initial benefit
+without assuming cross-process coordination or game integration is needed.
 
 ## Optional Comparison: Gaming And Background Work
 
-For users choosing a comparative experiment, the question is whether AMC changes
-an explicitly selected gaming/background tradeoff beyond native controls. This
-section is not a prerequisite for the operational workstation profile.
+This optional experiment tests whether AMC changes an explicit gaming/background
+tradeoff beyond native controls. It doesn't gate the operational profile.
 
-Keep the game on its ordinary launch path. Discover its actual execution domain
-on the chosen setup; do not assume a universal Steam unit name, infer containment
-from a launcher PID, or require the game to use the admission library.
-Enroll only selected background jobs under one shared runner and known native
-boundaries. This proves nothing yet about whole-desktop automatic management.
+Launch the game normally and discover its actual execution domain. Don't assume
+a universal Steam unit name, infer containment from a launcher PID, or require
+game use of the admission library. Enroll only selected background jobs under
+one shared runner and known native boundaries. This doesn't validate automatic
+whole-desktop management.
 
 | Arm | Configuration | Purpose |
 |---|---|---|
@@ -234,87 +227,85 @@ boundaries. This proves nothing yet about whole-desktop automatic management.
 | D, conditional | C plus pressure-aware adaptation | Test adaptation only after earlier evidence justifies it |
 
 Use identical offered work, inputs, game settings, and native limits for B/C.
-Record any intentional differences in scheduling. Choose baseline concurrency
-without using the final comparison data to favor AMC. Attribute gains from
-native controls separately from gains due to AMC.
+Record intentional scheduling differences. Don't tune baseline concurrency to
+favor AMC using final comparison data. Attribute native and AMC gains separately.
 
 ### Outcomes And Measurement
 
-- Game frame-time distributions, especially p99 and long-stall frequency;
-  average FPS alone is insufficient. Frame-time percentiles and 1% low FPS are
-  different summaries and must not be conflated.
-- Completed useful background work, completion times, admission waits,
-  starvation, and recovery after gaming ends. Merely stopping all background
-  work is not an unexplained success.
+- Game frame-time distributions, especially p99 and long-stall frequency. Average
+  FPS alone isn't enough; frame-time percentiles aren't 1% low FPS.
+- Completed useful background work, completion times, admission waits, starvation and
+  post-game recovery. Don't count stopping all background work as success
+  without explanation.
 - OOM events with mechanism/victim attribution, lost work, application failures,
   memory and IO pressure, swap activity, and observed memory usage.
-- AMC CPU, memory, launch/admission latency, and diagnostic overhead, measured
-  with release builds and relevant enabled/disabled comparisons.
-- Coverage and identity for each observation window. Missing final counters or
-  collection failures remain explicit; do not discard inconvenient failed runs.
+- AMC CPU, memory, launch/admission latency and diagnostic overhead in release
+  builds, with relevant enabled/disabled comparisons.
+- Coverage and identity per window. Disclose missing final counters and
+  collection failures. Keep inconvenient failed runs.
 
-Reuse suitable existing tools such as MangoHud for frame-time collection rather
-than building an overlay. Verify logging resolution and instrumentation overhead
-for the selected game. Align game and resource measurements in time.
-The existing finite observer is not automatically a whole-session collector;
-choose bounded windows or explicitly design the additional collection needed.
+Use an existing frame-time tool such as MangoHud, not a new overlay. Verify
+logging resolution and overhead for the game and align game and resource
+measurements. The finite observer doesn't automatically cover whole sessions;
+choose bounded windows or explicitly design additional collection.
 
 ### Experimental Controls
 
-- Begin with one identified machine, one repeatable game scene, and finite,
-  repeatable background jobs. Archive/extraction, builds, and indexing are
-  candidate workloads, not all mandatory for the first experiment.
+- Start with one identified machine, one repeatable game scene and finite,
+  repeatable background jobs. Archive/extraction, builds and indexing are
+  candidates, not all required for the first experiment.
 - Record hardware, RAM, GPU/VRAM, distro, kernel, systemd, game/Proton/driver
   versions, swap/zram, resource ancestry, active OOM managers, and effective
   settings. Pin source/configuration identities for each attempt.
 - Randomize arm order and block on machine/session where appropriate. Control
   shader-cache state, warm-up, thermals, GPU load, and unrelated background work.
-- Treat independent runs as replicates, not individual frames. Determine
-  repetition counts and practical improvement/noninferiority margins from a
-  separate calibration pilot before comparative evaluation.
+- Use independent runs as replicates, not frames. Derive repetition counts and
+  practical improvement/noninferiority margins from a separate calibration pilot
+  before comparison.
 - Predeclare the selected objective, guardrails, observation windows, exclusion
   rules, and analysis. Report uncertainty and sensitivity to workload/parameters.
 - Preserve negative, null, and inconclusive results. Lack of statistical
   significance is not proof of equivalence or evidence that a mechanism is useless.
-- Compare against existing pressure management where deployed. Do not silently
-  disable an OOM manager to obtain a favorable result. Swap/zram variations are
-  separate controlled conditions, not incidental changes between arms.
+- Compare against deployed pressure management. Don't silently disable an OOM
+  manager to favor results. Swap/zram variants are separate controlled
+  conditions, not incidental arm differences.
 
 VMs validate mechanisms, not real GPU/game responsiveness. Replay tests can
-validate decision logic but cannot establish the performance of a closed-loop
-policy that would change the trace itself.
+validate decision logic, not performance of a closed-loop policy that changes
+the trace.
 
 ### Risks And Safety
 
 - System-RAM admission does not establish VRAM control. Dedicated VRAM and
   integrated-GPU shared memory need separate observations and claims.
-- CPU saturation, IO contention, shader compilation, and application faults can
-  resemble memory-induced stutter. PSI complements application measurements;
-  it does not identify every cause.
+- CPU saturation, IO contention, shader compilation and application faults can
+  mimic memory stutter. PSI complements app measurements but can't identify
+  every cause.
 - Admission limits new participating work, not already committed allocations
   or arbitrary nonparticipants. Preserve headroom and aggregate boundaries.
-- Freezing a workload is not memory release and can retain dependencies needed
-  elsewhere. A new freeze/thaw controller is outside this first slice.
-- Stress only an explicitly authorized test machine/session with finite loads,
-  a host resource budget, cleanup, and a watchdog outside the tested domain.
-  Do not stress or reconfigure a production workstation merely to gather proof.
-- Workload output can contain secrets. Keep default evidence allowlisted and
-  local; do not upload personal, proprietary, or unpublished workload data to
+- Freezing doesn't release memory and can retain dependencies needed elsewhere.
+  A new freeze/thaw controller is out of scope for the first slice.
+- Stress only an explicitly authorized test machine/session: finite loads, host
+  budget, cleanup and a watchdog outside the tested domain. Don't stress or
+  reconfigure a production workstation just for proof.
+- Workload output may contain secrets. Keep evidence allowlisted and local by
+  default. Don't upload personal, proprietary or unpublished workload data to
   external AI or visualization services without authorization.
 
 ## Accounted Observer Prerequisite
 
-The PSI validator now rejects unexpected top-level rows, explicit-null CPU
-`full`, and out-of-range large integer averages through the normal invalid-input
-path. Regression inputs contain complete PSI rows so malformed-total tests
-exercise the intended guard rather than missing average fields.
+The PSI validator rejects unexpected top-level rows, explicit-null CPU `full`
+and out-of-range large integer averages via the normal invalid-input path.
+Malformed-total regression inputs supply complete PSI rows so they reach the
+total-value guard rather than failing on missing averages.
 
-Implemented `scripts/capture-accounted.py`: a bounded, private session runner
-using a uniquely named transient user observer, native accounting, retained
-post-exit state, durable export, and then observer-only cleanup. It copies and
-checksums the executable before launching and records unavailable counters as
-unknown rather than zero. Target service/scope configuration is untouched.
-Usage and recovery boundaries are in the [accounted observation guide](telemetry.md#accounted-observation).
+`scripts/capture-accounted.py` runs bounded, private sessions with a uniquely
+named transient user observer and native accounting. It copies and checksums
+the executable before launch, retains post-exit state, exports durably, then
+cleans up only the observer. Unavailable counters are unknown, not zero. Target
+service/scope configuration stays untouched. See the
+[accounted observation guide](telemetry.md#accounted-observation) for usage and
+recovery boundaries.
 
 Short real-host verification (export timestamp 2026-09-20T23:50:34Z):
 
@@ -324,32 +315,31 @@ Short real-host verification (export timestamp 2026-09-20T23:50:34Z):
   `41e48d7faed8402bbfe30d8f401e079c`.
 - Final accounting: 22,202,000 ns CPU, 3,149,824 bytes peak memory, 32,768 block-IO
   bytes read, 233,472 block-IO bytes written, 2 read and 27 write operations.
-- Main-process monotonic duration: 3,025,033 microseconds. These are native
-  observer-cgroup measurements including children, not per-sample read timing
-  and not total system overhead induced by observation.
-- Accounting was exported while the observer was `active/exited`; cleanup then
-  stopped it. A subsequent query returned `LoadState=not-found` and inactive.
+- Main-process monotonic duration: 3,025,033 microseconds. Native observer-cgroup
+  measurements include children, not per-sample read timing or total overhead
+  induced by observation.
+- Exported accounting while the observer was `active/exited`, then stopped it.
+  A later query returned `LoadState=not-found` and inactive.
 
 Tests cover units/sentinels, zero versus unavailable values, private files,
 export-before-stop ordering, preservation after export failure, cancellation,
 and observed invocation replacement without controlling the replacement.
-They are included in `scripts/check-fixtures.py` and do not contact a real manager.
+`scripts/check-fixtures.py` includes them; they don't contact a real manager.
 
-This closes the short accounting-path prerequisite, not the longer accounting
-experiment. The original endurance run still has no CPU accounting; do not
-retroactively assign these smoke results to it. A further passive long run,
-named-game/frame-time work, and comparative policy evaluation remain pending.
+Only the short accounting-path prerequisite is complete. Don't attribute these
+smoke results to the original endurance run, which lacks CPU accounting. The
+longer accounting experiment, another passive long run, named-game/frame-time
+work and comparative policy evaluation remain pending.
 
 ## Ordered Implementation Slices
 
-The roadmap below distinguishes source implementation from consumer rollout.
-Completed source items do not attest to active deployment. Runtime/install
-results apply to their recorded environment and revision.
+Source completion isn't consumer rollout or proof of active deployment.
+Runtime/install results apply only to the recorded environment and revision.
 
 ### Telemetry Prerequisite (2026-09-20)
 
-- [x] Add explicit passive `amc watch UNIT --production` mode using the existing
-  collector, rather than a new daemon or policy engine.
+- [x] Add explicit passive `amc watch UNIT --production` mode to the existing
+  collector, without a new daemon or policy engine.
 - [x] Accept native `.service` and `.scope` owners in read-only diagnostics,
   without adding scope launching or changing application placement.
 - [x] Default to 30 minutes at 1 Hz; validate up to 24 hours with 1-60 second
@@ -364,40 +354,38 @@ results apply to their recorded environment and revision.
   output limits, and unmeasured gaming/VRAM/performance claims in
   [the production capture guide](telemetry.md#production-capture).
 
-Verification for this slice: workspace/all-target tests (186 tests), strict
-workspace clippy, formatting, fixture regressions, and the runner feature matrix
-(default/none/sync/async/sysinfo/systemd tests, clippy, and documentation) passed.
-Commands use `direnv exec .`; the workspace test command is
-`cargo test --workspace --all-targets --locked -j 2`. Clippy was run directly as
+Passed workspace/all-target tests (186 tests), strict workspace clippy,
+formatting, fixture regressions and the runner feature matrix
+(default/none/sync/async/sysinfo/systemd tests, clippy and documentation).
+These checks used `direnv exec .`. Workspace tests ran
+`cargo test --workspace --all-targets --locked -j 2`; clippy ran directly as
 `cargo-clippy clippy --workspace --all-targets --locked -j 2 -- -D warnings`:
 `cargo clippy` selected a stale rustup subcommand despite the pinned shell and
 failed on a missing linker wrapper. No global toolchain configuration was changed.
 
-An existing runner test, `detached_reservation_lasts_until_confirmed_termination`,
-had one transient `SpawnFailed` result in the first feature-matrix run. Its
-isolated rerun and the full unchanged matrix passed. The cause was not established;
-record this as residual test flakiness, not as a fixed telemetry defect.
+The existing `detached_reservation_lasts_until_confirmed_termination` runner
+test returned `SpawnFailed` once in the first feature-matrix run. It passed in
+isolation and in the full unchanged matrix. The cause remains unknown: residual
+test flakiness, not a fixed telemetry defect.
 
 A three-second real-manager, read-only capture of `systemd-journald.service`
 produced three persisted samples, `reason: deadline`, `complete: true`, and
 `storageDurable: true`. Local smoke artifacts are under
 `/data/scratch/tmp/opencode/amc-production-telemetry-20260920-01/`.
-This is collection-path evidence only, not gaming, stress, long-session endurance,
-or release-build overhead evidence. No services or policies were changed and no
-new VM run was performed for this slice. Existing staged work was preserved.
+Collection-path evidence only: no gaming, stress, long-session endurance or
+release-build overhead evidence. This slice changed no services or policies, ran
+no new VM and preserved staged work.
 
-Optional comparative work: game-specific frame-time capture, calibrated
-thresholds and A/B/C results. The subsequent shared-admission implementation and
-operational guide are recorded separately. Ordinary `watch` defaults remain
-unchanged.
+Game-specific frame-time capture, calibrated thresholds and A/B/C results are
+optional. The record covers later shared admission and the operational guide
+separately. Ordinary `watch` defaults didn't change.
 
 ### Atlas Pilot Readiness (2026-09-20)
 
-Pilot host is Atlas. Read-only discovery found Steam (`app-cosmic-steam-*.scope`)
-and Lutris scopes running, plus `gamemoded.service`. No game owner was
-identified (scopes were present; which one owns a game was not established);
-scope names embed PIDs and must be rediscovered per session.
-MangoHud was not on `PATH`; frame-time logging availability is pending.
+Read-only discovery on pilot host Atlas found running Steam
+(`app-cosmic-steam-*.scope`) and Lutris scopes plus `gamemoded.service`, but no
+confirmed game owner. Scope names embed PIDs; rediscover them each session.
+MangoHud wasn't on `PATH`; frame-time logging remains unverified.
 
 Validated on Atlas, no policy or service changes:
 
@@ -408,8 +396,8 @@ Validated on Atlas, no policy or service changes:
 - Release binary `target/release/amc` (`amc 0.1.0`, sha256
   `05c94a2b68f27fb10032394a38f186411cda1551453b97aa41ce8b04d8b44520`)
   captured the Steam scope; per-sample read-path timing peaked near 198us
-  (debug: ~1127us). That is capture-read timing from `captureDurationUs`,
-  not a whole-observer overhead estimate.
+  (debug: ~1127us). `captureDurationUs` measures capture reads, not whole-observer
+  overhead.
   Smoke artifacts: `/data/scratch/tmp/opencode/amc-atlas-steam-scope-01/`,
   `/data/scratch/tmp/opencode/amc-atlas-steam-release-01/`.
 
@@ -436,72 +424,68 @@ background work, frame-time logging, and a scheduled 30-minute session.
 ### First comparison candidate (2026-09-30)
 
 **Counter-Strike 2** (Steam app 730) is installed on Atlas and is the first
-comparison candidate. An offline, locally recorded demo is the proposed scene:
-record a fixed 60–90 second route on the same training map, archive the demo
-and its hash, and replay the same file for each arm. No replay has been
-selected or verified yet, so the scene, playback determinism, and a
-representative memory-pressure level remain calibration gates, not established
-facts. Do not use a public network match as the measurement scene.
+comparison candidate. Proposed scene: record a fixed 60–90 second route locally
+and offline on the same training map, archive the demo and hash, and replay
+the same file in each arm. No replay is selected or verified. The scene,
+playback determinism and representative memory pressure still need calibration.
+Don't measure a public network match.
 
 The selected operational objective is **gaming-first stability with bounded
-useful background progress**. If conducting a comparison, frame times and stall
-counts are scenario-specific supporting observations. Choose its thresholds and
-run count separately and report useful work, failures and recovery alongside
-those observations. This optional protocol does not gate usable setup.
+useful background progress**. In a comparison, frame times and stall counts
+are scenario-specific supporting observations. Set thresholds and run count
+separately; report useful work, failures and recovery alongside them. This
+optional protocol doesn't gate usable setup.
 
 MangoHud 0.8.4 is present in the Nix store but not on `PATH`. Its
 [upstream configuration](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/data/MangoHud.conf)
 supports `output_folder`, `autostart_log`, `log_duration`, and `log_interval`.
-First verify that it logs per-frame data for this game and quantify its
-instrumentation overhead using otherwise identical launches; retain the same
-logging configuration in every comparison arm. A frame-time CSV must be
-aligned by run window with each AMC capture; an on-screen FPS value is not a
-substitute.
+Verify per-frame logging for this game and measure overhead with otherwise
+identical launches before comparing. Keep logging configuration identical
+across arms. Align the frame-time CSV with each AMC capture by run window;
+on-screen FPS is no substitute.
 
-Candidate useful background work is a fixed, clean AMC Cargo workspace build
-or test batch with pinned source/lock/toolchain and a fresh, isolated target
-directory per run. Predeclare the finite batch, verify it actually competes
-for memory on Atlas, and record completion, elapsed time, failures, and
-admission waits. For arms B/C, use identical native per-job and aggregate
-limits and the same offered batch; C enrolls it under **one shared** weighted
-runner, while B uses calibrated fixed concurrency. The installed `amc run`
-fixture command is not a weighted-admission runner. Tune the work estimate and
-comparison margins on separate calibration runs; do not infer benefit from
-the prior passive capture or count frames as independent replicates.
+Candidate background work: a fixed, clean AMC Cargo workspace build or test
+batch with pinned source/lock/toolchain and a fresh, isolated target directory
+per run. Predeclare the finite batch, verify memory competition on Atlas and
+record completion, elapsed time, failures and admission waits. Match native
+per-job and aggregate limits and offered work in B/C. C uses **one shared**
+weighted runner; B uses calibrated fixed concurrency. The installed `amc run`
+fixture command doesn't provide weighted admission. Tune work estimates and
+comparison margins in separate calibration runs. Don't infer benefit from the
+prior passive capture or treat frames as independent replicates.
 
 Footprint probe (2026-09-30): one fresh-target
 `cargo test --workspace --all-targets --locked -j 2` batch completed all 190
 tests in a retained transient service. Native accounting reported a
 1,134,256,128-byte peak (about 1.06 GiB), 39.34 CPU seconds, and 30.22 seconds
 between main-process start and exit. The service had a 2 GiB max, zero swap,
-200% CPU quota, and 180-second runtime bound. Accounting was exported before
-the service was stopped. Host activity was concurrent, so these timings are
-exploratory rather than a comparison baseline. This single small batch does
-not establish a representative memory-admission challenge for Atlas; validate
-the offered multi-job mix before fixing weights or useful-work margins.
+200% CPU quota and 180-second runtime bound. Accounting export preceded service
+stop. Concurrent host activity makes these exploratory timings, not a
+comparison baseline. One small batch doesn't establish a representative Atlas
+memory-admission challenge. Validate the offered multi-job mix before fixing
+weights or useful-work margins.
 Evidence: `/data/scratch/tmp/opencode/amc-cargo-calibration-20260930/`, including
 the command, limits, complete log, accounting, and source patch (SHA-256
 `cfc60dea2cffc6cbcbcaba56d52badcc5f8fd764774bb04fb39af564c91c1045`).
 
 ### Consumer-owned Fleetix binding pilot (2026-09-30)
 
-Canix now exposes a read-only Atlas binding in
-`root/hosts/atlas/features/amc_binding.nix`: Fleetix supplies the declared
+Canix exposes a read-only Atlas binding in
+`root/hosts/atlas/features/amc_binding.nix`. Fleetix supplies the declared
 `atlas` host and `can` account, while Canix names `opencode.service`, its
 `app-amc.slice` owner, and the `agent-tools.slice` domain. Memory limits come
-from `canix.amcContracts`, not new Fleetix workload fields. The binding adds
-no resource-policy activation or memory-budget decision to AMC.
+from `canix.amcContracts`, not new Fleetix workload fields. AMC neither activates
+resource policy nor decides memory budgets through this binding.
 
-Guarded evaluation of `nixosConfigurations.atlas.config.canix.amcBinding` and
-the Atlas toplevel derivation passed. Read-only live inspection found the
-backend in `app-amc.slice` at 32 GiB/2 GiB max/swap, the tool slice at
-24 GiB/8 GiB aggregate, and one active tool service in that slice at
-16 GiB/4 GiB. These are identity/boundary checks on the currently running
-generation, not proof that a weighted runner is coordinating those jobs or
-that the new Nix binding has been activated.
+Guarded evaluation passed for `nixosConfigurations.atlas.config.canix.amcBinding`
+and the Atlas toplevel derivation. Read-only live inspection found the backend
+in `app-amc.slice` at 32 GiB/2 GiB max/swap, the tool slice at 24 GiB/8 GiB
+aggregate, and one active tool service there at 16 GiB/4 GiB. These identity/boundary
+checks cover the running generation, not weighted coordination or
+activation of the new Nix binding.
 
-Repeat the acceptance check from the Canix checkout on Atlas after the Canix
-configuration changes (`canix` and `amc` must both be on `PATH`):
+After Canix configuration changes, repeat acceptance from its checkout on Atlas
+with `canix` and `amc` on `PATH`:
 
 ```sh
 canix repo eval --output json .#nixosConfigurations.atlas.config.canix.amcBinding
@@ -513,46 +497,41 @@ systemctl --user list-units 'amc-opencode-tool-*.service' --state=running
 amc inspect UNIT --json
 ```
 
-Require an active `opencode.service` whose `Slice`, leaf cgroup, and effective
-`MemoryMax`/`MemorySwapMax` match the declaration (32 GiB/2 GiB). Require an
-active `agent-tools.slice` with a cgroup ending in that slice and matching
-aggregate limits (24 GiB/8 GiB). For a live tool service, require its `Slice`
-and cgroup to place it beneath `agent-tools.slice`, with the Canix per-job
-contract (16 GiB/4 GiB). Check AMC's cgroup `memory.max` and `memory.swap.max`
-cells as well as manager properties; fail rather than treating an unknown cell
-as a match. Re-discover transient unit names on each run. A backend match alone
-does not attest to the tool domain, and native placement does not establish
+Require active `opencode.service` with `Slice`, leaf cgroup and effective
+`MemoryMax`/`MemorySwapMax` matching the declaration (32 GiB/2 GiB). Require active
+`agent-tools.slice` with a cgroup ending in that slice and matching aggregate
+limits (24 GiB/8 GiB). For a live tool service, require its `Slice` to match
+`agent-tools.slice`, its cgroup beneath that slice, and its limits matching the
+Canix per-job contract (16 GiB/4 GiB). Check AMC's `memory.max` and
+`memory.swap.max` cgroup cells and manager properties; fail on unknown cells. Rediscover transient names each run.
+A backend match doesn't verify the tool domain. Native placement doesn't prove
 gaming responsiveness or coordinated admission.
 
-The Canix binding now also asserts agreement with the resolved Home Manager
-backend service and native tool slice. The consumer-owned
-`tests/amc-binding/check-live.py` reads an evaluated declaration and checks
-manager/kernel limits for the backend, aggregate slice, and one live tool
-service, rechecking identity after observation. Its adjacent README gives the
-guarded evaluation and read-only test commands. Offline negative regressions
-cover wrong placement, changed invocation, mismatched limits, and unknown cells.
-A guarded evaluation of the pure module regression also passed, checking that
-matching resolved settings satisfy the assertions while missing/mismatched
-service and slice settings fail them. This regression is wired into Canix's
-existing `amc-tool-domains` check.
-The Home Manager module is now tracked, resolving the earlier Git-backed source
-blocker. A later guarded full-configuration evaluation failed on unrelated
-concurrent Canix work: the pinned toolbelt does not export the newly referenced
-`gatus-instances` module. The runtime checker consequently still has no fresh
-evaluated declaration from this tree; the earlier manual live result remains
-the last complete Atlas acceptance evidence.
+The Canix binding asserts agreement with the resolved Home Manager backend
+service and native tool slice. The consumer-owned `tests/amc-binding/check-live.py`
+checks an evaluated declaration against manager/kernel limits for the backend,
+aggregate slice and one live tool service, then rechecks identity. Its adjacent
+README lists guarded evaluation and read-only test commands. Offline negative
+regressions cover wrong placement, changed invocation, mismatched limits and
+unknown cells. Guarded evaluation passed for the pure module regression:
+matching resolved settings pass assertions; missing/mismatched service and
+slice settings fail. Canix's existing `amc-tool-domains` check includes it.
+Tracking the Home Manager module cleared the Git-backed source blocker. Later
+guarded full-configuration evaluation failed on unrelated concurrent Canix
+work: the pinned toolbelt lacks the newly referenced `gatus-instances` module.
+The runtime checker still lacks a fresh declaration from this tree. The earlier
+manual live result remains the last complete Atlas acceptance evidence.
 
 ### Atlas Endurance Run (started 2026-09-20 ~21:19 local)
 
-A first backgrounded launch (`amc-atlas-endurance-01`, PID 2164183) exited after
-2 samples with `reason: cancelled`, `complete: false`, durable prefix intact.
-Suspected cause: the tool shell reaped the backgrounded child when its command
-returned (alive at +2s, SIGTERM-handled summary before +14s, no other operator
-action). This is suspected, not proven. The partial directory is retained as
-aborted-run evidence; it must not be presented as endurance data.
+The first backgrounded launch (`amc-atlas-endurance-01`, PID 2164183) exited
+after 2 samples with `reason: cancelled`, `complete: false` and durable prefix
+intact. The tool shell may have reaped its child when the command returned:
+alive at +2s, SIGTERM-handled summary before +14s, no other operator action.
+The partial directory was retained as aborted-run evidence, not endurance data.
 
-The rerun uses a transient user unit so the observer is a child of the user
-manager, not the tool shell:
+The rerun put the observer under the user manager, not the tool shell, through a
+transient user unit:
 `systemd-run --user --unit=amc-endurance-01` running release `amc 0.1.0`
 (invocation `8f2a3cd22f0f4019a669029740937ed6`),
 `watch app-cosmic-steam-1439422.scope --production --seconds 1800`
@@ -562,14 +541,13 @@ Early health (~15s): unit active/running, `ready` present, 15/15 samples,
 Completed ~21:49 local: `reason: deadline`, `complete: true`, 1800/1800 samples,
 0 missed intervals, contiguous sequences, single invocation, zero unknown host
 cells. Full data-quality report: [atlas-endurance-01](atlas-endurance-01.md).
-Validation is reproducible: `python3 scripts/validate-capture.py <capture-dir>`
-checks schema, contiguity, counts, bytes, and identity, and derives report
-metrics (nearest-rank p99, rates over the sample span); its regressions live in
-`scripts/test-validate-capture.py`. The aborted first attempt validates as
-structurally sound but incomplete, as required.
-Residual gap: observer CPU time was not measured (only RSS); capture timing
-covers reads, not total observer cost. Aggregate Steam scope telemetry must not
-be presented as game-specific evidence.
+Reproduce validation with `python3 scripts/validate-capture.py <capture-dir>`:
+it checks schema, contiguity, counts, bytes and identity and derives report
+metrics (nearest-rank p99, rates over the sample span). Regressions:
+`scripts/test-validate-capture.py`. The aborted run validates as structurally
+sound but incomplete, as required. Only RSS, not observer CPU time, was measured;
+capture timing covers reads, not total observer cost. Don't present aggregate
+Steam scope telemetry as game-specific evidence.
 
 ### 1. Product Contract
 
@@ -613,11 +591,11 @@ there is no comparative-performance prerequisite or mandatory game wrapper.
 
 ### 4. Optional Shared Coordination
 
-An optional implementation landed in `56bae9f` during this work. Its ten native
+The optional implementation landed in `56bae9f` during this work. All ten native
 ledger/socket/store tests passed in the combined workspace run. The independent
-Ubuntu and Nix review-fix snapshot predates that implementation; it does not
-verify the service. Use [the service's contract](persistent-admission.md) for
-its interface and recovery rules; retain the acceptance gates below.
+Ubuntu and Nix review-fix snapshot predates and doesn't verify the service.
+See [the service's contract](persistent-admission.md) for interface and recovery
+rules; keep the gates below.
 
 - [x] Supply optional coordination for independently launched tools and servers;
   a single in-process runner remains independently usable.
@@ -647,16 +625,16 @@ future validation targets, not demonstrated capabilities.
 
 ## Verification And Release Gates
 
-For code changes, retain the existing workspace tests, clippy, formatting,
-runner feature-matrix tests/docs, and fixture-script checks. Inspect the current
-flake/README for exact commands and use the pinned project environment. Run cheap
-checks before the separately invoked, resource-budgeted VM mechanism tests.
+For code changes, keep workspace tests, clippy, formatting, runner feature-matrix
+tests/docs and fixture-script checks. Use exact commands from the current
+flake/README and the pinned environment. Run cheap checks first; run
+resource-budgeted VM mechanism tests separately.
 
 For authorized local flake realization, use the approved cache workflow,
 `canix cache binary build .#nixosTests.x86_64-linux.generic --include-tests`, with private publication
-enabled and resource limits selected for the actual host. A cached output is not
-proof of fresh execution. Capture command, source/dirty-tree identity, versions,
-configuration, artifact locations, and verification outcomes for each claim.
+enabled and limits sized for the host. Cached outputs don't prove fresh
+execution. Record command, source/dirty-tree identity, versions, configuration,
+artifact locations and verification outcomes for each claim.
 
 Release gates apply to the selected operational objective:
 
@@ -675,23 +653,20 @@ Release gates apply to the selected operational objective:
 
 ## Open Decisions And Next Action
 
-Resolved since planning: pilot host is Atlas; Counter-Strike 2 is the first
-game candidate and gaming-first is the selected objective. The telemetry and
-scope prerequisites are implemented. Ubuntu 24.04.5 has passed the booted
-diagnostic walkthrough. The fixed Cargo batch remains a provisional background
-workload pending memory-demand profiling.
+Resolved since planning: Atlas selected as pilot host, Counter-Strike 2 as first
+candidate, gaming-first objective, implemented telemetry and scope prerequisites,
+and a passed booted diagnostic walkthrough on Ubuntu 24.04.5. The fixed Cargo
+batch is provisional pending memory-demand profiling.
 
-Operational work remaining: integrate the chosen AMC revision, finish exact
-package/consumer checks, verify effective host limits, and exercise foreground
-entry/exit with intended useful work. Replay, per-frame logging, numerical margins
-and a comparison schedule belong to optional diagnostics. A source installation
-smoke does not establish support for every module on every distribution.
-No launch date, universal threshold, public IPC API, or daemon mandate was agreed.
-
-Next action: complete the selected revision's packaging, consumer integration and
-operational lifecycle checks. Keep source implementation, tested modules and
-active deployment attributable to their own revisions. Optional comparisons may
-be performed later without changing the delivery contract.
+Next: integrate the chosen AMC revision, finish exact package/consumer checks,
+verify effective host limits, exercise foreground entry/exit with intended
+useful work, and complete that revision's operational lifecycle checks. Attribute
+source implementation, tested modules and active deployment to their own
+revisions. Replay, per-frame logging, numerical margins and a comparison
+schedule can follow as optional diagnostics without changing the delivery
+contract. Source installation smoke doesn't establish every module's support on
+every distribution. No agreed launch date, universal threshold, public IPC API
+or daemon mandate.
 
 ## Sources And Provenance
 

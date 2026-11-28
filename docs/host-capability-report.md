@@ -1,8 +1,7 @@
 # Atlas host capability report
 
-Observed 2026-09-04 before implementation. Commands were run locally on Atlas.
-Only selected Nix settings were captured; credential-bearing configuration was
-not recorded.
+Observed locally on Atlas on 2026-09-04, before implementation. Captured only
+selected Nix settings, omitting credential-bearing configuration.
 
 ## Platform
 
@@ -36,8 +35,8 @@ $ systemctl --user is-system-running
 degraded
 ```
 
-The user manager was reachable despite the degraded state; one unrelated
-`skillnet-subscription-sync.service` was failed. `systemctl --user
+The user manager was reachable despite the degraded state. One unrelated unit,
+`skillnet-subscription-sync.service`, was in the failed state. `systemctl --user
 show-environment` succeeded.
 
 The harmless transient probe accepted `Slice=app.slice`,
@@ -51,10 +50,10 @@ memory.swap.max  0
 memory.oom.group 1
 ```
 
-`MemoryOOMGroup=yes` itself was rejected as `Unknown assignment` and is absent
-from the systemd 261 manuals. The documented `OOMPolicy=kill` behavior produced
-the required kernel value, so AMC verifies the kernel file instead of sending a
-nonexistent property.
+The probe rejected `MemoryOOMGroup=yes` as `Unknown assignment`. The property
+is absent from the systemd 261 manuals. The documented `OOMPolicy=kill`
+produced the required kernel value, so AMC verifies the kernel file rather than
+sending a nonexistent property.
 
 ## Memory and swap
 

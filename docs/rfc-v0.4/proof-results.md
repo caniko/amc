@@ -1,49 +1,49 @@
 # Mechanism Validation Results
 
 **Verdict: MECHANISM GATE PASSED 2026-09-11 (disposable VM evidence below).**
-Prior attempts failed/blocked on permissions and unrealized fixture defects;
-this record supersedes them for the mechanism claim only.
+Earlier attempts failed/blocked on permissions and unrealized fixture defects.
+This result supersedes them for the mechanism claim only.
 
 Attempt: `proof-artifacts/mechanism-20260908T092416Z/`.
-The exact requested build was denied by tool policy **before execution**:
+Tool policy denied the exact requested build **before execution**:
 
 ```sh
 nix build --no-write-lock-file --max-jobs 1 --cores 2 .#nixosTests.x86_64-linux.generic
 ```
 
-There is no process exit status, VM execution, observed guest version, realized
-test output, cached test result used, or driver log from this attempt. The denial
-was not bypassed through direnv, scripts, another executable path or permission
-changes. The generic test remains outside ordinary flake checks.
+No process exit status, VM execution, observed guest version, realized test
+output, cache result reuse, or driver log exists for this attempt. The attempt
+did not bypass the denial via direnv, scripts, another executable path, or
+permission changes. The generic test remains outside ordinary flake checks.
 
 ## Changes In This Attempt
 
-- Boot and test assertions are inside the finalization boundary. Identity files
-  are registered before submission, including short-lived `amc run` fixtures.
+- Finalization covers boot and test assertions. The harness registers identity
+  files before submission, including for short-lived `amc run` fixtures.
 - `finalize_run` captures available allowlisted files and live default snapshots
-  before teardown, on failure as well as success. Export has a 20-second budget,
-  cleanup 35 seconds, individual guest/control waits at most 5 seconds, files at
-  most 4 MiB each and captured payload at most 16 MiB. These are collector bounds,
-  not new workload-runtime limits or relaxed mechanism acceptance thresholds.
-- Host-side deadlines cover a dead guest control channel; no reconnect is
-  attempted when the guest is unavailable. A timed-out/desynchronized channel
-  is not reused to interpret a later command's result.
-- Every owned identity gets a cleanup record with stop/reset/query exit codes,
-  final state where available and a cgroup-empty observation. Missing evidence
-  or unconfirmed cleanup is UNKNOWN. The original assertion remains the primary
-  failure; secondary failures are recorded without replacing it.
+  before teardown on success or failure. Collector bounds: 20-second export,
+  35 seconds for cleanup, at most 5 seconds per guest/control wait, 4 MiB per
+  file, and 16 MiB total payload. These collector bounds neither impose
+  workload-runtime limits nor relax mechanism acceptance thresholds.
+- Host-side deadlines cover a dead guest control channel. The harness does not
+  reconnect if the guest is unavailable or reuse a timed-out/desynchronized
+  channel to interpret later results.
+- Each owned identity gets a cleanup record: stop/reset/query exit codes,
+  available final state, and a cgroup-empty observation. Missing evidence or
+  unconfirmed cleanup is UNKNOWN. The original assertion remains the primary
+  failure; the record also captures secondary failures.
 - Artifacts go to a unique `mechanism-*` directory under the test-driver output.
   Bounded `AMC_ARTIFACT` and `AMC_FINALIZATION` records also preserve allowlisted
   data in the driver log if a failed Nix output is discarded. No raw application
   journal, environment or arbitrary diagnostic error stream is exported.
-- Added a VM-only startup cancellation case using a targeted fixture template,
-  one identity and an unrelated service. Added boolean-only native executable,
-  argv and configured-environment comparisons. Neither test has executed yet.
+- Added two not-yet-run tests: VM-only startup cancellation with a targeted
+  fixture template, one identity and an unrelated service; and boolean-only
+  comparisons of native executable, argv and configured environment.
 
 ## Current Checks
 
-Each command ran through the working direnv environment without truncating pipes
-or hidden exit statuses. `checks.json` records normalized actual tool outcomes.
+Commands used working direnv without truncated pipes or hidden exit statuses.
+`checks.json` records normalized tool outcomes.
 
 | Exact command | Outcome |
 |---|---|
@@ -59,10 +59,9 @@ or hidden exit statuses. `checks.json` records normalized actual tool outcomes.
 
 ## Attempt Identity And Preflight
 
-`source-identity.json` records revision, dirty-diff hash, lock hashes, untracked
-input hashes and the command. `source.diff` preserves the private source diff at
-the attempted gate; later documentation reconciliation does not change that
-historical snapshot.
+`source-identity.json` records revision, dirty-diff hash, lock and untracked
+input hashes, and the command. `source.diff` preserves the private diff from
+the attempted gate, unchanged by later documentation reconciliation.
 
 - Revision: `ff91f5ee24152b9c63de601fae1845aac13e453d`, dirty worktree.
 - Dirty-diff SHA-256: `3f41f032cab1ae71e2f408eaf330d8510ff50ce49c64ec854b419b906bb31383`.
@@ -72,28 +71,29 @@ historical snapshot.
 - Guest plan: 1024 MiB, 2 vCPUs, no guest swap/zram, existing 600-second driver
   timeout, finite fixture runtime limits and observer-readiness barriers.
 
-`preflight.json` was captured at 2026-09-08 09:24:16 UTC. It found 40,277,053,440
+`preflight.json` (2026-09-08 09:24:16 UTC) recorded 40,277,053,440
 bytes host-available RAM, 2,585,735,168 bytes client-ancestor high/max headroom,
 44,172,300,288 bytes broker high/max headroom, global memory PSI avg10 of zero,
-accessible KVM for the current process and sufficient workspace/store disk space.
-Read-only observations did not modify existing broker or ancestor policy.
-Builder-specific KVM access remained untested. This snapshot was sufficient to
-attempt the build, not a resource reservation or proof that a future run is safe.
+KVM access for the current process, and sufficient workspace/store disk space.
+Read-only checks left broker and ancestor policy intact. Builder-specific KVM
+access remained untested. The snapshot supported a build attempt, not a resource
+reservation or proof of safety for future runs.
 
 ## Evidence Scope
 
-See `migration-checklist.md` for implementation/test -> outcome -> artifact ->
-limitation for each claim. In particular:
+See `migration-checklist.md` for each claim's implementation/test, outcome,
+artifact, and limitation.
 
 - Isolated launcher/diagnostic regressions passed; they do not cover every
   real-manager lost-reply, cancellation or controller failure mode.
-- Generated native NixOS drop-in text has been evaluated; runtime lifecycle,
-  environment and precedence checks remain unexecuted.
+- Evaluation covered generated native NixOS drop-in text, not runtime
+  lifecycle, environment, or precedence. At this attempt, those runtime checks
+  had not run.
 - Helper checks are observations at helper entry, not universal pre-exec
   attestation. No general pre-exec supervisor is introduced.
-- OOM attribution, fixture-group cleanup, unrelated-unit survival and the Nix
-  broker boundary require the VM's actual event/lifecycle evidence. They are not
-  demonstrated by evaluation, a signal result, or the host preflight.
+- OOM attribution, fixture-group cleanup, unrelated-unit survival, and the Nix
+  broker boundary require VM event/lifecycle evidence, not evaluation, a signal
+  result, or host preflight.
 - The per-user symlink is a systemd lookup fixture, not Home Manager module
   evaluation/activation. No Home Manager dependency is added for this milestone.
 - A/B/C and high/max exercises are smoke tests. Pressure, aggregate parent policy,
@@ -102,37 +102,37 @@ limitation for each claim. In particular:
 ## Mechanism Attempt (2026-09-10)
 
 Attempt: `proof-artifacts/mechanism-20260910T215606Z/`.
-The exact requested build was denied by tool policy **before execution**
+Tool policy denied the exact requested build **before execution**
 (verified still in effect; `nix *` deny, no matching real-build permission):
 
 ```sh
 nix build --no-write-lock-file --max-jobs 1 --cores 2 .#nixosTests.x86_64-linux.generic
 ```
 
-No process started, no VM executed, no driver log. The denial was not
-bypassed via wrappers, alternate spellings, or `canix cache build`.
-Fresh workspace checks all passed on this tree (88 tests: amc 15, CLI 4,
-amc-runner 69; fixtures, fmt, clippy, diff-check, py-compile, bash -n —
-all exit 0; see attempt `checks.json`). Allowed evaluation-only commands
-succeeded: current drv
+No process started, no VM ran, and no driver log exists for this attempt. The
+attempt did not bypass denial via wrappers, alternate spellings, or
+`canix cache build`. Fresh workspace checks passed on this tree (88 tests:
+amc 15, CLI 4, amc-runner 69; fixtures, fmt, clippy, diff-check, py-compile,
+bash -n — all exit 0; see this attempt's `checks.json`). Allowed
+evaluation-only commands succeeded: drv
 `/nix/store/8fcpjh3sssxnvjb55h4gnqgr34h11wby-vm-test-run-amc-generic.drv`
 (planned guest systemd 261.2, kernel 6.18.48; observed: none), plus a
-`--dry-run` listing what would be realized. Source identity: revision
+`--dry-run` listing planned realizations. Source: revision
 `ff91f5ee24152b9c63de601fae1845aac13e453d`, dirty, diff-sha
 `4e64eb9c016c5d0ebc284776ae437847a65cd2235901f9640e6322927aad6a12`
 (excludes `proof-artifacts/`). Preflight (43 GB host RAM available,
-206 GB store disk free, KVM present, eval lock free) supported an attempt;
-it is not a reservation. **Verdict unchanged: MECHANISM GATE
+206 GB store disk free, KVM present, eval lock free) supported an attempt,
+not a reservation. **Verdict unchanged: MECHANISM GATE
 FAILED/BLOCKED (permission, not a demonstrated mechanism failure).**
-To execute, the operator runs the exact command above from the AMC
-checkout and reports the driver outcome; on success the finalization
-record must show `complete: true` with all exports `EXPORTED` and all
-owned fixtures `CONFIRMED_EMPTY`.
+The execution instructions for this attempt were for the operator to run the
+exact command above from the AMC checkout and report the driver outcome, with
+success requiring the finalization record to show `complete: true`, all exports
+`EXPORTED`, and all owned fixtures `CONFIRMED_EMPTY`.
 
 ## Mechanism Attempt (2026-09-11) — PASS
 
 Attempt: `proof-artifacts/mechanism-20260911T053209Z/`.
-Executed via the approved cache workflow (no raw-`nix-build` bypass):
+Ran via the approved cache workflow, without a raw-`nix-build` bypass:
 
 ```sh
 canix cache build .#nixosTests.x86_64-linux.generic --max-jobs 1 --cores 2 --output json
@@ -154,35 +154,31 @@ canix cache build .#nixosTests.x86_64-linux.generic --max-jobs 1 --cores 2 --out
   diff-sha `30ee23296dbcdaeef6bda0b291968b406dc85c383c57c395a4bb48e3c76a1a3c`
   (refreshed after the in-attempt fixes below; this is the passing tree).
 
-In-attempt fixture fixes (mechanism inputs, not weakened assertions):
-ty-Never export-list annotation, removed harness-colliding globals aliases
-(ruff F811), `machine.shell` None guard, removed unused `import os`, and the
-native fixture moved to `systemd.user.units` full text plus a per-user
-drop-in — established stepwise from evidence: `systemd.packages` never
-propagated the user unit (start failed "not found"), etc file/dir collided
-in make-etc, and derivation-output readFile is IFD-disabled. Each fix was
-re-verified (`py_compile`, fixture regressions) before retry; nothing was
-published until the passing run.
+Fixture fixes changed mechanism inputs without weakening assertions: ty-Never
+export-list annotation, removed harness-colliding global aliases (ruff F811),
+`machine.shell` None guard, removed unused `import os`, and moved the native
+fixture to full `systemd.user.units` text plus a per-user drop-in. Stepwise
+evidence: `systemd.packages` never propagated the user unit (start failed "not
+found"), the etc file/dir collided in make-etc, and derivation-output readFile
+is IFD-disabled. Each fix passed `py_compile` and fixture regressions before
+retry. Nothing was published before the passing run.
 
-What this proves — and does not: OOM attribution with observer deltas,
-fixture-group cleanup with cgroup-empty confirmation, unrelated-unit
-survival, per-user lookup precedence, native executable/argv/environment
-preservation, and the Nix-daemon builder boundary are now demonstrated in a
-disposable guest. Pressure comparisons, aggregate parent policy, overhead
-benchmarks, OpenCode usefulness, and production limits remain deferred and
-unmeasured. Home Manager evaluation of an actual owner unit is still
-unproven.
+The disposable guest demonstrated OOM attribution with observer deltas,
+fixture-group cleanup with cgroup-empty confirmation, unrelated-unit survival,
+per-user lookup precedence, native executable/argv/environment preservation,
+and the Nix-daemon builder boundary. Pressure comparisons, aggregate parent
+policy, overhead benchmarks, OpenCode usefulness, and production limits
+remain deferred and unmeasured. Home Manager evaluation of an actual owner unit
+remains unproven.
 
 ## Mechanism Rerun (2026-09-11) — declarative integration PASS
 
 Attempt: `proof-artifacts/mechanism-20260911T090621Z/`.
-The earlier passing run had substituted a driver-written per-user drop-in
-for the declarative NixOS `asDropin`, leaving the documented integration
-uncovered. This rerun restores it: the fixture fragment lives at
-`lib/systemd/user` in its package (the only package paths the generator
-scans) and is registered via `systemd.packages`, with limits arriving
-through declarative `overrideStrategy = "asDropin"`. Evidence, not
-assumption: the passing guest reports
+The earlier pass used a driver-written per-user drop-in instead of declarative
+NixOS `asDropin`, leaving the documented integration untested. This rerun
+registers the fixture via `systemd.packages`, puts its fragment at
+`lib/systemd/user` (the generator scans only those paths in packages),
+and sets limits through `overrideStrategy = "asDropin"`. The passing guest reports
 `FragmentPath: /etc/systemd/user/amc-native.service` with
 `DropInPaths: ...-user-units/amc-native.service.d/overrides.conf` and
 effective `MemoryMax: 268435456`.
@@ -193,23 +189,23 @@ effective `MemoryMax: 268435456`.
   out `/nix/store/r9s23i0zy2l4x2yi468pn4nq741vwczs-vm-test-run-amc-generic`.
 - Same guest versions (6.18.48 / 261.2), zero tracebacks, all 10 subtests,
   finalization `complete: true` (48/48 `EXPORTED`, 16/16 `CONFIRMED_EMPTY`).
-- Supporting fix: `nix/package.nix` now filters sources to Cargo inputs
+- Supporting fix: `nix/package.nix` filters sources to Cargo inputs
   plus `nix/vm-test.py` (embedded by `src/systemd.rs` via `include_str!`),
-  so docs, standalone scripts, and other Nix files no longer rebuild the
-  package — but editing `nix/vm-test.py` still does. The missing-file
-  failure showed the filter was too narrow, not that it is exact.
-- Pre-execution identity (`source-identity.json`, package.nix `ff922ff5…`)
-  is preserved as the failed-filter attempt; the passing retry (package.nix
-  `6c510075…`) is attributed separately in `build-attempt.json` via its
-  immutable derivation. Guest reports live at
+  so docs, standalone scripts, and other Nix files no longer trigger package
+  rebuilds, but `nix/vm-test.py` still does. The missing-file failure showed the
+  prior filter was too narrow, not that the new one is exact.
+- `source-identity.json` preserves the failed-filter attempt's pre-execution
+  identity (package.nix `ff922ff5…`); `build-attempt.json` attributes the
+  passing retry (package.nix `6c510075…`) by immutable derivation. Guest reports:
   `/nix/store/r9s23i0zy2l4x2yi468pn4nq741vwczs-vm-test-run-amc-generic/mechanism-uk2xa9ry/`;
-  the prior manual-drop-in run remains preserved as pattern evidence,
-  distinct from this declarative coverage.
+  the prior manual-drop-in run remains preserved as pattern evidence, not
+  declarative coverage.
 
 ## Package/Cache Attempt (2026-09-09)
 
-Historical realization (source fingerprint not recorded at the time; do not
-reuse as current identity). CLI
+Historical realization: no fingerprint recorded at realization; do not reuse as
+current identity.
+CLI
 `/nix/store/kcbfb1fwkrrb3mcgy35v2zxir2bv1p37-canix-admin-0.1.0/bin/canix`
 via canix direnv, cwd AMC, revision
 `ff91f5ee24152b9c63de601fae1845aac13e453d`, dirty.
@@ -224,12 +220,11 @@ direnv exec /data/nvme0/can/canix bash -c 'cd /data/nvme0/can/canix/projects/rep
 - retained: `.nix-results/cache-default-3afe8b28d0fa6f73`
 - `--no-push` is diagnostic only; not cache-milestone completion.
 
-Earlier workspace passes (2026-09-09) are unattributed: no fingerprints were
-captured around those runs, so they establish nothing about any identified
-source. The 2026-09-10 run below supersedes them.
+The 2026-09-09 workspace passes lacked fingerprints, so they establish nothing
+about any identified source. The 2026-09-10 run supersedes them.
 
-Fresh workspace run (2026-09-10, via AMC direnv cargo). Fingerprints match
-before and after, so no source drift invalidates the run: HEAD
+Fresh workspace run (2026-09-10, via AMC direnv cargo). The recorded
+fingerprints matched before and after the run: HEAD
 `ff91f5ee24152b9c63de601fae1845aac13e453d`, diff-sha
 `8ba4a2d4c2b7b21f67e3f61fe8352d4b76bdd44430a5f21bd29c65215a0f95d8`,
 Cargo.lock `7c77ac4578bd656584cddb22040e1009ade6b1cf145b729bfd434a663cc634b3`.
@@ -250,42 +245,38 @@ inspect_failure --locked` (exit 0) and the full `cache::` set (66 passed,
 exit 0); `rustfmt --edition 2024 --check` clean on `native.rs` and
 `health/mod.rs`. The standalone mirror is superseded; reconcile/delete it
 when convenient.
-`canix cache health --cache canix-fleet` reported local
-`attic cache info canix-fleet` as `NoSuchCache`. That is this login's result,
-not proof of global absence. No `canix-fleet:` key in `attic.nix`. Create was
-not run. Isolated-store restore was not attempted. Generic VM remains
-unexecuted.
+`canix cache health --cache canix-fleet` reported `NoSuchCache` from local
+`attic cache info canix-fleet`: this login's result, not proof of global
+absence. No `canix-fleet:` key in `attic.nix`. Cache creation, isolated-store
+restore, and the generic VM run were not attempted.
 
-Re-observed 2026-09-11: AMC diff-sha unchanged (`8ba4a2d4...`), retained
-output still valid in store, and unprivileged health again reports
-`NoSuchCache` for this login. Correction to the earlier claim: a canix-admin
-rebuild WAS attempted and failed at the time, and the health check that
-followed ran under the old profile CLI (`a36ny518...-canix-admin-hm`), not a
-verified dev-shell build — treat that observation as provisional until a
-verified executable repeats it. Since then the concurrent owner staged
-`hosts/omniroute_accept.rs`, the canix shell builds again, and the real
-in-crate gates pass (see above). Separately fixed 2026-09-11: `cache health`
-never registered the existing `Sudo` check, so `can_sudo` was always false
-and every run silently took the unprivileged path — this was a canix wiring
-bug, not proof that `sudo -v` failed. The suite now registers
-`Sudo::default()` before the cache inspection. Privileged inspection,
-publication, isolated-store restoration, and the VM remain not run (blocked,
-not complete).
+Rechecked 2026-09-11: AMC diff-sha unchanged (`8ba4a2d4...`), retained output
+still valid in store, and unprivileged health again reports `NoSuchCache`
+for this login. Correction: a canix-admin rebuild WAS attempted and failed.
+The subsequent health check used the old profile CLI
+(`a36ny518...-canix-admin-hm`), not a verified dev-shell build. Treat that
+health result as provisional until a verified executable repeats it.
+Subsequently, the concurrent owner staged `hosts/omniroute_accept.rs`, the
+canix shell builds again, and real in-crate gates pass (see above). Separate
+2026-09-11 fix: `cache health` never registered `Sudo`, leaving `can_sudo`
+false and silently using the unprivileged path every time. This was canix
+wiring, not proof `sudo -v` failed. The suite now registers `Sudo::default()`
+before cache inspection. Privileged inspection, publication, isolated-store
+restoration, and the VM remain blocked and unrun.
 
 ## Cache Milestone (2026-09-11)
 
-`canix-fleet` pre-existed — no creation was needed. Its signing key was
-already committed by the rollout owner (`b6d0f9ed2`,
-`canix-fleet:OGrxH9eDSB1HuKEd920MKUK5GDpqI16q5FqBPMKc68E=`) and matches the
-live cache (`Public: false`, store `/nix/store`, priority 41, upstream
-`["cache.nixos.org-1"]`). The earlier `NoSuchCache` followed a dead operator
-token; JWT-secret rotation since mint is plausible but unproven (the server
-returns not-found rather than unauthorized for the private cache either
-way). The operator refreshed the login with a new 2y admin token;
-unprivileged `attic cache info canix-fleet` now succeeds.
+`canix-fleet` already existed. The rollout owner had committed its signing key
+(`b6d0f9ed2`, `canix-fleet:OGrxH9eDSB1HuKEd920MKUK5GDpqI16q5FqBPMKc68E=`). That
+key matches the live cache (`Public: false`, store `/nix/store`, priority 41,
+upstream `["cache.nixos.org-1"]`). The earlier `NoSuchCache` followed a dead operator
+token. JWT-secret rotation since mint is plausible but unproven: the server
+returns not-found, not unauthorized, for the private cache either way. The
+operator refreshed the login with a new 2y admin token; unprivileged
+`attic cache info canix-fleet` now succeeds.
 
-Published without rebuilding, then via one command (profile `canix`,
-pre-Sudo-fix build — inspect succeeded so the classifier version is moot):
+First published without rebuilding, then with one command (profile `canix`,
+pre-Sudo-fix build; successful inspection made the classifier version irrelevant):
 
 - Sep 9 artifact `/nix/store/v98c0z4m2z8gfhmf5lh8nv5hacinlb00-amc-0.1.0`
   (drv `vnclmwpj…`): `cache push --cache canix-fleet` → 1 missing
@@ -298,28 +289,27 @@ pre-Sudo-fix build — inspect succeeded so the classifier version is moot):
   presence confirmed, retained link replaced. Nix-internal `cargo test -p amc`
   passed as part of the build.
 
-Canix `verified: true` is a narinfo presence check only
-(`verify.rs` issues HEAD/Range-GET probes; it downloads no archive and
-checks no signature), so it does not establish signed substitutability.
+Canix `verified: true` checks narinfo presence only. `verify.rs` issues
+HEAD/Range-GET probes without downloading archives or checking signatures,
+so this does not establish signed substitutability.
 
-Byte-level content match (valid, narrow): the canix-fleet NAR (zstd,
-836605 B) was downloaded out-of-band, decompressed to exactly 2181928 bytes,
-and its sha256 (`bea6105e…cfef54`) equals the production store record
-(`sha256-vqYQXlwZNA5M3Ab7hlZTxYJrClqEYtYxKH7co6TP71Q=`). This proves the
-served bytes are the trusted artifact; it is not a store restoration.
+Byte-level match only: an out-of-band download of the canix-fleet NAR (zstd,
+836605 B) decompressed to exactly 2181928 bytes. Its sha256 (`bea6105e…cfef54`)
+matches the production store record
+(`sha256-vqYQXlwZNA5M3Ab7hlZTxYJrClqEYtYxKH7co6TP71Q=`), proving the served
+bytes match the trusted artifact, not that they were restored to a store.
 
 Corrections to prior attempts (preserved, not deleted):
 
-- Every `nix path-info --store <iso>` run was a query, not an import: `null`
-  / `not valid` proved nothing about downloads, keys, or sudo. The
-  "isolated stores cannot import NARs here" environment conclusion and the
-  confounded negative control are withdrawn.
-- The custom Ed25519/fingerprint experiment is invalid and retired from
-  acceptance testing: it hashed the received text instead of canonicalizing
-  to algorithm-prefixed Nix32, and the script carries an incorrect scalar
-  bound. No Attic signature defect is demonstrated; the substituter-vs-vault
-  decision framing is withdrawn. Scripts remain as audit trail only
-  (`verify_nar.py`, `fp_variants.py`).
+- `nix path-info --store <iso>` only queried, never imported: `null` /
+  `not valid` proved nothing about downloads, keys, or sudo. The
+  "isolated stores cannot import NARs here" conclusion and the confounded
+  negative control are withdrawn.
+- The invalid custom Ed25519/fingerprint experiment is retired from acceptance. It
+  hashed received text rather than canonicalizing to algorithm-prefixed
+  Nix32, and the script has an incorrect scalar bound. It demonstrates no
+  Attic signature defect; the substituter-vs-vault framing is withdrawn.
+  `verify_nar.py` and `fp_variants.py` remain only for audit.
 
 Restore results (2026-09-11, operator-run; agent shell denies real
 `nix build`/import). Stores `OK=/tmp/iso-fleet-ok-XmvnWT`,
@@ -340,16 +330,14 @@ Restore results (2026-09-11, operator-run; agent shell denies real
   signatures. Agent independently re-read the same record from the ISO
   store (read-only, no production reads).
 
-This settles the signature question empirically: stock Nix verified and
-recorded the attic-issued signature, so canix-fleet IS usable as a Nix
-substituter through the standard trust path. The custom-verifier failure
-was the experiment's bug, not an Attic defect — fully withdrawn.
+Stock Nix verified and recorded the attic-issued signature: canix-fleet works
+as a Nix substituter through the standard trust path. The custom verifier,
+not Attic, was at fault; the defect claim is withdrawn.
 
-Cache milestone CLOSED: local project builds via one command
-(`canix cache build .#default`), outputs retained under the documented
-finite policy, publication to private `canix-fleet` verified, and signed
-restoration demonstrated in an isolated store with compilation disabled —
-including the trust-specific negative control. No activation, global GC,
+Cache milestone CLOSED: one-command local AMC builds (`canix cache build .#default`),
+outputs retained under the documented finite policy, verified publication to
+private `canix-fleet`, and signed isolated-store restoration with compilation
+disabled and a trust-specific negative control. No activation, global GC,
 production-limit, or unrelated changes occurred.
 
 ## Smallest Next Action
@@ -357,12 +345,11 @@ production-limit, or unrelated changes occurred.
 Delete `/tmp/canix-fleet-restore-netrc` and the exact attempt stores
 (`OK`/`BAD` above plus the eleven enumerated `/tmp/iso-amc-*` skeletons;
 the sudo-created one needs its own `sudo rm -rf`). Then pursue the generic
-VM as a separate authorized gate with fresh preflight. No production
-activation, live-service restart, host stress, paid request, agent replay,
-broker cap, cache rewrite, or server change is justified by the current
-evidence.
+VM separately, with authorization and fresh preflight. Current evidence
+does not justify production activation, live-service restart, host stress,
+paid requests, agent replay, broker caps, cache rewrites, or server changes.
 
-No production activation, live-service restart, host doctor/stress, paid request,
-agent replay, broker cap or application integration occurred in this continuation.
-Historical corrective/direnv records are preserved in `history/`; v0.1 results
-remain separately at `docs/proof-results.md`.
+This continuation did not activate production configuration, restart live
+services, run host doctor/stress, make paid requests, replay agent actions, cap
+brokers, or integrate applications. Historical corrective/direnv records remain
+in `history/`; v0.1 results remain at `docs/proof-results.md`.

@@ -1,9 +1,9 @@
 # Native memory supervision
 
-AMC can observe enrolled native services and admitted jobs with one host-wide
-supervisor. Consumers select application policy and lifecycle authority.
-Systemd retains execution, cgroup placement, hard limits and descendant cleanup;
-the admission services retain their full-ceiling reservations.
+One host-wide AMC supervisor can observe enrolled native services and admitted
+jobs. Consumers choose application policy and lifecycle authority. Systemd owns
+execution, cgroup placement, hard limits and descendant cleanup; admission
+services keep their full-ceiling reservations.
 
 ## Interfaces and ownership
 
@@ -13,15 +13,15 @@ amc supervise status
 amc supervise replay --file /var/lib/amc-supervision/trace.jsonl
 ```
 
-`serve` requires root, an explicit policy, a trusted runtime directory and an
+`serve` requires root, explicit policy, a trusted runtime directory and an
 exclusive durable-state lock. The NixOS `nixosModules.supervision` module installs
-the service and creates its directories. `status` reads public, bounded JSON;
-it does not contact a manager. `replay` reads up to 128 MiB of chronological JSONL
-with a 1 MiB frame bound and never signals or starts a service.
+the service and creates its directories. `status` reads public, bounded JSON
+without contacting a manager. `replay` reads up to 128 MiB of chronological JSONL
+with a 1 MiB frame limit; it never signals or starts services.
 
 [`examples/supervision.json`](../examples/supervision.json) is a disabled-actuation
-schema example. Replace its unit and ceilings with the actual enrolled native
-owner before running it; its values are not workstation defaults.
+schema example; its values are not workstation defaults. Before running it, set
+the unit and ceilings to those of the enrolled native owner.
 
 Policy version 1 has three lifecycle authorities:
 
@@ -31,107 +31,105 @@ Policy version 1 has three lifecycle authorities:
 | `terminate` | Stop one disposable invocation; never replay or start its command |
 | `observe` | Observe and inhibit new admission; no signal or start authority |
 
-Each static domain names an exact system/user service, native memory/swap
-ceilings and recovery priority. An `observe` domain can use `memory_max = 0`
-to read its actual leaf and ancestor capacities without prescribing a leaf cap.
-Job pools select explicit contract names from per-user admission ledgers and
-carry each grant's invocation, cgroup path and inode into attachment. Reading a
-ledger never changes or releases its reservations. Brokers need a broker-owned
-cancellation interface before their authority can expand.
+Static domains specify an exact system/user service, native memory/swap ceilings
+and recovery priority. An `observe` domain can set `memory_max = 0` to read live
+leaf and ancestor capacities without setting a leaf cap. Job pools select
+explicit contract names from per-user admission ledgers and attach using each
+grant's invocation, cgroup path and inode. Ledger reads never change or release
+reservations. Expanding broker authority requires a broker-owned cancellation
+interface.
 
-`shadow` observes and traces without intervention or admission inhibition.
-`enforce` additionally inhibits on pressure or unknown evidence and permits
-bounded recovery. Consumers should connect admission's optional `--health-file`
-only for enforcement. A separate `forecast_recovery` gate controls disruptive
-forecast-based recovery; it is independent of directly observed emergencies.
+`shadow` observes and traces without intervening or inhibiting admission.
+`enforce` adds inhibition on pressure or unknown evidence and permits bounded
+recovery. Connect admission's optional `--health-file` only for enforcement.
+`forecast_recovery` gates disruptive forecast-based recovery independently of
+directly observed emergencies.
 
 ## Forecast interpretation
 
-Every comparable invocation gets its own streaming model. The input contains
-memory and swap usage against finite leaf and ancestor hard boundaries, plus
-host RAM usage against `MemTotal - reserve_bytes`. Leaf/ancestor protected
-boundaries are 90% of their ceilings. These fractions are initial mechanism
-settings, not benchmark-derived application optima.
+Each comparable invocation gets a streaming model fed memory and swap usage
+against finite leaf and ancestor hard boundaries, plus host RAM usage against
+`MemTotal - reserve_bytes`. Leaf/ancestor protected boundaries are 90% of their
+ceilings. These fractions are initial settings, not benchmark-derived
+application optima.
 
 The model combines plateau, damped-growth and sustained-growth local-linear
 state-space experts. Student-t-inspired robust innovations reduce outlier
-influence; fixed-share likelihood weights allow regime switching. It is an
+influence; fixed-share likelihood weights let regimes switch. This is an
 approximate filter, not a full Bayesian Student-t posterior. Forecast steps are
-nominal one-second samples; oversized gaps censor the segment rather than
-bridging it.
+nominal one-second samples; oversized gaps censor, not bridge, segments.
 
-For a forecast issued at time `t`, the calibration score is the largest absolute
-error over **all boundaries and all future steps in its window**. That score
-enters the rolling calibration set only after the whole window arrives. A
-trailing empirical conformal quantile, with integral coverage-error feedback,
-sets the common radius. An unestimable tail or negative radius cannot authorize
-forecast recovery. `possible` marks an upper forecast peak crossing a protected
-boundary. `strong` requires a calibrated lower peak crossing it.
+For a forecast at `t`, the score is the largest absolute error over **all
+boundaries and all future steps in its window**. It enters rolling calibration
+only after the full window arrives.
+A trailing empirical conformal quantile with integral coverage-error feedback
+sets the common radius. An unestimable tail or negative radius bars forecast
+recovery. `possible` marks an upper forecast peak crossing a protected boundary;
+`strong` requires a calibrated lower peak crossing it.
 
-These intervals describe normalized usage trajectories. They are not OOM
-probabilities, leak diagnoses or guaranteed conditional/local coverage. Future
-windows overlap, workload streams are dependent and nonstationary, and
-intervention censors the unobserved counterfactual future. Exchangeability-based
-conformal guarantees do not automatically apply. Warm forecasts can inhibit
-when their predicted peak threatens a boundary, but cannot authorize forecast
-recovery until calibration is ready.
+Intervals describe normalized usage trajectories, not OOM probabilities, leak
+diagnoses or guaranteed conditional/local coverage. Future windows overlap,
+workload streams are dependent and nonstationary, and intervention censors the
+unobserved counterfactual future. Exchangeability-based conformal guarantees
+don't automatically apply. Warm forecasts can inhibit admission if their peak
+threatens a boundary, but cannot authorize forecast recovery until calibration
+is ready.
 
-The e-CUSUM mixture is diagnostic only. Its mathematical null is that the
-conditional mean of the clipped normalized innovation is nonpositive. Normal
-workload growth and selecting the largest innovation across boundaries can
-violate that null. Its value is neither a p-value nor an ever-alarm probability,
-and it is not an actuation gate.
+The e-CUSUM mixture is diagnostic only: no p-value, ever-alarm probability or
+actuation gate. Its null is a nonpositive conditional mean of the clipped
+normalized innovation. Normal workload growth or selecting the largest
+innovation across boundaries can violate it.
 
 Identity/capacity changes, missing observations, sampling gaps and intervention
 end comparability. Replay preserves completed, evaluated, uncovered and censored
 window counts across boot/policy segments, rejects reordered/interleaved boots
-and duplicate domains, and censors missing-domain frames. Report the empirical
-miss fraction with its workload, segment and missingness context; it does not
-establish deployment reliability by itself.
+and duplicate domains, and censors missing-domain frames. Report empirical miss
+fractions with workload, segment and missingness context; alone they don't
+establish deployment reliability.
 
 The statistical design draws on [online conformal PID control](https://arxiv.org/abs/2307.16895),
 [time-series prediction research](https://nejsds.nestat.org/journal/NEJSDS/article/59/info),
 and sequential/adaptive research at [2509.02844](https://arxiv.org/html/2509.02844v4)
 and [2410.13115](https://arxiv.org/html/2410.13115v2). Their published guarantees
-are not claims about this combined heuristic or its recovery controller.
+do not establish guarantees for this combined heuristic or recovery controller.
 
 ## Bounded recovery
 
-An enforceable domain requires `Restart=no`, `KillMode=control-group`,
+A domain eligible for recovery requires `Restart=no`, `KillMode=control-group`,
 `OOMPolicy=kill`, matching finite leaf ceilings and a native stop timeout within
-the kill deadline. Attachment pins the main process with a pidfd and the
-cgroup readers with held descriptors, then rechecks manager identity.
+the kill deadline. Attachment pins the main process by pidfd and cgroup readers
+by held descriptors, then rechecks manager identity.
 
-The supervisor publishes inhibition and durably records an attempt before TERM.
-At the TERM deadline it may escalate to KILL. Signals target the pinned main
-process; systemd cleans up descendants. No stop/restart by a fixed unit name,
-raw cgroup mutation or process-tree scanning is used. Original process death,
-original cgroup absence/empty population and fresh native inactivity are all
-required before cooldown. A replacement while stopping trips the recovery.
+Before TERM, the supervisor publishes inhibition and durably records the attempt.
+It may escalate to KILL at the TERM deadline. Signals target the pinned main
+process; systemd cleans up descendants. No fixed-name stop/restart, raw cgroup
+mutation or process-tree scanning. Cooldown requires original process death,
+original cgroup absence/empty population and fresh native inactivity evidence.
+A replacement during stopping trips recovery.
 
-Backend cooldown requires continuously healthy known headroom. It has an
-absolute `cooldown_ms + 60 seconds` deadline, so unhealthy recovery cannot wait
-forever. Starting has a 10-second verification deadline. Restart dispatch
-rechecks current host headroom, native lifecycle and the persisted phase's
-in-memory authority after its manager query. Queued, expired or revoked actions
-cannot inherit a replacement phase. Failed queries, unavailable workers,
-unknown termination and exhausted budgets trip rather than broaden authority.
+Backend cooldown requires continuously healthy, known headroom. An absolute
+`cooldown_ms + 60 seconds` deadline bounds unhealthy waits. Starting has a
+10-second verification deadline. After querying the manager, restart dispatch
+rechecks live host headroom, native lifecycle and in-memory authority for the
+persisted phase. Queued, expired or revoked actions cannot inherit a replacement
+phase. Failed queries, unavailable workers, unknown termination and exhausted
+budgets trip rather than expand authority.
 
 Dispatch also rechecks the bounded native stop timeout and independently proves
-that the original process and descendants are gone. A backend first discovered
-in a failed state uses its retained invocation and verified empty service slot;
-it enters cooldown without acquiring signal authority. Loss of cleanup evidence
-during cooldown trips rather than authorizing a start.
+the original process and descendants are gone. A backend first found failed
+enters cooldown with its retained invocation and verified empty service slot,
+without signal authority. Losing cleanup evidence during cooldown trips rather
+than authorizing a start.
 
 Attempts survive supervisor restart/reboot and policy edits. The accounting
-window only grows: shortening policy does not forgive existing recovery
-history. A backwards wall clock forbids another attempt; cross-boot accounting
-assumes a trustworthy wall clock. Persisted in-flight recovery becomes `tripped`
-on startup and is never replayed automatically.
+window only grows: shorter policy never forgives recovery history. A backwards
+wall clock forbids another attempt; cross-boot accounting requires a trustworthy
+wall clock. Startup marks persisted in-flight recovery `tripped`; AMC never
+replays it automatically.
 
-Disposable jobs share the recovery budget of their enrolled pool across UUID
-ticket changes. Persisted per-ticket history is migrated into that same pool
-budget without forgiving consumed attempts.
+Disposable jobs share their enrolled pool's recovery budget across UUID ticket
+changes. Persisted per-ticket history migrates to that budget without forgiving
+spent attempts.
 
 To reconcile a trip, stop the supervisor and resolve the native domain first:
 
@@ -140,26 +138,25 @@ amc supervise reconcile --state /var/lib/amc-supervision
 ```
 
 Reconciliation takes the same exclusive state lock and proves original native
-termination before clearing the active recovery. It preserves all attempts and
-does not start work. A running replacement, replaced cgroup or unreadable state
-requires resolving that ambiguity before reconciliation can succeed.
+termination before clearing active recovery. It preserves attempts and starts
+nothing. Resolve any running replacement, replaced cgroup or unreadable state
+before reconciliation can succeed.
 
 ## Evidence and failure behavior
 
-`/run/amc-supervision/health.json` and `status.json` are public read-only files
-written atomically with mode 0644, including under service `UMask=0077`.
+The supervisor atomically writes public read-only `/run/amc-supervision/health.json`
+and `status.json` with mode 0644, even under service `UMask=0077`.
 Admission refuses new entries/grants on missing, malformed, future, wrong-boot,
 older-than-three-second, inhibited or degraded health. Existing grants remain
-charged. A gracefully stopped enforce-mode supervisor immediately publishes
-inhibition; abrupt loss is detected through freshness.
+charged. Graceful enforce-mode shutdown publishes inhibition immediately;
+freshness checks catch abrupt loss.
 
-`/var/lib/amc-supervision/recovery.json` and rotating traces are private. Each
-trace file rotates at 64 MiB; trace backpressure/failure increments a visible
-drop counter. The sample loop has no manager subprocesses. Discovery and
-actuation use separate bounded workers; stale discovery inhibits admission.
-Durable transitions still perform synchronous filesystem writes, so a stalled
-filesystem can stall supervision. Heartbeat freshness and native hard limits
-remain the fallback in that case, not a promise of successful software recovery.
+`/var/lib/amc-supervision/recovery.json` and rotating traces are private. Traces
+rotate at 64 MiB per file; backpressure/failure increments a visible drop counter.
+The sample loop runs no manager subprocesses. Discovery and actuation use
+separate bounded workers; stale discovery inhibits admission. Synchronous
+durable writes can stall supervision if the filesystem stalls. Heartbeat
+freshness and native hard limits are the fallback, not a recovery guarantee.
 
 Local Rust tests cover forecasting, delayed scoring, identity/gap censoring,
 pidfd identity rejection, admission inhibition, recovery deadlines/budgets and
@@ -167,34 +164,34 @@ replay segmentation. `nixosTests.x86_64-linux.supervision` defines closed-loop
 backend/descendant cleanup, once-only restart, in-flight supervisor restart,
 shadow authority and trace/replay cases. Hosted CI must retain its named JUnit
 cases and trace/recovery receipts. The VM stops the trace writer before replay
-and export; `replay-input.json` binds the complete trace's SHA-256 and byte count
-to the replay summary's SHA-256. Hosted verification rejects missing or stale
-bindings. Defined tests are not passing VM evidence;
-application thresholds still need chronological replay, shadow observation and
-controlled consumer qualification before enabling forecast recovery.
+and export. `replay-input.json` binds the full trace's SHA-256 and byte count to
+the replay summary's SHA-256; hosted verification rejects missing or stale
+bindings. Test definitions aren't passing VM evidence. Before enabling forecast
+recovery, application thresholds still need chronological replay, shadow
+observation and controlled consumer qualification.
 
 ### Native failure injections
 
-The supervision VM additionally defines these production-path probes:
+The supervision VM also defines these production-path probes:
 
 - Missing, malformed, oversized, writable, foreign-owned and symlinked heartbeat
   files; expired/future timestamps; changed boot, inhibition and degraded state.
-  Each variant denies a new pool across multiple broker ticks while preserving a
-  live root owner's exact grant, identity and full-ceiling commitment.
+  Each denies a new pool across multiple broker ticks but preserves a live root
+  owner's exact grant, identity and full-ceiling commitment.
 - Missing/malformed `MemAvailable` and full memory PSI. Corrupted proc files are
-  mounted only in the broker's private namespace. Broker restarts preserve two
-  live grants; restoring required observations permits the queued third pool.
-- A replacement invocation during native failed-backend cooldown. The old
-  recovery trips, retains its attempt and never signals or restarts the active
-  replacement or its descendant.
+  mounted only in the broker's private namespace. Broker restart preserves both
+  live grants; restoring the required observations permits the queued third pool.
+- Replacement during native failed-backend cooldown. The old recovery trips,
+  keeps its attempt and never signals or restarts the active replacement or its
+  descendant.
 - Two completed recoveries followed by independent domain-budget and host-budget
   exhaustion. Both trips survive supervisor restart with unchanged accounting
-  and no third recovery. The host case uses two different domains, each below
-  its individual limit, to distinguish the host constraint.
+  and no third recovery. The host case isolates the host constraint using two
+  domains below their individual limits.
 
-An unenrolled backend and its descendant remain live with the same invocation
-through replacement and budget trials. Injected failures stay inside the VM;
-they do not change the build host's telemetry or service policy.
+An unenrolled backend and descendant stay live under the same invocation
+through replacement and budget trials. Failures stay inside the VM, leaving
+build-host telemetry and service policy unchanged.
 
 `nix/hosted-ci.py` requires all named execution cases and verifies the exported
 `admission-failures.json`, `admission-observations.json`,
